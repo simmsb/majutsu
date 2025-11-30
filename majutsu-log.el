@@ -242,23 +242,28 @@ instead of stopping on visual padding."
                           (setq pending nil))
                         (push current entries))
                       (setq current
-                            (seq-let (prefix change-id author bookmarks _git-head _conflict _signature _empty short-desc commit-id timestamp long-desc)
+                            (seq-let (prefix change-id author bookmarks git-head conflict signature empty short-desc commit-id timestamp long-desc)
                                 trimmed-elems
                               (let* ((cid (if (stringp change-id) (substring-no-properties change-id) ""))
                                      (full (if (stringp commit-id) (substring-no-properties commit-id) ""))
                                      (id8  (if (> (length cid) 8) (substring cid 0 8) cid))
-                                     (idv  (unless (string-empty-p id8) id8)))
+                                     (idv  (unless (string-empty-p id8) id8))
+                                     (clean-elems-pre (seq-remove (lambda (l) (or (not l) (string-blank-p l)))
+                                                        (list prefix change-id author bookmarks git-head conflict signature empty short-desc)))
+                                     (clean-elems-post (seq-remove (lambda (l) (or (not l) (string-blank-p l)))
+                                                        (list commit-id timestamp))))
                                 (list :id idv
                                       :prefix prefix
                                       :line line
-                                      :elems clean-elems
+                                      :elems-pre clean-elems-pre
+                                      :elems-post clean-elems-post
                                       :author author
                                       :change-id cid
                                       :commit_id full
                                       :short-desc short-desc
                                       :long-desc (when long-desc (json-parse-string long-desc))
                                       :timestamp timestamp
-                                      :bookmarks bookmarks))))
+                                      :bookmarks (string-split bookmarks)))))
                       (setq pending nil))
                   (push line pending))))
             (when current
@@ -275,6 +280,13 @@ instead of stopping on visual padding."
                (split-string s "\n")
                "\n"))) ; Join lines with newline, prefixed by indentation
 
+(defun jj--right-align-string (s)
+  (let ((w (string-pixel-width (concat s "  "))))
+    (concat
+     (propertize " " 'display `(space :align-to (- right (,w))) 'invisible t)
+     s
+     " ")))
+
 (defun majutsu-log-insert-logs ()
   "Insert jj log graph into current buffer."
   (magit-insert-section (majutsu-log-graph-section)
@@ -288,7 +300,8 @@ instead of stopping on visual padding."
                             (oset section description (plist-get entry :short-desc))
                             (oset section bookmarks (plist-get entry :bookmarks))
                             (magit-insert-heading
-                              (insert (string-join (butlast (plist-get entry :elems)) " ")))
+                              (insert (string-join (butlast (plist-get entry :elems-pre)) " ")
+                                      (jj--right-align-string (string-join (plist-get entry :elems-post) " "))))
                             (when-let* ((long-desc (plist-get entry :long-desc))
                                         (indented (majutsu--indent-string long-desc
                                                                           (+ 10 (length (plist-get entry :prefix))))))

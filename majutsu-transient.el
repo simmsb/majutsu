@@ -757,7 +757,7 @@ PARENTS, AFTER, BEFORE, MESSAGE, and NO-EDIT default to transient state."
      :description "Delete (propagate)" :transient nil)
     ("f" "Forget bookmark" majutsu-bookmark-forget
      :description "Forget (local)" :transient nil)]
-   [("q" "Quit" transient-quit-one)]] )
+   [("q" "Quit" transient-quit-one)]])
 
 ;;; Git Transients
 
@@ -780,13 +780,19 @@ PARENTS, AFTER, BEFORE, MESSAGE, and NO-EDIT default to transient state."
     ("i" "Init" majutsu-git-init-transient)]
    [("q" "Quit" transient-quit-one)]])
 
+(defun jj--init-bookmarks-at-point (obj)
+  (when-let* ((at (magit-current-section))
+              (bookmarks (and (slot-boundp at 'bookmarks)
+                              (oref at bookmarks))))
+    (oset obj value (string-join (mapcar (lambda (s) (string-remove-suffix "*" s)) bookmarks) ","))))
+
 (transient-define-prefix majutsu-git-push-transient ()
   "Transient for jj git push."
   [:description "JJ Git Push"
    :class transient-columns
    ["Arguments"
     ("-R" "Remote" "--remote=" :choices majutsu--get-git-remotes)
-    ("-b" "Bookmark" "--bookmark=" :choices majutsu--get-bookmark-names)
+    ("-b" "Bookmark" "--bookmark=" :choices majutsu--get-bookmark-names :init-value jj--init-bookmarks-at-point)
     ("-a" "All bookmarks" "--all")
     ("-t" "Tracked only" "--tracked")
     ("-D" "Deleted" "--deleted")
