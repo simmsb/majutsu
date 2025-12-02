@@ -157,10 +157,9 @@
         [:separate "\x1e"
                    [:call 'format_short_change_id_with_hidden_and_divergent_info [:raw "self" :Commit]]
                    [:call 'format_short_signature_oneline [:author]]
-                   [:separate " "
-                              [:bookmarks]
-                              [:tags]
-                              [:working_copies]]
+                   [:coalesce [:bookmarks] " "]
+                   [:coalesce [:tags] " "]
+                   [:coalesce [:working_copies] " "]
                    [:if [:git_head]
                        [:label "git_head" "git_head()"]
                      " "]
@@ -242,14 +241,14 @@ instead of stopping on visual padding."
                           (setq pending nil))
                         (push current entries))
                       (setq current
-                            (seq-let (prefix change-id author bookmarks git-head conflict signature empty short-desc commit-id timestamp long-desc)
+                            (seq-let (prefix change-id author bookmarks tags working-copies git-head conflict signature empty short-desc commit-id timestamp long-desc)
                                 trimmed-elems
                               (let* ((cid (if (stringp change-id) (substring-no-properties change-id) ""))
                                      (full (if (stringp commit-id) (substring-no-properties commit-id) ""))
                                      (id8  (if (> (length cid) 8) (substring cid 0 8) cid))
                                      (idv  (unless (string-empty-p id8) id8))
                                      (clean-elems-pre (seq-remove (lambda (l) (or (not l) (string-blank-p l)))
-                                                        (list prefix change-id author bookmarks git-head conflict signature empty short-desc)))
+                                                        (list prefix change-id author bookmarks tags working-copies git-head conflict signature empty short-desc)))
                                      (clean-elems-post (seq-remove (lambda (l) (or (not l) (string-blank-p l)))
                                                         (list commit-id timestamp))))
                                 (list :id idv
@@ -300,8 +299,9 @@ instead of stopping on visual padding."
                             (oset section description (plist-get entry :short-desc))
                             (oset section bookmarks (plist-get entry :bookmarks))
                             (magit-insert-heading
-                              (insert (string-join (butlast (plist-get entry :elems-pre)) " ")
-                                      (jj--right-align-string (string-join (plist-get entry :elems-post) " "))))
+                              (insert (string-join (plist-get entry :elems-pre) " ")
+                                      (jj--right-align-string (string-join (plist-get entry :elems-post) " "))
+                                      "\n"))
                             (when-let* ((long-desc (plist-get entry :long-desc))
                                         (indented (majutsu--indent-string long-desc
                                                                           (+ 10 (length (plist-get entry :prefix))))))
