@@ -682,13 +682,27 @@ With prefix ALL, include remote bookmarks."
       (view-mode 1))
     (funcall majutsu-log-display-function buf)))
 
+(defun jj--get-closest-parent-bookmark-names (&optional all-remotes)
+  "Return bookmark names.
+When ALL-REMOTES is non-nil, include remote bookmarks formatted as NAME@REMOTE."
+  (let* ((current (or (majutsu-log--revset-at-point) "@"))
+         (template (if all-remotes
+                       "if(remote, name ++ '@' ++ remote ++ '\n', '')"
+                     "name ++ '\n'"))
+         (args (append '("bookmark" "list")
+                       (list "-r" (format "heads(::%s & bookmarks() & mine())" current))
+                       (and all-remotes '("--all"))
+                       (list "-T" template))))
+    (delete-dups (split-string (apply #'majutsu-run-jj args) "\n" t))))
+
 ;;;###autoload
 (defun majutsu--bookmark-read-move-args ()
   "Return interactive arguments for bookmark move commands."
   (let* ((existing (majutsu--get-bookmark-names))
          (table (majutsu--completion-table-with-category existing 'majutsu-bookmark))
          (crm-separator (or (bound-and-true-p crm-separator) ", *"))
-         (names (completing-read-multiple "Move bookmark(s): " table nil t))
+         (closest (jj--get-closest-parent-bookmark-names))
+         (names (completing-read-multiple "Move bookmark(s): " table nil t (string-join closest ",")))
          (at (or (majutsu-log--revset-at-point) "@"))
          (rev (read-string (format "Target revision (default %s): " at) nil nil at)))
     (ignore crm-separator)
