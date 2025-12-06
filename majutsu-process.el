@@ -11,7 +11,8 @@
 
 ;;; Commentary:
 
-;; Process execution and with-editor integration for Majutsu.
+;; This library runs jj commands synchronously and asynchronously,
+;; integrating with with-editor and handling ANSI coloring.
 
 ;;; Code:
 
@@ -224,7 +225,7 @@ outer shell quoting that `with-editor' adds, matching Magit's workaround."
                         with-editor-server-window-alist
                         :test #'string=)
         (push (cons majutsu--with-editor-description-regexp
-                    (or majutsu-message-display-function #'pop-to-buffer))
+                    (majutsu--display-function 'message))
               with-editor-server-window-alist)))
     (when (boundp 'with-editor-filter-visit-hook)
       (unless (memq #'majutsu--with-editor--apply-visit with-editor-filter-visit-hook)
@@ -282,7 +283,7 @@ outer shell quoting that `with-editor' adds, matching Magit's workaround."
       (with-selected-window window
         (switch-to-buffer buffer)))
      ((buffer-live-p buffer)
-      (majutsu--display-buffer-for-editor buffer))))
+      (majutsu-display-buffer buffer 'message))))
   (remove-hook 'with-editor-post-finish-hook #'majutsu--with-editor--restore-context t)
   (remove-hook 'with-editor-post-cancel-hook #'majutsu--with-editor--restore-context t))
 
@@ -369,5 +370,6 @@ On success, display SUCCESS-MSG and refresh the log; otherwise use ERROR-MSG."
                                (string-join args " "))
     process))
 
+;;; _
 (provide 'majutsu-process)
 ;;; majutsu-process.el ends here

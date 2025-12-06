@@ -9,16 +9,13 @@
 
 ;;; Commentary:
 
-;; Optional Evil integration for Majutsu.  This file defines native Evil
-;; keybindings so Majutsu users no longer need an external Doom module or
-;; evil-collection recipe to get a consistent experience.
+;; This library adds optional Evil keybindings for Majutsu without
+;; depending on evil-collection.
 
 ;;; Code:
 
 (require 'majutsu-core)
-(require 'majutsu-commands)
 (require 'majutsu-log)
-(require 'majutsu-transient)
 
 (eval-when-compile
   ;; Silence byte-compile when Evil isn't installed at build time.
@@ -54,6 +51,8 @@ When nil, Majutsu leaves Evil's state untouched."
 STATES can be a symbol or list.  KEYMAP can be a symbol or list of
 symbols/maps.  Mirrors `evil-collection-define-key' to defer any
 macro expansion until Evil is actually present."
+  (declare (indent 2)
+           (states keymap &rest bindings))
   (when (and (featurep 'evil) (fboundp 'evil-define-key*))
     (let* ((states (if (listp states) states (list states)))
            (maps (if (listp keymap) keymap (list keymap))))
@@ -81,13 +80,11 @@ macro expansion until Evil is actually present."
   "Install Evil keybindings for Majutsu maps."
   ;; Normal/visual/motion share the same bindings for navigation commands.
   (majutsu-evil--define-keys '(normal visual motion) 'majutsu-mode-map
-    (kbd ".") #'majutsu-log-goto-@
-    (kbd "R") #'majutsu-log-refresh
-    (kbd "g r") #'majutsu-log-refresh
+    (kbd "R") #'majutsu-refresh
+    (kbd "g r") #'majutsu-refresh
     (kbd "c") #'majutsu-describe
     (kbd "C") #'majutsu-commit
     (kbd "o") #'majutsu-new-transient
-    (kbd "O") #'majutsu-new
     (kbd "e") #'majutsu-edit-changeset
     (kbd "u") #'majutsu-undo
     (kbd "C-r") #'majutsu-redo
@@ -105,7 +102,16 @@ macro expansion until Evil is actually present."
 
   (majutsu-evil--define-keys 'normal 'majutsu-mode-map
     (kbd "y") #'majutsu-duplicate-transient
-    (kbd "Y") #'majutsu-duplicate))
+    (kbd "Y") #'majutsu-duplicate)
+
+  (majutsu-evil--define-keys '(normal visual) 'majutsu-diff-mode-map
+    (kbd "g d") #'majutsu-jump-to-diffstat-or-diff)
+
+  (majutsu-evil--define-keys '(normal visual motion) 'majutsu-log-mode-map
+    (kbd ".") #'majutsu-log-goto-@
+    (kbd "O") #'majutsu-new
+    (kbd "I") #'majutsu-new-with-before
+    (kbd "A") #'majutsu-new-with-after))
 
 ;;;###autoload
 (defun majutsu-evil-setup ()
@@ -124,5 +130,6 @@ Safe to call multiple times.  Set
   (add-hook 'majutsu-mode-hook #'turn-off-evil-snipe-mode)
   (add-hook 'majutsu-mode-hook #'turn-off-evil-snipe-override-mode))
 
+;;; _
 (provide 'majutsu-evil)
 ;;; majutsu-evil.el ends here
