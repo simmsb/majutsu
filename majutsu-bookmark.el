@@ -132,7 +132,6 @@ When ALL-REMOTES is non-nil, include remote bookmarks formatted as NAME@REMOTE."
                        (list "-T" template))))
     (delete-dups (split-string (apply #'majutsu-run-jj args) "\n" t))))
 
-
 ;;;###autoload
 (defun majutsu-read-bookmarks (prompt &optional init-input history)
   "Return interactive arguments for bookmark move commands."
