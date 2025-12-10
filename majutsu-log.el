@@ -388,7 +388,7 @@ automatically even if omitted or hidden."
 (defun majutsu-log--invalidate-template-cache (&rest _)
   "Reset cached compiled template when layout changes."
   (setq majutsu-log--compiled-template-cache nil)
-  (setq majutsu-log--cached-entries nil))
+  (setq-local majutsu-log--cached-entries nil))
 
 (when (fboundp 'add-variable-watcher)
   (add-variable-watcher 'majutsu-log-commit-columns
