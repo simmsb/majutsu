@@ -17,8 +17,6 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
-(require 'eieio)
-(require 'magit-section)
 
 ;;; Customization
 

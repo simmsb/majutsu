@@ -533,7 +533,7 @@ Note: This must return a valid JSON string (usually via :json) to be parsed corr
 (defun majutsu-log--invalidate-template-cache (&rest _)
   "Reset cached compiled template when layout changes."
   (setq majutsu-log--compiled-template-cache nil)
-  (setq majutsu-log--cached-entries nil))
+  (setq-local majutsu-log--cached-entries nil))
 
 (defun majutsu-log--normalize-column-spec (spec)
   "Normalize a single column SPEC into a plist with defaults."
