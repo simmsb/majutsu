@@ -18,50 +18,17 @@
 
 ;;; Edit
 
-(defun majutsu-enter-dwim ()
-  "Context-sensitive Enter key behavior."
-  (interactive)
-  (let ((section (magit-current-section)))
-    (cond
-     ;; On a changeset/commit - edit it with jj edit
-     ((and section
-           (eq (oref section type) 'majutsu-revision-section)
-           (slot-boundp section 'commit-id))
-      (majutsu-edit-changeset-at-point))
+;;;###autoload
+(defun majutsu-edit-changeset (&optional arg)
+  "Edit commit at point.
 
-     ;; On a diff hunk line - jump to that line in the file
-     ((and section
-           (eq (oref section type) 'majutsu-hunk-section)
-           (slot-boundp section 'file))
-      (majutsu-goto-diff-line))
-
-     ;; On a file section - visit the file
-     ((and section
-           (eq (oref section type) 'majutsu-file-section)
-           (slot-boundp section 'file))
-      (majutsu-visit-file)))))
-
-(defun majutsu-edit-changeset ()
-  "Edit commit at point."
-  (interactive)
-  (when-let* ((revset (majutsu-log--revset-at-point)))
-    (let ((result (majutsu-run-jj "edit" revset)))
-      (if (majutsu--handle-command-result (list "edit" revset) result
-                                          (format "Now editing commit %s" revset)
-                                          "Failed to edit commit")
-          (majutsu-log-refresh)))))
-
-(defun majutsu-edit-changeset-at-point ()
-  "Edit the commit at point using jj edit."
-  (interactive)
-  (when-let* ((revset (majutsu-log--revset-at-point)))
-    (let ((result (majutsu-run-jj "edit" revset)))
-      (if (majutsu--handle-command-result (list "edit" revset) result
-                                          (format "Now editing revset %s" revset)
-                                          "Failed to edit commit")
-          (progn
-            (majutsu-log-refresh)
-            (back-to-indentation))))))
+With prefix ARG, pass --ignore-immutable."
+  (interactive "P")
+  (when-let* ((revset (magit-section-value-if 'jj-commit))
+              (args (append (list "edit" revset)
+                            (when arg (list "--ignore-immutable")))))
+    (when (zerop (apply #'majutsu-call-jj args))
+      (message "Now editing commit %s" revset))))
 
 ;;; _
 (provide 'majutsu-edit)

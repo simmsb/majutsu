@@ -3,10 +3,12 @@
 Majutsu provides a magit-inspired interface for [[https://github.com/martinvonz/jj][Jujutsu]], offering an efficient
 way to interact with JJ repositories from within Emacs.
 
-This project started life as a fork of [[https://github.com/bolivier/jj-mode.el][bolivier/jj-mode.el]]. I dropped the fork
-relationship after deciding to pursue breaking changes —most notably a reworked
-Magit-style log UI, a new template DSL, and different window/message
-handling—that fundamentally diverge from the original package’s scope.
+This project started as a fork of [[https://github.com/bolivier/jj-mode.el][bolivier/jj-mode.el]] and was later renamed to
+Majutsu. The codebase has since been heavily refactored—with a Magit-style log
+UI, a new template DSL, and reworked window/message handling—so it is no longer
+drop-in compatible with the upstream package. The GitHub fork flag was removed
+to avoid implying compatibility; this is an independently maintained fork. Many
+thanks to the original authors for the initial codebase.
 
 * Features
 - *Magit-style log viewer* with collapsible sections and syntax highlighting
@@ -26,7 +28,7 @@ handling—that fundamentally diverge from the original package’s scope.
 
 * Requirements
 - Emacs 26.1 or later
-- [[https://github.com/jj-vcs/jj][Jujutsu (jj)]] (v0.35.0) installed and in PATH
+- [[https://github.com/jj-vcs/jj][Jujutsu (jj)]] (v0.36.0) installed and in PATH
 - [[https://magit.vc/][magit]] (for section management and UI components)
 - [[https://github.com/magit/transient][transient]] (usually bundled with magit)
 - [[https://github.com/magit/with-editor][with-editor]] (usually bundled with magit)
@@ -36,7 +38,7 @@ handling—that fundamentally diverge from the original package’s scope.
 - Native Evil integration ships in-tree (~majutsu-evil.el~)
 - Asynchronous refresh for ~majutsu-log~, ~majutsu-diff~, ~majutsu-git-fetch~ and ~majutsu-git-push~
 - ~majutsu-op-log~ debuts for quickly auditing recent JJ commands
-- ~majutsu-rebase-transient~ exposes both source (~-b~ ~-r~ ~-s~) and destination (~-d~ ~-A~ ~-B~) toggles
+- ~majutsu-rebase-transient~ exposes both source (~-b~ ~-r~ ~-s~) and destination (~-o~ ~-A~ ~-B~) toggles
 
 * Installation
 ** Doom Emacs
@@ -74,11 +76,12 @@ S-TAB, M-n/M-p, etc.) remain available. The lists below mirror the bindings in
 
 *** Navigation
 - ~n~ / ~p~ - Move to the next/previous changeset in log buffers
-- ~RET~ - Run ~majutsu-enter-dwim~ (visit file, expand section, etc.)
+- ~RET~ - Run ~majutsu-visit-thing~ (visit file, edit revision, etc.)
 - ~.~ - Goto ~@~ (current) section
 
 *** Primary Commands (~majutsu-mode-map~)
 - ~g~ - Refresh the log (~majutsu-log-refresh~)
+- ~$~ - Show the per-repo process buffer (~majutsu-process-buffer~)
 - ~l~ - Open the log options transient
 - ~?~ - Open the Majutsu dispatcher (~majutsu-dispatch~)
 - ~C~ / ~c~ - Commit / describe the change at point
@@ -122,11 +125,12 @@ columns:
 - ~c~ - Clear all selections
 - ~m~ - Set the initial commit message
 - ~e~ - Toggle ~--no-edit~
+- ~-I~ - Toggle ~--ignore-immutable~
 - ~n~ / ~RET~ - Create the new change with the current selections
 
 *** Duplicate (~y~)
 - ~y~ - Mark or unmark sources (defaults to the change at point or ~@~)
-- ~d~ - Toggle ~--destination~ parents
+- ~d~ - Toggle ~--onto~ parents
 - ~a~ / ~b~ - Toggle ~--after~ / ~--before~ parents
 - ~c~ - Clear selections
 - ~RET~ / ~p~ - Execute duplicate with the current selections
@@ -136,6 +140,7 @@ columns:
 - ~t~ - Select the destination
 - ~c~ - Clear selections
 - ~-k~ - Keep emptied commits
+- ~-I~ - Toggle ~--ignore-immutable~
 - ~s~ - Execute squash (DWIMs when only sources are marked)
 - ~b~ / ~q~ - Bury or quit the transient
 
@@ -150,10 +155,11 @@ columns:
 - ~s~ - Select the source revision
 - ~S~ - Cycle the source flag (~-s~, ~-b~, ~-r~)
 - ~d~ - Toggle destinations
-- ~D~ - Cycle the destination flag (~-d~, ~-A~, ~-B~)
+- ~D~ - Cycle the destination flag (~-o~, ~-A~, ~-B~)
 - ~c~ - Clear selections
 - ~-se~ - Toggle ~--skip-emptied~
 - ~-kd~ - Toggle ~--keep-divergent~
+- ~-I~ - Toggle ~--ignore-immutable~
 - ~r~ - Execute the rebase
 
 *** Bookmark (~b~)
@@ -163,8 +169,10 @@ columns:
 - ~m~ / ~M~ - Move bookmarks (with or without ~--allow-backwards~)
 - ~r~ - Rename a bookmark
 - ~t~ / ~u~ - Track or untrack a remote bookmark
+- ~g~ - Fetch remote
 - ~d~ - Delete (propagate) a bookmark
 - ~f~ - Forget a local bookmark
+- ~-I~ - Toggle ~--ignore-immutable~
 
 *** Git (~G~)
 - ~p~ - Open the push transient (supports ~-R~ remote, ~-b~ bookmark, ~-a~, ~-t~, ~-D~, ~-n~,
@@ -198,13 +206,14 @@ motion states (and mirrors the ~RET~ binding onto ~majutsu-diff-mode-map~):
 
 - ~.~ → ~majutsu-log-goto-@~
 - ~R~ / ~g r~ → ~majutsu-log-refresh~
+- ~`~ → ~majutsu-process-buffer~
 - ~c~ → ~majutsu-describe~
 - ~C~ → ~majutsu-commit~
 - ~e~ → ~majutsu-edit-changeset~
 - ~u~ → ~majutsu-undo~
 - ~C-r~ → ~majutsu-redo~
-- ~o~ → ~majtusu-new-transient~
-- ~O~ → ~majtusu-new~
+- ~o~ → ~majutsu-new-transient~
+- ~O~ → ~majutsu-new~
 - ~I~ → ~majutsu-new~ with ~--before~ current revision
 - ~A~ → ~majutsu-new~ with ~--after~ current revision
 - ~s~ → ~majutsu-squash-transient~
@@ -218,7 +227,7 @@ motion states (and mirrors the ~RET~ binding onto ~majutsu-diff-mode-map~):
 - ~E~ → ~majutsu-diffedit-emacs~
 - ~M~ → ~majutsu-diffedit-smerge~
 - ~?~ → ~majutsu-dispatch~
-- ~RET~ → ~majutsu-enter-dwim~
+- ~RET~ → ~majutsu-visit-thing~
 
 When [[https://github.com/hlissner/evil-snipe][evil-snipe]] is present, Majutsu automatically calls ~turn-off-evil-snipe-mode~
 and ~turn-off-evil-snipe-override-mode~ on ~majutsu-mode-hook~ to avoid conflicting
@@ -232,6 +241,15 @@ directly from Elisp.
 - Keyword sugar covers JJ built-ins plus helpers registered with ~majutsu-
   template-defkeyword~ or methods declared with ~:keyword t~.
 - Usage patterns and safeguards live in =test/majutsu-template-test.el=.
+
+* Credits
+Majutsu began as a fork of [[https://github.com/bolivier/jj-mode.el][bolivier/jj-mode.el]] by Brandon Olivier and
+has since grown into an independent project.
+
+It stands on the shoulders of [[https://github.com/jj-vcs/jj][Jujutsu]] — the DVCS it wraps — and both
+depends on and draws interface inspiration from [[https://magit.vc/][Magit]] (sections,
+transients, with-editor). Thank you to both communities for the tools,
+ideas, and care that make this package possible.
 
 * Contributing
 Issues and pull requests welcome! This project aims to provide a solid JJ

@@ -16,6 +16,7 @@
 
 ;;; majutsu-commit
 
+;;;###autoload
 (defun majutsu-commit ()
   "Create a commit using Emacs as the editor."
   (interactive)
@@ -25,11 +26,15 @@
 
 ;;; majutsu-describe
 
-(defun majutsu-describe ()
-  "Update the description for the commit at point."
-  (interactive)
-  (let ((revset (or (majutsu-log--revset-at-point) "@")))
-    (majutsu--with-editor-run (list "describe" "-r" revset)
+;;;###autoload
+(defun majutsu-describe (&optional arg)
+  "Update the description for the commit at point.
+With prefix ARG, add --ignore-immutable."
+  (interactive "P")
+  (let* ((revset (or (magit-section-value-if 'jj-commit) "@"))
+         (args (append (list "describe" "-r" revset)
+                       (when arg '("--ignore-immutable")))))
+    (majutsu--with-editor-run args
                               (format "Description updated for %s" revset)
                               "Failed to update description")))
 

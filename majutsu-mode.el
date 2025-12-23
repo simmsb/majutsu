@@ -15,16 +15,16 @@
 ;;; Code:
 
 (require 'majutsu-base)
-(require 'magit-section)
 
 ;;; Keymap
 
 (defvar-keymap majutsu-mode-map
   :doc "Parent keymap for modes derived from `majutsu-mode'."
   :parent magit-section-mode-map
-  "RET" 'majutsu-enter-dwim
+  "RET" 'majutsu-visit-thing
   "g"   'majutsu-refresh
   "q"   'quit-window
+  "$"   'majutsu-process-buffer
   "l"   'majutsu-log-transient
   "?"   'majutsu-dispatch
   "c"   'majutsu-describe
@@ -43,36 +43,24 @@
   "C-/" 'majutsu-undo
   "C-?" 'majutsu-redo)
 
+;;; Visit
+
+(defun majutsu-visit-thing ()
+  "Visit the thing at point.
+
+This is a placeholder command.  Where applicable, section-specific
+keymaps remap this command to another command that visits the thing at
+  point."
+  (declare (completion ignore))
+  (interactive)
+  (if-let* ((url (thing-at-point 'url t)))
+      (browse-url url)
+    (user-error "There is no thing at point that could be visited")))
+
 ;;; Helpers
 
-(defun majutsu--buffer-root (&optional buffer)
-  "Return the cached repo root for BUFFER (default `current-buffer').
-Falls back to `majutsu--root' when available.  This is used to match
-buffers to repositories when refreshing."
-  (with-current-buffer (or buffer (current-buffer))
-    (or (and (boundp 'majutsu--repo-root) majutsu--repo-root)
-        (ignore-errors (majutsu--root)))))
-
-(defun majutsu--find-mode-buffer (mode &optional root)
-  "Return a live buffer in MODE for ROOT (or any repo when ROOT is nil)."
-  (let ((root (or root (majutsu--buffer-root))))
-    (seq-find (lambda (buf)
-                (with-current-buffer buf
-                  (and (derived-mode-p mode)
-                       (or (null root)
-                           (equal (majutsu--buffer-root buf) root)))))
-              (buffer-list))))
-
-(defun majutsu--resolve-mode-buffer (mode &optional root)
-  "Prefer the current buffer if it is in MODE; otherwise find one for ROOT."
-  (if (derived-mode-p mode)
-      (current-buffer)
-    (majutsu--find-mode-buffer mode root)))
-
-(defun majutsu--assert-mode (mode)
-  "Signal a user error unless the current buffer derives from MODE."
-  (unless (derived-mode-p mode)
-    (user-error "Command is only valid in %s buffers" mode)))
+(defvar majutsu-inhibit-refresh nil
+  "When non-nil, inhibit refreshing Majutsu buffers.")
 
 (defun majutsu--refresh-buffer-function ()
   "Return the refresh function for the current Majutsu buffer, if any.
@@ -89,16 +77,29 @@ The function name is derived from `major-mode' by replacing the
   "Refresh the current Majutsu buffer, ensuring the buffer type matches.
 This is suitable for use as `revert-buffer-function'."
   (interactive)
-  (unless (derived-mode-p 'majutsu-mode)
-    (user-error "Current buffer is not a Majutsu buffer"))
-  (if-let ((fn (majutsu--refresh-buffer-function)))
+  (majutsu--assert-mode 'majutsu-mode)
+  (if-let* ((fn (majutsu--refresh-buffer-function)))
       (funcall fn)
     (user-error "No refresh function defined for %s" major-mode)))
 
 (defun majutsu-refresh ()
-  "Refresh the current Majutsu buffer (Magit-style `g`)."
+  "Refresh Majutsu buffers belonging to the current repository.
+
+Refresh the current buffer if its major mode derives from
+`majutsu-mode', and refresh the corresponding log buffer."
   (interactive)
-  (majutsu-refresh-buffer))
+  (unless majutsu-inhibit-refresh
+    (let ((root (majutsu--buffer-root)))
+      (when (derived-mode-p 'majutsu-mode)
+        (if (called-interactively-p 'interactive)
+            (majutsu-refresh-buffer)
+          (ignore-errors (majutsu-refresh-buffer))))
+      (when (and root
+                 (not (derived-mode-p 'majutsu-log-mode))
+                 (fboundp 'majutsu-log-refresh))
+        (when-let ((buffer (majutsu--find-mode-buffer 'majutsu-log-mode root)))
+          (with-current-buffer buffer
+            (ignore-errors (majutsu-log-refresh))))))))
 
 (defun majutsu-hack-dir-local-variables ()
   "Like `hack-dir-local-variables-non-file-buffer' but ignore some variables.
@@ -118,4 +119,8 @@ when the user has strict .dir-locals.el settings."
 
 ;;; _
 (provide 'majutsu-mode)
+
+(with-eval-after-load 'evil
+  (require 'majutsu-evil nil t))
+
 ;;; majutsu-mode.el ends here

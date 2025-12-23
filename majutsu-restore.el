@@ -18,16 +18,15 @@
 
 ;;; Abandon
 
+;;;###autoload
 (defun majutsu-abandon ()
   "Abandon the changeset at point."
   (interactive)
-  (if-let* ((revset (majutsu-log--revset-at-point)))
+  (if-let* ((revset (magit-section-value-if 'jj-commit)))
       (if (and majutsu-confirm-critical-actions
                (not (yes-or-no-p (format "Abandon changeset %s? " revset))))
           (message "Abandon canceled")
-        (progn
-          (majutsu-run-jj "abandon" "-r" revset)
-          (majutsu-log-refresh)))
+        (majutsu-call-jj "abandon" "-r" revset))
     (message "No changeset at point to abandon")))
 
 ;;; _

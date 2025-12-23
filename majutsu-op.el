@@ -17,31 +17,31 @@
 
 ;;; majutsu-undo
 
+;;;###autoload
 (defun majutsu-undo ()
   "Undo the last change."
   (interactive)
   (if (and majutsu-confirm-critical-actions
            (not (yes-or-no-p "Undo the most recent change? ")))
       (message "Undo canceled")
-    (let ((revset (majutsu-log--revset-at-point)))
-      (majutsu-run-jj "undo")
-      (majutsu-log-refresh)
-      (when revset
-        (majutsu-goto-commit revset)))))
+    (let ((revset (magit-section-value-if 'jj-commit)))
+      (when (zerop (majutsu-call-jj "undo"))
+        (when revset
+          (majutsu-goto-commit revset))))))
 
 ;;; majutsu-redo
 
+;;;###autoload
 (defun majutsu-redo ()
   "Redo the last undone change."
   (interactive)
   (if (and majutsu-confirm-critical-actions
            (not (yes-or-no-p "Redo the previously undone change? ")))
       (message "Redo canceled")
-    (let ((revset (majutsu-log--revset-at-point)))
-      (majutsu-run-jj "redo")
-      (majutsu-log-refresh)
-      (when revset
-        (majutsu-goto-commit revset)))))
+    (let ((revset (magit-section-value-if 'jj-commit)))
+      (when (zerop (majutsu-call-jj "redo"))
+        (when revset
+          (majutsu-goto-commit revset))))))
 
 ;;; op log
 

@@ -14,8 +14,7 @@
 
 ;;; Code:
 
-(require 'majutsu-core)
-(require 'majutsu-log)
+(require 'majutsu)
 
 (eval-when-compile
   ;; Silence byte-compile when Evil isn't installed at build time.
@@ -82,6 +81,7 @@ macro expansion until Evil is actually present."
   (majutsu-evil--define-keys '(normal visual motion) 'majutsu-mode-map
     (kbd "R") #'majutsu-refresh
     (kbd "g r") #'majutsu-refresh
+    (kbd "`") #'majutsu-process-buffer
     (kbd "c") #'majutsu-describe
     (kbd "C") #'majutsu-commit
     (kbd "o") #'majutsu-new-transient
@@ -98,7 +98,7 @@ macro expansion until Evil is actually present."
     (kbd "E") #'majutsu-diffedit-emacs
     (kbd "M") #'majutsu-diffedit-smerge
     (kbd "?") #'majutsu-dispatch
-    (kbd "RET") #'majutsu-enter-dwim)
+    (kbd "RET") #'majutsu-visit-thing)
 
   (majutsu-evil--define-keys 'normal 'majutsu-mode-map
     (kbd "y") #'majutsu-duplicate-transient

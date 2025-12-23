@@ -16,9 +16,10 @@
 ;;; Code:
 
 (require 'majutsu-core)
+(require 'majutsu-mode)
 (require 'majutsu-process)
 (require 'majutsu-log)
-(require 'magit-section)
+(require 'magit-diff)      ; for faces/font-lock keywords
 (require 'diff-mode)
 (require 'smerge-mode)
 
@@ -83,127 +84,140 @@ otherwise fall back to the current buffer's `tab-width'."
   :group 'majutsu
   :type 'boolean)
 
+(defface majutsu-diffstat-binary
+  '((t :inherit font-lock-constant-face :foreground "#81c8be"))
+  "Face for the (binary) label in diffstat entries."
+  :group 'majutsu)
+
 (defvar majutsu-diff--tab-width-cache nil
   "Alist mapping file names to cached tab widths.")
 
 (defvar-local majutsu-diff--last-refined-section nil)
 (defvar-local majutsu-diff--context-lines nil)
+(defvar-local majutsu-diff--paint-whitespace-enabled t)
+(defvar-local majutsu-diff--inserted-bytes 0)
+(defvar-local majutsu-diff--paint-whitespace-enabled t)
+(defcustom majutsu-diff-whitespace-max-chars 12000
+  "Skip whitespace painting for hunks larger than this many chars.
+Set to nil to always paint whitespace inside hunks."
+  :group 'majutsu
+  :type '(choice (const :tag "No limit" nil)
+          (integer :tag "Max characters")))
+(defcustom majutsu-diff-whitespace-max-bytes 800000
+  "Disable whitespace painting when a diff exceeds this many bytes.
+Set to nil to always allow painting."
+  :group 'majutsu
+  :type '(choice (const :tag "No limit" nil)
+          (integer :tag "Max bytes")))
 
-(defun majutsu-diff--stat-args (args)
-  "Return ARGS amended with `--stat', stripping `--git'.
-JJ emits a full patch when `--git` is present; for a clean summary we
-drop it and ensure a single `--stat`."
-  (let ((res '())
-        (rest args)
-        added)
-    (while rest
-      (pcase rest
-        (`("--stat" . ,more)
-         (setq rest more added t))
-        (`("--git" . ,more)
-         (setq rest more))
-        (_
-         (push (car rest) res)
-         (setq rest (cdr rest)))))
-    (unless added
-      (push "--stat" res))
-    (nreverse res)))
+(defun majutsu-diff--ensure-flag (args flag)
+  "Return ARGS ensuring FLAG is present once at the end."
+  (if (member flag args) args (append args (list flag))))
 
-(defun majutsu-diff--color-diffstat-graph (graph)
-  "Return GRAPH string with +/- colored like Magit."
-  (apply #'concat
-         (mapcar (lambda (ch)
-                   (propertize (string ch) 'font-lock-face
-                               (cond ((eq ch ?+) 'magit-diffstat-added)
-                                     ((eq ch ?-) 'magit-diffstat-removed)
-                                     (t 'default))))
-                 graph)))
+(defun majutsu-diff--delete-line ()
+  "Delete current line, including trailing newline if present."
+  (delete-region (line-beginning-position)
+                 (min (point-max) (1+ (line-end-position)))))
 
-(defconst majutsu-diff--statline-re
-  (rx line-start
-      (? " ")
-      (group (+? (not (any "\n"))))   ; file name
-      (1+ (any " \t")) "|" (1+ (any " \t"))
-      (group (+ digit))                 ; count
-      (1+ (any " \t"))
-      (group (* "+"))                  ; adds bar
-      (group (* "-"))                  ; dels bar
-      line-end))
+(defconst majutsu-diff-statline-re
+  (concat "^ ?"
+          "\\(.*\\)"     ; file
+          "\\( +| +\\)"  ; separator
+          "\\("
+          "\\(?:[0-9]+\\)"
+          "\\|"
+          "(binary)\\(?: +[+-][0-9]+ bytes\\)?"
+          "\\)"
+          "\\(?: +\\(\\+*\\)\\(-*\\)\\)?$") ; add/del graph (optional)
+  "Regexp matching `jj diff --stat` entries, modeled after Magit's statline.")
 
-(defun majutsu-diff--insert-stat-section (stat-output)
-  "Insert a diffstat section rendered from STAT-OUTPUT."
-  (let ((lines (split-string stat-output "\n" t))
-        (summary-lines '())
-        (inserted nil))
-    (when lines
+(defun majutsu-diff--collect-diff-files ()
+  "Return a list of file paths from \"diff --git\" headers in the buffer.
+The list is in the same order as the diff headers appear."
+  (save-excursion
+    (goto-char (point-min))
+    (let (files)
+      (while (re-search-forward "^diff --git a/\\(.*\\) b/\\(.*\\)$" nil t)
+        (push (match-string 2) files))
+      (nreverse files))))
+
+(defun majutsu-diff-wash-diffstat ()
+  "Wash the diffstat produced by `jj diff --stat'.
+
+Assumes point is at the start of the diff output and that the output was
+generated using `--git --stat', meaning the diffstat appears before the
+first \"diff --git\" header."
+  (let ((files (majutsu-diff--collect-diff-files))
+        heading
+        (beg (point)))
+    ;; Like `magit-diff-wash-diffstat': find the summary line first, delete it,
+    ;; then rewrite each stat line as a `diffstat' section.
+    (when (re-search-forward "^ ?\\([0-9]+ +files? change[^\n]*\n\\)" nil t)
+      (setq heading (match-string 1))
+      (delete-region (match-beginning 0) (match-end 0))
+      (goto-char beg)
       (magit-insert-section (diffstat)
-        (magit-insert-heading (propertize "Summary (--stat)" 'font-lock-face 'magit-section-heading))
-        (dolist (line lines)
-          (let ((plain (substring-no-properties line)))
-            (cond
-             ;; File line: "<file> | <count> <graph>"
-             ((string-match majutsu-diff--statline-re plain)
-              (setq inserted t)
-              (let* ((file (string-trim (match-string 1 plain)))
-                     (count (match-string 2 plain))
-                     (adds (match-string 3 plain))
-                     (dels (match-string 4 plain))
-                     (graph (concat adds dels))
-                     (colored (majutsu-diff--color-diffstat-graph graph)))
-                (magit-insert-section (majutsu-diffstat-file-section file nil :file file)
-                  (insert (propertize file 'font-lock-face 'magit-filename))
-                  (insert " | " count)
-                  (when (and graph (not (string-empty-p graph)))
-                    (insert " " colored))
-                  (insert "\n"))))
-             ;; Summary line
-             ((string-match "files changed" plain)
-              (push plain summary-lines))
-             (t))))
-        (when summary-lines
-          (insert (string-join (nreverse summary-lines) "\n") "\n"))
-        (when inserted
-          (insert "\n"))))))
+        (magit-insert-heading
+          (propertize heading 'font-lock-face 'magit-diff-file-heading))
+        (while (looking-at majutsu-diff-statline-re)
+          (let* ((file (match-string 1))
+                 (sep  (match-string 2))
+                 (cnt  (match-string 3))
+                 (add  (match-string 4))
+                 (del  (match-string 5)))
+            (majutsu-diff--delete-line)
+            (when (string-match " +$" file)
+              (setq sep (concat (match-string 0 file) sep))
+              (setq file (substring file 0 (match-beginning 0))))
+            (setq file (string-trim-right file))
+            (magit-insert-section (jj-file (pop files))
+              (insert (magit-format-file 'stat file 'magit-filename))
+              (insert sep)
+              (cond
+               ((string-match "\\`(binary)\\(?: +\\([+-][0-9]+\\) bytes\\)?\\'" cnt)
+                (insert (propertize "(binary)" 'font-lock-face
+                                    'majutsu-diffstat-binary))
+                (when-let ((delta (match-string 1 cnt)))
+                  (insert " "
+                          (propertize delta 'font-lock-face
+                                      (if (string-prefix-p "-" delta)
+                                          'magit-diffstat-removed
+                                        'magit-diffstat-added))
+                          " bytes")))
+               (t
+                (insert cnt)))
+              (insert " ")
+              (when add
+                (insert (propertize add 'font-lock-face
+                                    'magit-diffstat-added)))
+              (when del
+                (insert (propertize del 'font-lock-face
+                                    'magit-diffstat-removed)))
+              (insert "\n"))))
+        (if (looking-at "^$") (forward-line) (insert "\n"))))))
 
-(defun majutsu-diff--find-section (pred section)
-  "Depth-first search SECTION tree for PRED."
-  (or (when (funcall pred section) section)
-      (seq-some (lambda (child)
-                  (majutsu-diff--find-section pred child))
-                (oref section children))))
-
-(defun majutsu-diff--goto-file-section (file)
-  "Jump to diff body section for FILE."
-  (if-let ((sec (majutsu-diff--find-section
-                 (lambda (s)
-                   (and (object-of-class-p s 'majutsu-file-section)
-                        (equal (oref s file) file)))
-                 magit-root-section)))
-      (magit-section-goto sec)
-    (user-error "No diff found for %s" file)))
-
-(defun majutsu-diff--goto-stat-section (file)
-  "Jump to diffstat entry for FILE."
-  (if-let ((sec (majutsu-diff--find-section
-                 (lambda (s)
-                   (and (object-of-class-p s 'majutsu-diffstat-file-section)
-                        (equal (oref s file) file)))
-                 magit-root-section)))
-      (magit-section-goto sec)
-    (user-error "No diffstat entry for %s" file)))
-
-(defun majutsu-jump-to-diffstat-or-diff ()
-  "Jump between diffstat entry and its patch body."
-  (interactive)
-  (let ((sec (magit-current-section)))
-    (cond
-     ((object-of-class-p sec 'majutsu-diffstat-file-section)
-      (majutsu-diff--goto-file-section (oref sec file)))
-     ((object-of-class-p sec 'majutsu-hunk-section)
-      (majutsu-diff--goto-stat-section (oref sec file)))
-     ((object-of-class-p sec 'majutsu-file-section)
-      (majutsu-diff--goto-stat-section (oref sec file)))
-     (t (user-error "Not on a file entry")))))
+(defun majutsu-jump-to-diffstat-or-diff (&optional expand)
+  "Jump to the diffstat or diff.
+When point is on a file inside the diffstat section, then jump
+to the respective diff section, otherwise jump to the diffstat
+section or a child thereof."
+  (interactive "P")
+  (cond-let
+    ([section
+      (magit-get-section
+       (append
+        (magit-section-case
+          ([jj-file diffstat] `((jj-file . ,(oref it value)) (diff-root)))
+          (jj-file `((jj-file . ,(oref it value)) (diffstat) (diff-root)))
+          (jj-hunk `((jj-file . ,(magit-section-parent-value it))
+                     (diffstat) (diff-root)))
+          (t '((diffstat) (diff-root))))
+        (magit-section-ident magit-root-section)))]
+     (goto-char (oref section start))
+     (when expand
+       (with-local-quit (magit-section-show section))
+       (recenter 0)))
+    ((user-error "No diffstat in this buffer"))))
 
 ;;; Diff Parsing & Display
 
@@ -222,7 +236,10 @@ drop it and ensure a single `--stat`."
 
 (defun majutsu-diff--paint-hunk-whitespace (start end file)
   "Paint tabs and trailing whitespace between START and END for FILE."
-  (when majutsu-diff-paint-whitespace
+  (when (and majutsu-diff--paint-whitespace-enabled
+             majutsu-diff-paint-whitespace
+             (or (not majutsu-diff-whitespace-max-chars)
+                 (<= (- end start) majutsu-diff-whitespace-max-chars)))
     (let ((tabw (majutsu-diff--tab-width file)))
       (save-excursion
         (goto-char start)
@@ -307,6 +324,77 @@ drop it and ensure a single `--stat`."
     (when (and in-file-section current-file)
       (majutsu--insert-file-section current-file file-section-content))))
 
+(defun majutsu-diff-wash-diffs (args)
+  "Parse a jj diff already inserted into the current buffer.
+Assumes point is at the start of the diff output."
+  (goto-char (point-min))
+  (when (member "--stat" args)
+    (majutsu-diff-wash-diffstat))
+  (goto-char (point-min))
+  (when (re-search-forward "^diff --git " nil t)
+    (goto-char (match-beginning 0)))
+  (cond
+   ((looking-at "^diff --git ")
+    (while (and (not (eobp))
+                (looking-at "^diff --git "))
+      (majutsu-diff-wash-file))
+    (unless (bolp) (insert "\n")))
+   ((save-excursion
+      (goto-char (point-min))
+      (looking-at-p (rx (* (any " \t\n")) eos)))
+    (insert (propertize "(No diff)" 'face 'shadow)))))
+
+(defun majutsu-diff-wash-file ()
+  "Parse a single file section at point and wrap it in Magit sections."
+  (when (looking-at "^diff --git a/\\(.*\\) b/\\(.*\\)$")
+    (let* ((file-a (match-string 1))
+           (file-b (match-string 2))
+           (file (or file-b file-a))
+           (headers nil))
+      ;; Drop the diff header line; keep the rest of the text in place.
+      (majutsu-diff--delete-line)
+      ;; Collect extended headers
+      (while (and (not (eobp))
+                  (not (looking-at "^diff --git "))
+                  (not (looking-at "^@@ ")))
+        (push (buffer-substring-no-properties (line-beginning-position)
+                                              (line-end-position))
+              headers)
+        (majutsu-diff--delete-line))
+      (magit-insert-section (jj-file file)
+        (magit-insert-heading
+          (propertize (majutsu--diff-file-heading file (nreverse headers))
+                      'font-lock-face 'magit-diff-file-heading))
+        ;; Hunk bodies remain in the buffer; just wrap them.
+        (while (and (not (eobp)) (looking-at "^@@ "))
+          (majutsu-diff-wash-hunk file))
+        (insert "\n"))))
+  t)
+
+(defun majutsu-diff-wash-hunk (file)
+  "Wrap the current hunk in a section for FILE without copying its body."
+  (let* ((header (buffer-substring-no-properties (line-beginning-position)
+                                                 (line-end-position))))
+    ;; Remove original header and insert a propertized one.
+    (majutsu-diff--delete-line)
+    (magit-insert-section (jj-hunk file nil :header header)
+      (magit-insert-heading
+        (propertize header 'font-lock-face 'magit-diff-hunk-heading))
+      (let ((body-start (point)))
+        ;; Advance over hunk lines already present in the buffer.
+        (while (and (not (eobp))
+                    (not (looking-at "^@@ "))
+                    (not (looking-at "^diff --git ")))
+          (let ((bol (point)))
+            (forward-line 1)
+            (let ((face (cond
+                         ((eq (char-after bol) ?+) 'magit-diff-added)
+                         ((eq (char-after bol) ?-) 'magit-diff-removed)
+                         (t 'magit-diff-context))))
+              (put-text-property bol (point) 'font-lock-face face))))
+        (when majutsu-diff--paint-whitespace-enabled
+          (majutsu-diff--paint-hunk-whitespace body-start (point) file))))))
+
 (defun majutsu--diff-line-matching-p (regexp lines)
   "Return non-nil if any string in LINES matches REGEXP."
   (seq-some (lambda (line) (and line (string-match-p regexp line))) lines))
@@ -329,7 +417,7 @@ drop it and ensure a single `--stat`."
   ;; Loosely modeled after `magit-diff-insert-file-section' to leverage
   ;; Magit's section toggling behavior for large revisions.
   (let ((ordered-lines (nreverse lines)))
-    (magit-insert-section  (majutsu-file-section file nil :file file)
+    (magit-insert-section  (jj-file file)
       (magit-insert-heading
         (propertize (majutsu--diff-file-heading file ordered-lines)
                     'font-lock-face 'magit-diff-file-heading))
@@ -355,7 +443,7 @@ drop it and ensure a single `--stat`."
 
 (defun majutsu--insert-hunk-section (file header lines)
   "Insert a hunk section."
-  (magit-insert-section (majutsu-hunk-section file nil :file file :header header)
+  (magit-insert-section (jj-hunk file nil :header header)
     (magit-insert-heading
       (propertize header 'font-lock-face 'magit-diff-hunk-heading))
     (let ((body-start (point)))
@@ -465,12 +553,22 @@ works with the simplified jj diff we render here."
 
 ;;; Navigation
 
+(defun majutsu-diff--file-at-point ()
+  "Return the file for the current diff/diffstat section, if any."
+  (when-let* ((section (magit-current-section)))
+    (cond
+     ((magit-section-match 'jj-hunk section)
+      (or (magit-section-parent-value section)
+          (oref section value)))
+     ((magit-section-match 'jj-file section)
+      (oref section value)))))
+
 (defun majutsu-goto-diff-line ()
   "Jump to the line in the file corresponding to the diff line at point."
   (interactive)
   (when-let* ((section (magit-current-section))
-              (_ (eq (oref section type) 'majutsu-hunk-section))
-              (file (oref section file))
+              (_ (magit-section-match 'jj-hunk section))
+              (file (magit-section-parent-value section))
               (header (oref section header))
               (repo-root (majutsu--root)))
     ;; Parse the hunk header to get line numbers
@@ -502,24 +600,48 @@ works with the simplified jj diff we render here."
 (defun majutsu-visit-file ()
   "Visit the file at point."
   (interactive)
-  (when-let* ((section (magit-current-section))
-              (file (oref section file))
+  (when-let* ((file (majutsu-diff--file-at-point))
               (repo-root (majutsu--root)))
     (let ((full-file-path (expand-file-name file repo-root)))
       (find-file full-file-path))))
 
+;;;###autoload
+(defun majutsu-diff-visit-file ()
+  "Visit the file at point.
+
+When point is on a hunk section, jump to the corresponding line in the
+file."
+  (interactive)
+  (let ((section (magit-current-section)))
+    (cond
+     ((and section (magit-section-match 'jj-hunk section))
+      (majutsu-goto-diff-line))
+     ((majutsu-diff--file-at-point)
+      (majutsu-visit-file))
+     (t
+      (user-error "No file at point")))))
+
+;;; Section Keymaps
+
+(defvar-keymap majutsu-diff-section-map
+  :doc "Keymap for diff sections."
+  "<remap> <majutsu-visit-thing>" #'majutsu-diff-visit-file)
+
+(defvar-keymap majutsu-file-section-map
+  :doc "Keymap for `jj-file' sections."
+  :parent majutsu-diff-section-map)
+
+(defvar-keymap majutsu-hunk-section-map
+  :doc "Keymap for `jj-hunk' sections."
+  :parent majutsu-diff-section-map)
+
 ;;; Diff Edit
 
+;;;###autoload
 (defun majutsu-diffedit-emacs ()
   "Emacs-based diffedit using built-in ediff."
   (interactive)
-  (let* ((section (magit-current-section))
-         (file (cond
-                ((and section (eq (oref section type) 'majutsu-file-section))
-                 (oref section file))
-                ((and section (eq (oref section type) 'majutsu-hunk-section))
-                 (oref section file))
-                (t nil))))
+  (let* ((file (majutsu-diff--file-at-point)))
     (if file
         (majutsu-diffedit-with-ediff file)
       (majutsu-diffedit-all))))
@@ -561,16 +683,11 @@ works with the simplified jj diff we render here."
 (defvar-local majutsu-smerge-repo-root nil
   "Repository root for smerge session.")
 
+;;;###autoload
 (defun majutsu-diffedit-smerge ()
   "Emacs-based diffedit using smerge-mode (merge conflict style)."
   (interactive)
-  (let* ((section (magit-current-section))
-         (file (cond
-                ((and section (eq (oref section type) 'majutsu-file-section))
-                 (oref section file))
-                ((and section (eq (oref section type) 'majutsu-hunk-section))
-                 (oref section file))
-                (t nil))))
+  (let* ((file (majutsu-diff--file-at-point)))
     (if file
         (majutsu-diffedit-with-smerge file)
       (majutsu-diffedit-all))))
@@ -651,30 +768,19 @@ works with the simplified jj diff we render here."
 (defun majutsu-diff-clear-selections ()
   "Clear all diff selections."
   (interactive)
-  (majutsu--entry-clear-overlays majutsu-diff-from)
-  (majutsu--entry-clear-overlays majutsu-diff-to)
-  (setq majutsu-diff-from nil
-        majutsu-diff-to nil)
+  (majutsu-selection-clear)
   (when (called-interactively-p 'interactive)
     (message "Cleared diff selections")))
 
 (defun majutsu-diff-set-from ()
   "Set the commit at point as diff --from."
   (interactive)
-  (majutsu--selection-select-revset
-   :kind "from"
-   :label "[FROM]"
-   :face '(:background "dark orange" :foreground "black")
-   :collection-var 'majutsu-diff-from))
+  (majutsu-selection-select 'from))
 
 (defun majutsu-diff-set-to ()
   "Set the commit at point as diff --to."
   (interactive)
-  (majutsu--selection-select-revset
-   :kind "to"
-   :label "[TO]"
-   :face '(:background "dark cyan" :foreground "white")
-   :collection-var 'majutsu-diff-to))
+  (majutsu-selection-select 'to))
 
 (defun majutsu-diff-context-set (n)
   "Set context lines (`jj diff --context N') and refresh."
@@ -734,6 +840,11 @@ With prefix STYLE, cycle between `all' and `t'."
   "Major mode for viewing jj diffs."
   :group 'majutsu
   (setq-local line-number-mode nil)
+  ;; Use diff-mode's keywords as a fallback, but primarily rely on
+  ;; `font-lock-face' properties applied during the washing process.
+  ;; We set this to enable JIT Lock, which renders our `font-lock-face' properties.
+  (setq-local font-lock-defaults '(diff-font-lock-keywords t))
+  (setq-local font-lock-multiline t)
   (add-hook 'post-command-hook #'majutsu-diff--maybe-clear-refinement nil t))
 
 (defvar-local majutsu-diff--last-args nil
@@ -749,20 +860,22 @@ With prefix STYLE, cycle between `all' and `t'."
       (erase-buffer)
       (setq-local majutsu--repo-root repo-root)
       (let* ((default-directory repo-root)
-             (output (apply #'majutsu-run-jj majutsu-diff--last-args))
-             (stat-output (when (and majutsu-diff-show-stat
-                                     (not (string-empty-p output)))
-                            (apply #'majutsu-run-jj
-                                   (majutsu-diff--stat-args majutsu-diff--last-args)))))
-        (magit-insert-section (majutsu-diff-section)
-          (when stat-output
-            (majutsu-diff--insert-stat-section stat-output))
+             (cmd-args (if majutsu-diff-show-stat
+                           (majutsu-diff--ensure-flag majutsu-diff--last-args "--stat")
+                         majutsu-diff--last-args))
+             ;; Avoid ANSI; let our painting run lazily.
+             (majutsu-process-color-mode nil)
+             (majutsu-process-apply-ansi-colors nil))
+        (setq-local majutsu-diff--paint-whitespace-enabled
+                    (or (not majutsu-diff-whitespace-max-bytes)
+                        (< (buffer-size) majutsu-diff-whitespace-max-bytes)))
+        (magit-insert-section (diffbuf)
           (magit-insert-section (diff-root)
-            (magit-insert-heading (format "jj %s" (string-join majutsu-diff--last-args " ")))
+            (magit-insert-heading
+              (format "jj %s" (string-join majutsu-diff--last-args " ")))
             (insert "\n")
-            (if (string-empty-p output)
-                (insert (propertize "(No diff)" 'face 'shadow))
-              (majutsu--insert-diff-hunks output)))))
+            (majutsu-diff--wash-with-state
+                #'majutsu-diff-wash-diffs 'wash-anyway cmd-args))))
       (when (eq majutsu-diff-refine-hunk 'all)
         (majutsu-diff--update-hunk-refinement))
       (goto-char (point-min)))))
@@ -773,7 +886,7 @@ With prefix STYLE, cycle between `all' and `t'."
 If called interactively, defaults to diffing the commit at point (if in
 log view) or the working copy (if elsewhere)."
   (interactive
-   (list (if-let* ((rev (majutsu-log--revset-at-point)))
+   (list (if-let* ((rev (magit-section-value-if 'jj-commit)))
              (list "-r" rev)
            nil)))
   (let* ((repo-root (majutsu--root))
@@ -799,10 +912,8 @@ log view) or the working copy (if elsewhere)."
 (defun majutsu-diff-execute (&optional args)
   "Execute diff using transient selections or ARGS."
   (interactive (list (transient-args 'majutsu-diff-transient--internal)))
-  (let* ((from-entry (car majutsu-diff-from))
-         (to-entry (car majutsu-diff-to))
-         (from (when from-entry (majutsu--entry-revset from-entry)))
-         (to (when to-entry (majutsu--entry-revset to-entry)))
+  (let* ((from (car (majutsu-selection-values 'from)))
+         (to (car (majutsu-selection-values 'to)))
          (final-args (copy-sequence args)))
     ;; If we have selections, they override or supplement standard args
     (when from
@@ -815,36 +926,30 @@ log view) or the working copy (if elsewhere)."
                (not (member "-r" final-args))
                (not (member "--from" final-args)))
       ;; DWIM logic: if in log view, diff commit at point. Else working copy.
-      (if-let* ((rev (majutsu-log--revset-at-point)))
+      (if-let* ((rev (magit-section-value-if 'jj-commit)))
           (setq final-args (append final-args (list "-r" rev)))
         (setq final-args (append final-args (list "-r" "@")))))
 
     (majutsu-diff final-args)
-    ;; Clear selections after successful execution
-    (majutsu-diff-clear-selections)))
-
-(defun majutsu-diff-cleanup-on-exit ()
-  "Clean up diff selections when transient exits."
-  (majutsu-diff-clear-selections)
-  (remove-hook 'transient-exit-hook 'majutsu-diff-cleanup-on-exit t))
+    (majutsu-selection-session-end)))
 
 ;;;###autoload
 (defun majutsu-diff-transient ()
   "Transient for jj diff operations."
   (interactive)
-  (add-hook 'transient-exit-hook 'majutsu-diff-cleanup-on-exit nil t)
+  (majutsu-selection-session-begin
+   '((:key from
+      :label "[FROM]"
+      :face (:background "dark orange" :foreground "black")
+      :type single)
+     (:key to
+      :label "[TO]"
+      :face (:background "dark cyan" :foreground "white")
+      :type single)))
+  (add-hook 'transient-exit-hook #'majutsu-selection-session-end nil t)
   (majutsu-diff-transient--internal))
 
 ;;; Diff Transient
-
-(defvar-local majutsu-diff-from nil
-  "List containing at most one selected log section for diff --from.")
-
-(defvar-local majutsu-diff-to nil
-  "List containing at most one selected log section for diff --to.")
-
-(defun majutsu-diff--from-entry () (car majutsu-diff-from))
-(defun majutsu-diff--to-entry () (car majutsu-diff-to))
 
 (transient-define-prefix majutsu-diff-transient--internal ()
   "Internal transient for jj diff."
@@ -854,24 +959,24 @@ log view) or the working copy (if elsewhere)."
   [:description
    (lambda ()
      (concat "JJ Diff"
-             (when-let* ((from (majutsu-diff--from-entry)))
-               (format " | From: %s" (majutsu--entry-display from)))
-             (when-let* ((to (majutsu-diff--to-entry)))
-               (format " | To: %s" (majutsu--entry-display to)))))
+             (when-let* ((from (car (majutsu-selection-values 'from))))
+               (format " | From: %s" from))
+             (when-let* ((to (car (majutsu-selection-values 'to))))
+               (format " | To: %s" to))))
    :class transient-columns
    ["Selection"
     ("f" "Set 'from'" majutsu-diff-set-from
      :description (lambda ()
-                    (if (majutsu-diff--from-entry)
+                    (if (> (majutsu-selection-count 'from) 0)
                         (format "Set 'from' (current: %s)"
-                                (majutsu--entry-display (majutsu-diff--from-entry)))
+                                (car (majutsu-selection-values 'from)))
                       "Set 'from'"))
      :transient t)
     ("t" "Set 'to'" majutsu-diff-set-to
      :description (lambda ()
-                    (if (majutsu-diff--to-entry)
+                    (if (> (majutsu-selection-count 'to) 0)
                         (format "Set 'to' (current: %s)"
-                                (majutsu--entry-display (majutsu-diff--to-entry)))
+                                (car (majutsu-selection-values 'to)))
                       "Set 'to'"))
      :transient t)
     ("c" "Clear selections" majutsu-diff-clear-selections :transient t)]
@@ -881,6 +986,20 @@ log view) or the working copy (if elsewhere)."
    ["Actions"
     ("d" "Execute" majutsu-diff-execute)
     ("q" "Quit" transient-quit-one)]])
+
+(defun majutsu-diff--wash-with-state (washer keep-error &rest args)
+  "Wrap `majutsu--wash' to also track diff buffer bookkeeping.
+Sets `majutsu-diff--inserted-bytes' and whitespace painting flag
+after the wash finishes.  KEEP-ERROR and ARGS are forwarded unchanged."
+  (declare (indent 2))
+  (let ((before-size (buffer-size)))
+    (prog1
+        (apply #'majutsu--wash washer keep-error args)
+      (let ((bytes (- (buffer-size) before-size)))
+        (setq-local majutsu-diff--inserted-bytes bytes)
+        (setq-local majutsu-diff--paint-whitespace-enabled
+                    (or (not majutsu-diff-whitespace-max-bytes)
+                        (<= bytes majutsu-diff-whitespace-max-bytes)))))))
 
 ;;; _
 (provide 'majutsu-diff)

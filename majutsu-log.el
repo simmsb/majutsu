@@ -17,229 +17,266 @@
 ;;; Code:
 
 (require 'majutsu-core)
+(require 'majutsu-mode)
 (require 'majutsu-process)
 (require 'majutsu-template)
-(require 'magit-section)
 (require 'json)
 
-;;; Log entry helpers
+;;; Section Keymaps
 
-(defun majutsu-section-revision-p (section)
-  "Return non-nil when SECTION is a `majutsu-revision-section'."
-  (let ((section (if (magit-section-p section)
-                     section
-                   (magit-current-section))))
-    (magit-section-match 'majutsu-revision-section section)))
+(defvar-keymap majutsu-commit-section-map
+  :doc "Keymap for `jj-commit' sections."
+  "<remap> <majutsu-visit-thing>" #'majutsu-edit-changeset)
 
-(defun majutsu--entry-change-id (section)
-  "Extract change id from SECTION."
-  (when (magit-section-match 'majutsu-revision-section section)
-    (majutsu--section-change-id section)))
+;;; Transient Selection (value-keyed)
 
-(defun majutsu--entry-commit-id (section)
-  "Extract commit id from SECTION."
-  (when (majutsu-section-revision-p section)
-    (majutsu--section-commit-id section)))
+(cl-defstruct (majutsu-selection-category
+               (:constructor majutsu-selection-category-create))
+  key
+  label
+  face
+  type
+  values)
 
-(defun majutsu--entry-revset (section)
-  "Return the revset string to use for SECTION, preferring change-id."
-  (when (majutsu-section-revision-p section)
-    (or (majutsu--section-change-id section)
-        (majutsu--section-commit-id section))))
+(cl-defstruct (majutsu-selection-session
+               (:constructor majutsu-selection-session-create))
+  categories
+  overlays)
 
-(defun majutsu--entry-display (section)
-  "Return a human-readable identifier for SECTION."
-  (or (majutsu--entry-change-id section)
-      (majutsu--entry-commit-id section)
-      "?"))
+(defvar-local majutsu-selection--session nil
+  "Active transient selection session for the current buffer.
 
-(defun majutsu--entry-overlay (section)
-  "Return overlay stored on SECTION, if any."
-  (when (and (majutsu-section-revision-p section)
-             (slot-exists-p section 'overlay))
-    (oref section overlay)))
+Selections are keyed by the `value' of `majutsu-commit-section' instances
+(i.e., the revset/id string shown in the log).  The session and overlays
+are meant to exist only while a transient is active.")
 
-(defun majutsu--entry-set-overlay (section overlay)
-  "Associate OVERLAY with SECTION."
-  (when (majutsu-section-revision-p section)
-    (setf (oref section overlay) overlay)))
+(defun majutsu-selection-session-active-p ()
+  "Return non-nil if a transient selection session is active."
+  (and majutsu-selection--session t))
 
-(defun majutsu--entry-delete-overlay (section)
-  "Delete overlay associated with SECTION, if present."
-  (when-let* ((overlay (majutsu--entry-overlay section)))
-    (when (overlayp overlay)
-      (delete-overlay overlay))
-    (majutsu--entry-set-overlay section nil))
-  nil)
+(defun majutsu-selection--normalize-value (value)
+  (majutsu--normalize-id-value value))
 
-(defun majutsu--entry-clear-overlays (sections)
-  "Delete overlays for all SECTIONS and return nil."
-  (dolist (section sections)
-    (majutsu--entry-delete-overlay section))
-  nil)
+(defun majutsu-selection--delete-all-overlays ()
+  (when-let* ((session majutsu-selection--session))
+    (let ((overlays (majutsu-selection-session-overlays session)))
+      (maphash (lambda (_id ov)
+                 (when (overlayp ov)
+                   (delete-overlay ov)))
+               overlays)
+      (clrhash overlays))))
 
-(defun majutsu--entry-make-overlay (section face label ref)
-  "Create an overlay for SECTION with FACE, LABEL, and REF identifier."
-  (when (and (oref section start) (oref section end))
-    (let ((overlay (make-overlay (oref section start) (oref section end))))
-      (overlay-put overlay 'face face)
-      (overlay-put overlay 'before-string (concat label " "))
-      (overlay-put overlay 'evaporate t)
-      (overlay-put overlay 'majutsu-ref (or ref ""))
-      overlay)))
+(defun majutsu-selection-session-end ()
+  "End the active transient selection session and remove its overlays."
+  (interactive)
+  (when majutsu-selection--session
+    (majutsu-selection--delete-all-overlays)
+    (setq majutsu-selection--session nil)))
 
-(defun majutsu--entry-apply-overlay (section face label)
-  "Attach a fresh overlay to SECTION with FACE and LABEL."
-  (majutsu--entry-delete-overlay section)
-  (when-let* ((ref (majutsu--entry-revset section))
-              (overlay (majutsu--entry-make-overlay section face label ref)))
-    (majutsu--entry-set-overlay section overlay)
-    overlay))
+(defun majutsu-selection-session-begin (categories)
+  "Begin a transient selection session in the current buffer.
 
-(defun majutsu--selection-find (sections change-id commit-id)
-  "Find section in SECTIONS matching CHANGE-ID (preferred) or COMMIT-ID."
-  (seq-find (lambda (section)
-              (let ((entry-change (majutsu--entry-change-id section))
-                    (entry-commit (majutsu--entry-commit-id section)))
-                (cond
-                 ((and change-id entry-change)
-                  (string= entry-change change-id))
-                 ((and (not change-id) commit-id entry-commit)
-                  (string= entry-commit commit-id)))))
-            sections))
+CATEGORIES is a list of plists, each containing:
+- :key   symbol identifying the selection bucket
+- :label string displayed before selected commits
+- :face  face (symbol or plist) applied to the label
+- :type  either `single' or `multi' (defaults to `multi')"
+  (majutsu-selection-session-end)
+  (setq-local
+   majutsu-selection--session
+   (majutsu-selection-session-create
+    :categories
+    (mapcar
+     (lambda (spec)
+       (let* ((key (plist-get spec :key))
+              (label (or (plist-get spec :label) ""))
+              (face (plist-get spec :face))
+              (type (or (plist-get spec :type) 'multi)))
+         (unless (symbolp key)
+           (user-error "Selection category :key must be a symbol: %S" spec))
+         (unless (memq type '(single multi))
+           (user-error "Selection category :type must be `single' or `multi': %S" spec))
+         (majutsu-selection-category-create
+          :key key :label label :face face :type type :values nil)))
+     categories)
+    :overlays (make-hash-table :test 'equal)))
+  (majutsu-selection-render))
 
-(defun majutsu--selection-replace (sections old new)
-  "Return SECTIONS with OLD replaced by NEW."
-  (mapcar (lambda (s) (if (eq s old) new s)) sections))
+(defun majutsu-selection--category (key)
+  (and majutsu-selection--session
+       (seq-find (lambda (cat)
+                   (eq (majutsu-selection-category-key cat) key))
+                 (majutsu-selection-session-categories majutsu-selection--session))))
 
-(defun majutsu--selection-remove (sections section)
-  "Return SECTIONS without SECTION, cleaning up overlay side effects."
-  (majutsu--entry-delete-overlay section)
-  (delq section sections))
+(defun majutsu-selection--require-category (key)
+  (or (majutsu-selection--category key)
+      (user-error "No such selection category: %S" key)))
 
-(defun majutsu--selection-refresh-if-rewritten (section new-commit face label)
-  "Refresh log buffer when SECTION's commit id changed to NEW-COMMIT.
-FACE and LABEL are used to reapply the overlay post-refresh.
-Return the updated section when refresh occurs."
-  (let ((old-commit (majutsu--entry-commit-id section)))
-    (when (and section old-commit new-commit (not (string= old-commit new-commit)))
-      (let ((change (majutsu--entry-change-id section)))
-        (majutsu--message-with-log "Change %s rewritten (%s -> %s); refreshing log"
-                                   (or change "?")
-                                   old-commit
-                                   new-commit)
-        (setf (oref section commit-id) new-commit)
-        (majutsu--entry-delete-overlay section)
-        (majutsu-log-refresh)
-        (when-let* ((updated (majutsu-find-revision-section change new-commit)))
-          (majutsu--entry-apply-overlay updated face label)
-          updated)))))
+(defun majutsu-selection-values (key)
+  "Return selected commit values for category KEY."
+  (let ((cat (majutsu-selection--category key)))
+    (copy-sequence (and cat (majutsu-selection-category-values cat)))))
 
-(cl-defun majutsu--selection-toggle (&key kind label face collection-var (type 'multi))
-  "Internal helper to mutate refset selections for the current log entry.
-KIND/LABEL/FACE describe the UI; COLLECTION-VAR is the symbol storing entries.
-TYPE is either `single' or `multi'."
-  (let* ((ids (majutsu-log--ids-at-point)))
-    (if (not ids)
-        (message "No changeset at point to toggle")
-      (let* ((change (plist-get ids :change))
-             (commit (plist-get ids :commit))
-             (section (plist-get ids :section))
-             (entries (symbol-value collection-var))
-             (existing (majutsu--selection-find entries change commit)))
-        (when existing
-          (when-let* ((new-section (majutsu--selection-refresh-if-rewritten existing commit face label)))
-            (setq entries (majutsu--selection-replace entries existing new-section))
-            (set collection-var entries)
-            (setq existing new-section)
-            (setq section new-section)))
-        (pcase type
-          ('single
-           (if existing
-               (progn
-                 (majutsu--entry-clear-overlays entries)
-                 (set collection-var nil)
-                 (message "Cleared %s" kind))
-             (let ((entry (or section
-                              (majutsu-find-revision-section change commit)
-                              (majutsu-revision-section :change-id change :commit-id commit))))
-               (majutsu--entry-clear-overlays entries)
-               (majutsu--entry-apply-overlay entry face label)
-               (set collection-var (list entry))
-               (message "Set %s: %s" kind (majutsu--entry-display entry)))))
-          (_
-           (if existing
-               (progn
-                 (set collection-var (majutsu--selection-remove entries existing))
-                 (message "Removed %s: %s" kind (majutsu--entry-display existing)))
-             (let ((entry (or section
-                              (majutsu-find-revision-section change commit)
-                              (majutsu-revision-section :change-id change :commit-id commit))))
-               (majutsu--entry-apply-overlay entry face label)
-               (set collection-var (append entries (list entry)))
-               (message "Added %s: %s" kind (majutsu--entry-display entry))))))))))
+(defun majutsu-selection-count (key)
+  "Return number of selected commits for category KEY."
+  (length (majutsu-selection-values key)))
 
-(cl-defun majutsu--selection-select-revset (&key kind label face collection-var)
-  "Shared helper for `<REFSET>' style single selections."
-  (majutsu--selection-toggle
-   :kind kind :label label :face face
-   :collection-var collection-var :type 'single))
+(defun majutsu-selection--selected-any-p (id)
+  (and majutsu-selection--session
+       (seq-some (lambda (cat)
+                   (member id (majutsu-selection-category-values cat)))
+                 (majutsu-selection-session-categories majutsu-selection--session))))
 
-(cl-defun majutsu--selection-toggle-revsets (&key kind label face collection-var)
-  "Shared helper for `<REFSETS>' style multi selections."
-  (majutsu--selection-toggle
-   :kind kind :label label :face face
-   :collection-var collection-var :type 'multi))
+(defun majutsu-selection--labels-for (id)
+  (when majutsu-selection--session
+    (let (parts)
+      (dolist (cat (majutsu-selection-session-categories majutsu-selection--session))
+        (when (member id (majutsu-selection-category-values cat))
+          (push (propertize (majutsu-selection-category-label cat)
+                            'face (majutsu-selection-category-face cat))
+                parts)))
+      (when parts
+        (concat (mapconcat #'identity (nreverse parts) " ") " ")))))
 
-(defun majutsu--selection-normalize-revsets (items)
-  "Convert ITEMS (sections or strings) into a list of clean revset strings."
-  (seq-filter (lambda (rev) (and rev (not (string-empty-p rev))))
-              (mapcar (lambda (item)
-                        (cond
-                         ((stringp item)
-                          (substring-no-properties item))
-                         ((majutsu-section-revision-p item)
-                          (majutsu--entry-revset item))
-                         (t nil)))
-                      items)))
+(defun majutsu-selection--targets-at-point ()
+  (let ((values (or (magit-region-values 'jj-commit t)
+                    (and-let* ((value (magit-section-value-if 'jj-commit)))
+                      (list value)))))
+    (seq-filter
+     (lambda (v) (and v (not (string-empty-p v))))
+     (mapcar #'majutsu-selection--normalize-value values))))
+
+(defun majutsu-selection--overlay-range (section)
+  (let ((start (oref section start))
+        (end (or (oref section content) (oref section end))))
+    (and start end (cons start end))))
+
+(defun majutsu-selection--overlay-valid-p (ov)
+  (and (overlayp ov)
+       (overlay-buffer ov)))
+
+(defun majutsu-selection--delete-overlay (id)
+  (when-let* ((session majutsu-selection--session)
+              (overlays (majutsu-selection-session-overlays session))
+              (ov (gethash id overlays)))
+    (when (overlayp ov)
+      (delete-overlay ov))
+    (remhash id overlays)))
+
+(defun majutsu-selection--render-id (id)
+  (when-let* ((session majutsu-selection--session))
+    (let* ((labels (majutsu-selection--labels-for id))
+           (overlays (majutsu-selection-session-overlays session))
+           (existing (gethash id overlays)))
+      (cond
+       ((not labels)
+        (majutsu-selection--delete-overlay id))
+       (t
+        (when (and existing (not (majutsu-selection--overlay-valid-p existing)))
+          (remhash id overlays)
+          (setq existing nil))
+        (when-let* ((section (and (derived-mode-p 'majutsu-log-mode)
+                                  (majutsu-find-revision-section id)))
+                    (range (majutsu-selection--overlay-range section)))
+          (pcase-let ((`(,start . ,end) range))
+            (unless (and existing
+                         (= (overlay-start existing) start)
+                         (= (overlay-end existing) end))
+              (when existing
+                (delete-overlay existing))
+              (setq existing (make-overlay start end nil t))
+              (overlay-put existing 'evaporate t)
+              (overlay-put existing 'priority '(nil . 50))
+              (overlay-put existing 'majutsu-selection t)
+              (puthash id existing overlays))
+            (overlay-put existing 'before-string labels))))))))
+
+(defun majutsu-selection-render ()
+  "Re-render selection overlays for the current buffer."
+  (when majutsu-selection--session
+    (let* ((session majutsu-selection--session)
+           (overlays (majutsu-selection-session-overlays session))
+           (selected (make-hash-table :test 'equal)))
+      (dolist (cat (majutsu-selection-session-categories session))
+        (dolist (id (majutsu-selection-category-values cat))
+          (puthash id t selected)))
+      (maphash (lambda (id _ov)
+                 (unless (gethash id selected)
+                   (majutsu-selection--delete-overlay id)))
+               overlays)
+      (maphash (lambda (id _)
+                 (majutsu-selection--render-id id))
+               selected))))
+
+(defun majutsu-selection-clear (&optional key)
+  "Clear selections.
+
+If KEY is non-nil, clear only that selection category.  Otherwise clear
+all categories in the active session."
+  (interactive)
+  (when-let* ((session majutsu-selection--session))
+    (if key
+        (let ((cat (majutsu-selection--require-category key)))
+          (setf (majutsu-selection-category-values cat) nil))
+      (dolist (cat (majutsu-selection-session-categories session))
+        (setf (majutsu-selection-category-values cat) nil)))
+    (majutsu-selection-render)))
+
+(defun majutsu-selection-toggle (key &optional values)
+  "Toggle selected commits in category KEY.
+
+VALUES defaults to the commit(s) at point or in the active region."
+  (interactive)
+  (let* ((cat (majutsu-selection--require-category key))
+         (values (or values (majutsu-selection--targets-at-point))))
+    (unless values
+      (user-error "No changeset at point"))
+    (pcase (majutsu-selection-category-type cat)
+      ('single
+       (let* ((new (car values))
+              (old (car (majutsu-selection-category-values cat))))
+         (setf (majutsu-selection-category-values cat)
+               (if (and old (equal old new)) nil (list new)))
+         (when old (majutsu-selection--render-id old))
+         (when new (majutsu-selection--render-id new))))
+      (_
+       (let ((current (majutsu-selection-category-values cat))
+             (changed nil))
+         (dolist (id values)
+           (if (member id current)
+               (setq current (delete id current))
+             (setq current (append current (list id))))
+           (push id changed))
+         (setf (majutsu-selection-category-values cat) current)
+         (dolist (id changed)
+           (majutsu-selection--render-id id)))))))
+
+(defun majutsu-selection-select (key &optional values)
+  "Toggle a single commit selection in category KEY.
+
+KEY must be a `single' selection category.  VALUES defaults to the
+commit(s) at point or in the active region."
+  (interactive)
+  (let* ((cat (majutsu-selection--require-category key))
+         (values (or values (majutsu-selection--targets-at-point))))
+    (unless values
+      (user-error "No changeset at point"))
+    (unless (eq (majutsu-selection-category-type cat) 'single)
+      (user-error "Selection category %S is not single-select" key))
+    (when (cdr values)
+      (user-error "Selection category %S only accepts one changeset" key))
+    (majutsu-selection-toggle key values)))
 
 ;;; Utilities
 
 (defun majutsu-read-revset (prompt &optional default)
   "Prompt user with PROMPT to read a revision set string."
-  (let ((default (or default (majutsu-log--revset-at-point) "@")))
+  (let ((default (or default (magit-section-value-if 'jj-commit) "@")))
     (read-string
      (if default
          (format "%s (default %s): " prompt default)
        (format "%s: " prompt))
      nil nil default)))
-
-(defun majutsu--section-change-id (section)
-  "Return the change id recorded in SECTION, if available."
-  (when (and section (object-of-class-p section 'majutsu-revision-section))
-    (or (when (and (slot-exists-p section 'change-id)
-                   (slot-boundp section 'change-id))
-          (majutsu--normalize-id-value (oref section change-id)))
-        (let ((entry (oref section value)))
-          (when (listp entry)
-            (majutsu--normalize-id-value
-             (plist-get entry :change-id)))))))
-
-(defun majutsu--section-commit-id (section)
-  "Return the commit id recorded in SECTION, if available."
-  (when section
-    (when (and (slot-exists-p section 'commit-id)
-               (slot-boundp section 'commit-id))
-      (majutsu--normalize-id-value (oref section commit-id)))))
-
-(cl-defmethod magit-section-ident-value ((section majutsu-revision-section))
-  "Identify log entry sections by their change id."
-  (or (majutsu--section-change-id section)
-      (majutsu--section-commit-id section)
-      (let ((entry (oref section value)))
-        (when (listp entry)
-          (or (plist-get entry :change-id)
-              (plist-get entry :commit-id))))))
 
 ;;; Log State
 
@@ -257,9 +294,15 @@ TYPE is either `single' or `multi'."
 (defvar-local majutsu-log-buffer-state nil
   "Buffer-local log view options for the current majutsu log buffer.")
 
-(defcustom majutsu-log-sections-hook '(majutsu-log-insert-logs
-                                       majutsu-log-insert-status
-                                       majutsu-log-insert-diff)
+(defvar-local majutsu-log--this-error nil
+  "Last jj side-effect error summary for this log buffer.
+
+This is set by process runners (see `majutsu-process-buffer') and
+rendered by `majutsu-log-insert-error-header' on the next refresh.")
+
+(defcustom majutsu-log-sections-hook '(majutsu-log-insert-error-header
+                                       majutsu-log-insert-logs
+                                       majutsu-log-insert-status)
   "Hook run to insert sections in the log buffer."
   :type 'hook
   :group 'majutsu)
@@ -353,8 +396,8 @@ remaining invisible in the rendered buffer.")
   "Columns that must always be present in the compiled template for parsing.")
 
 (defcustom majutsu-log-commit-columns
-  '((:field change-id :align left)
-    (:field refs :align left :visible nil)
+  '((:field id :align left :visible nil)
+    (:field change-id :align left)
     (:field bookmarks :align left)
     (:field tags :align left)
     (:field working-copies :align left)
@@ -370,7 +413,7 @@ remaining invisible in the rendered buffer.")
 
 Each element is a plist with at least `:field'. Supported keys:
 - :field   - symbol identifying a known field (e.g. `change-id',
-             `commit-id', `refs', `description', `author',
+             `commit-id', `description', `author',
              `timestamp', `flags', `long-desc').
 - :align   - one of `left', `right', or `center' (defaults to `left').
 - :visible - non-nil to show in the buffer; nil keeps the field hidden
@@ -382,6 +425,108 @@ automatically even if omitted or hidden."
   :type '(repeat (plist :options (:field :align :width :visible)))
   :group 'majutsu)
 
+(defmacro majutsu-log-define-column (name template doc)
+  "Define a log column template variable for NAME with default TEMPLATE and DOC.
+The variable name will be `majutsu-log-template-NAME'.
+Also registers a variable watcher to invalidate the template cache."
+  (declare (indent 1) (debug t) (doc-string 3))
+  (let ((var-name (intern (format "majutsu-log-template-%s" name))))
+    `(progn
+       (defcustom ,var-name ,template
+         ,doc
+         :type 'sexp
+         :group 'majutsu)
+       (when (fboundp 'add-variable-watcher)
+         (add-variable-watcher ',var-name #'majutsu-log--invalidate-template-cache)))))
+
+(majutsu-log-define-column id
+  [:if [:or [:hidden] [:divergent]]
+      [:commit_id :shortest 8]
+    [:change_id :shortest 8]]
+  "Template for the commit-id column.")
+
+(majutsu-log-define-column change-id
+  [:if [:hidden]
+      [:label "hidden"
+              [[:change_id :shortest 8]
+               " hidden"]]
+    [:label
+     [:if [:divergent] "divergent"]
+     [[:change_id :shortest 8]
+      [:if [:divergent] "??"]]]]
+  "Template for the change-id column.")
+
+(majutsu-log-define-column commit-id
+  [:commit_id :shortest 8]
+  "Template for the commit-id column.")
+
+(majutsu-log-define-column bookmarks
+  [:bookmarks]
+  "Template for the bookmarks column.")
+
+(majutsu-log-define-column tags
+  [:tags]
+  "Template for the tags column.")
+
+(majutsu-log-define-column working-copies
+  [:working_copies]
+  "Template for the working-copies column.")
+
+(majutsu-log-define-column flags
+  [:separate " "
+             [:if [:current_working_copy] "@"]
+             [:if [:immutable] "immutable" "mutable"]
+             [:if [:conflict] [:label "conflict" "conflict"]]
+             [:if [:git_head] "git_head"]
+             [:if [:root] "root"]
+             [:if [:empty] "(empty)"]]
+  "Template for the flags column.")
+
+(majutsu-log-define-column git-head
+  [:if [:git_head] [:label "git_head" ""]]
+  "Template for the git-head column.")
+
+(majutsu-log-define-column signature
+  [:if [:method [:call 'config "ui.show-cryptographic-signatures"] :as_boolean]
+      [:if [:signature]
+          [:label "signature status"
+                  ["["
+                   [:label [:signature :status]
+                           [:coalesce
+                            [:if [:== [:signature :status] "good"] "✓︎"]
+                            [:if [:== [:signature :status] "unknown"] "?"]
+                            "x"]]
+                   "]"]]]]
+  "Template for the signature column.")
+
+(majutsu-log-define-column empty
+  [:if [:empty]
+      [:label "empty" "(empty)"]]
+  "Template for the empty column.")
+
+(majutsu-log-define-column description
+  [:if [:description]
+      [:method [:description] :first_line]
+    [:label
+     [:if [:empty] "empty"]
+     [:label
+      "description placeholder"
+      "(no description set)"]]]
+  "Template for the description column.")
+
+(majutsu-log-define-column author
+  [:author :name]
+  "Template for the author column.")
+
+(majutsu-log-define-column timestamp
+  [:committer :timestamp :ago]
+  "Template for the timestamp column.")
+
+(majutsu-log-define-column long-desc
+  [:if [:description] [:json [:description]] [:json " "]]
+  "Template for the long-desc column.
+Note: This must return a valid JSON string (usually via :json) to be parsed correctly.")
+
 (defvar majutsu-log--compiled-template-cache nil
   "Cached structure holding the compiled log template and column metadata.")
 
@@ -389,10 +534,6 @@ automatically even if omitted or hidden."
   "Reset cached compiled template when layout changes."
   (setq majutsu-log--compiled-template-cache nil)
   (setq majutsu-log--cached-entries nil))
-
-(when (fboundp 'add-variable-watcher)
-  (add-variable-watcher 'majutsu-log-commit-columns
-                        #'majutsu-log--invalidate-template-cache))
 
 (defun majutsu-log--normalize-column-spec (spec)
   "Normalize a single column SPEC into a plist with defaults."
@@ -420,52 +561,12 @@ Missing required fields are appended as hidden columns."
     columns))
 
 (defun majutsu-log--column-template (field)
-  "Return majutsu-template form for FIELD."
-  (pcase field
-    ('change-id [:if [:hidden]
-                    [:label "hidden"
-                            [[:change_id :shortest 8]
-                             " hidden"]]
-                  [:label
-                   [:if [:divergent] "divergent"]
-                   [[:change_id :shortest 8]
-                    [:if [:divergent] "??"]]]])
-    ('commit-id [:commit_id :shortest 8])
-    ('refs [:separate " " [:bookmarks] [:tags] [:working_copies]])
-    ('bookmarks [:bookmarks])
-    ('tags [:tags])
-    ('working-copies [:working_copies])
-    ('flags [:separate " "
-                       [:if [:current_working_copy] "@"]
-                       [:if [:immutable] "immutable" "mutable"]
-                       [:if [:conflict] [:label "conflict" "conflict"]]
-                       [:if [:git_head] "git_head"]
-                       [:if [:root] "root"]
-                       [:if [:empty] "(empty)"]])
-    ('git-head [:if [:git_head] [:label "git_head" "git_head()"]])
-    ('signature [:if [:method [:call 'config "ui.show-cryptographic-signatures"] :as_boolean]
-                    [:if [:signature]
-                        [:label "signature status"
-                                ["["
-                                 [:label [:signature :status]
-                                         [:coalesce
-                                          [:if [:== [:signature :status] "good"] "✓︎"]
-                                          [:if [:== [:signature :status] "unknown"] "?"]
-                                          "x"]]
-                                 "]"]]]])
-    ('empty [:if [:empty]
-                [:label "empty" "∅"]])
-    ('description [:if [:description]
-                      [:method [:description] :first_line]
-                    [:label
-                     [:if [:empty] "empty"]
-                     [:label
-                      "description placeholder"
-                      "(no description set)"]]])
-    ('author [:author :name])
-    ('timestamp [:committer :timestamp :ago])
-    ('long-desc [:if [:description] [:json [:description]] [:json " "]])
-    (_ (user-error "Unknown column field %S" field))))
+  "Return majutsu-template form for FIELD.
+Looks up `majutsu-log-template-FIELD'."
+  (let ((var (intern-soft (format "majutsu-log-template-%s" field))))
+    (if (and var (boundp var))
+        (symbol-value var)
+      (user-error "Unknown column field %S" field))))
 
 (defun majutsu-log--compile-columns (&optional columns)
   "Compile COLUMNS (or `majutsu-log-commit-columns') into a jj template string.
@@ -533,16 +634,13 @@ Returns a plist with :template, :columns, and :field-order."
 
 (defun majutsu-log--record-column (entry field value)
   "Record FIELD VALUE onto ENTRY plist and column map."
-  (let* ((columns (plist-get entry :columns)))
-    (setf (alist-get field columns nil nil #'eq) value)
-    (setq entry (plist-put entry :columns columns)))
   (pcase field
+    ('id
+     (setq entry (plist-put entry :id value)))
     ('change-id
      (setq entry (plist-put entry :change-id value)))
     ('commit-id
      (setq entry (plist-put entry :commit-id value)))
-    ('refs
-     (setq entry (plist-put entry :refs value)))
     ('bookmarks
      (setq entry (plist-put entry :bookmarks value)))
     ('tags
@@ -554,6 +652,7 @@ Returns a plist with :template, :columns, and :field-order."
     ('author
      (setq entry (plist-put entry :author value)))
     ('timestamp
+     (setq value (string-remove-suffix " ago" value))
      (setq entry (plist-put entry :timestamp value)))
     ('long-desc
      (setq entry (plist-put entry :long-desc (majutsu-log--parse-json-safe value))))
@@ -566,6 +665,9 @@ Returns a plist with :template, :columns, and :field-order."
      (setq entry (plist-put entry :signature value)))
     ('empty
      (setq entry (plist-put entry :empty (not (string-empty-p value))))))
+  (let* ((columns (plist-get entry :columns)))
+    (setf (alist-get field columns nil nil #'eq) value)
+    (setq entry (plist-put entry :columns columns)))
   entry)
 
 (defun majutsu-log--build-entry-from-elems (elems field-order line)
@@ -637,8 +739,7 @@ instead of stopping on visual padding."
 (defun majutsu-log--field-face (field)
   "Return face symbol for FIELD, or nil."
   (pcase field
-    ((or 'change-id 'commit-id) 'magit-hash)
-    ('refs 'magit-branch-remote)
+    ((or 'id 'change-id 'commit-id) 'magit-hash)
     ('bookmarks 'magit-branch-local)
     ('tags 'magit-tag)
     ('working-copies 'magit-branch-remote)
@@ -750,6 +851,23 @@ Left fields follow graph width per-line; right fields are rendered for margin."
                                (list (list 'margin 'right-margin)
                                      (or string " ")))))))
 
+(defun majutsu-log-insert-error-header ()
+  "Insert the message about the jj error that just occurred.
+
+This function only knows about the last error that occurred when jj was
+run for side-effects.  Refreshing the log buffer causes this section to
+disappear again."
+  (when majutsu-log--this-error
+    (magit-insert-section (error 'jj)
+      (insert (propertize (format "%-10s" "JJError! ")
+                          'font-lock-face 'magit-section-heading))
+      (insert (propertize majutsu-log--this-error 'font-lock-face 'error))
+      (when-let* ((_ majutsu-show-process-buffer-hint)
+                  (key (car (where-is-internal 'majutsu-process-buffer))))
+        (insert (format "  [Type %s for details]" (key-description key))))
+      (insert ?\n))
+    (setq majutsu-log--this-error nil)))
+
 (defun majutsu-log-insert-logs ()
   "Insert jj log graph into current buffer."
   (magit-insert-section (lograph)
@@ -759,54 +877,29 @@ Left fields follow graph width per-line; right fields are rendered for margin."
            (widths (majutsu-log--compute-column-widths entries compiled)))
       (majutsu-log--set-right-margin (plist-get widths :right-total))
       (dolist (entry entries)
-        (magit-insert-section
-            (majutsu-revision-section entry t
-                                      :commit-id  (plist-get entry :commit-id)
-                                      :change-id  (plist-get entry :change-id)
-                                      :description (plist-get entry :short-desc)
-                                      :bookmarks (let ((bookmarks (plist-get entry :bookmarks)))
-                                                   (when bookmarks
-                                                     (split-string (substring-no-properties bookmarks) ", " t))))
-          (let* ((line-info (majutsu-log--format-entry-line entry compiled widths))
-                 (heading (plist-get line-info :line))
-                 (margin (plist-get line-info :margin))
-                 (indent (plist-get line-info :desc-indent)))
-            (magit-insert-heading
-              (insert heading))
-            (when margin
-              (majutsu-log--make-margin-overlay margin))
-            (when-let* ((long-desc (plist-get entry :long-desc))
-                        (indented (majutsu--indent-string long-desc (or indent 0))))
-              (magit-insert-section-body
-                (insert indented)
-                (insert "\n"))))
-          (when-let* ((suffix-lines (plist-get entry :suffix-lines)))
-            (dolist (suffix-line suffix-lines)
-              (insert suffix-line)
-              (insert "\n"))))))
+        (let ((id (majutsu-selection--normalize-value (plist-get entry :id))))
+          (magit-insert-section
+              (jj-commit id t)
+            (let* ((line-info (majutsu-log--format-entry-line entry compiled widths))
+                   (heading (plist-get line-info :line))
+                   (margin (plist-get line-info :margin))
+                   (indent (plist-get line-info :desc-indent)))
+              (magit-insert-heading
+                (insert heading))
+              (when margin
+                (majutsu-log--make-margin-overlay margin))
+              (when-let* ((long-desc (plist-get entry :long-desc))
+                          (indented (majutsu--indent-string long-desc (or indent 0))))
+                (magit-insert-section-body
+                  (insert indented)
+                  (insert "\n"))))
+            (when-let* ((suffix-lines (plist-get entry :suffix-lines)))
+              (dolist (suffix-line suffix-lines)
+                (insert suffix-line)
+                (insert "\n")))))))
     (insert "\n")))
 
 ;;; Log insert status
-
-(defun majutsu--analyze-status-for-hints (status-output)
-  "Analyze jj status output and provide helpful hints."
-  (when (and status-output (not (string-empty-p status-output)))
-    (cond
-     ;; No changes
-     ((string-match-p "The working copy is clean" status-output)
-      (message "Working copy is clean - no changes to commit"))
-
-     ;; Conflicts present
-     ((string-match-p "There are unresolved conflicts" status-output)
-      (message "💡 Resolve conflicts with 'jj resolve' or use diffedit (E/M)"))
-
-     ;; Untracked files
-     ((string-match-p "Untracked paths:" status-output)
-      (message "💡 Add files with 'jj file track' or create .gitignore"))
-
-     ;; Working copy changes
-     ((string-match-p "Working copy changes:" status-output)
-      (message "💡 Commit changes with 'jj commit' or describe with 'jj describe'")))))
 
 (defun majutsu-log-insert-status ()
   "Insert jj status into current buffer."
@@ -814,16 +907,13 @@ Left fields follow graph width per-line; right fields are rendered for margin."
     (when (and status-output (not (string-empty-p status-output)))
       (magit-insert-section (status)
         (magit-insert-heading "Working Copy Status")
-        (insert status-output)
-        (insert "\n")
-        ;; Analyze status and provide hints in the minibuffer
-        (majutsu--analyze-status-for-hints status-output)))))
+        (insert status-output)))))
 
 ;;; Log insert diff
 
 (defun majutsu-log-insert-diff ()
   "Insert jj diff with hunks into current buffer asynchronously."
-  (let* ((section (magit-insert-section (majutsu-diff-section)
+  (let* ((section (magit-insert-section (diffbuf)
                     (magit-insert-heading "Working Copy Changes")
                     (insert "Loading diffs...\n")))
          (buf (current-buffer)))
@@ -865,30 +955,26 @@ Left fields follow graph width per-line; right fields are rendered for margin."
         (magit-insert-heading "Unresolved Conflicts")
         (dolist (line (split-string output "\n" t))
           (let ((file (string-trim line)))
-            (magit-insert-section (majutsu-file-section file nil :file file)
+            (magit-insert-section (jj-file file)
               (magit-insert-heading (propertize file 'face 'error))
               (insert "\n"))))
         (insert "\n")))))
 
 ;;; Log Navigation
 
-(defconst majutsu--show-change-id-template
-  (tpl-compile [:change_id :shortest 8]))
+(defconst majutsu--show-id-template
+  (tpl-compile [:if [:or [:hidden] [:divergent]]
+                   [:commit_id :shortest 8]
+                 [:change_id :shortest 8]]))
 
-(defconst majutsu--show-commit-id-template
-  (tpl-compile [:commit_id :shortest 8]))
-
-(defun majutsu-current-change-id ()
-  (majutsu-run-jj "log" "--no-graph" "-r" "@" "-T" majutsu--show-change-id-template))
-
-(defun majutsu-current-commit-id ()
-  (majutsu-run-jj "log" "--no-graph" "-r" "@" "-T" majutsu--show-commit-id-template))
+(defun majutsu-current-id ()
+  (when-let* ((output (majutsu-run-jj "log" "--no-graph" "-r" "@" "-T" majutsu--show-id-template)))
+    (string-trim output)))
 
 (defun majutsu-log-goto-@ ()
   "Jump to the current changeset (@)."
   (interactive)
-  (majutsu--goto-log-entry (majutsu-current-change-id)
-                           (majutsu-current-commit-id)))
+  (majutsu--goto-log-entry (majutsu-current-id)))
 
 (defun majutsu-goto-commit (commit-id)
   "Jump to a specific COMMIT-ID in the log."
@@ -910,11 +996,12 @@ Left fields follow graph width per-line; right fields are rendered for margin."
       (goto-char start-pos)
       (message "Change %s not found" change-id))))
 
-(defun majutsu--goto-log-entry (change-id &optional commit-id)
-  "Move point to the log entry section matching CHANGE-ID.
-When CHANGE-ID is nil, fall back to COMMIT-ID.
+(defun majutsu--goto-log-entry (id)
+  "Move point to the log entry section matching ID.
 Return non-nil when the section could be located."
-  (when-let* ((section (majutsu-find-revision-section change-id commit-id)))
+  (when-let* ((id (and id (string-trim id)))
+              (_(not (string-empty-p id)))
+              (section (majutsu-find-revision-section id)))
     (magit-section-goto section)
     (goto-char (oref section start))
     t))
@@ -929,7 +1016,7 @@ Return non-nil when the section could be located."
                 (< (point) (point-max)))
       (magit-section-forward)
       (when-let* ((section (magit-current-section)))
-        (when (and (eq (oref section type) 'majutsu-revision-section)
+        (when (and (magit-section-match 'jj-commit section)
                    (> (point) pos))
           (setq found t))))
     (unless found
@@ -946,59 +1033,19 @@ Return non-nil when the section could be located."
                 (> (point) (point-min)))
       (magit-section-backward)
       (when-let* ((section (magit-current-section)))
-        (when (and (eq (oref section type) 'majutsu-revision-section)
+        (when (and (magit-section-match 'jj-commit section)
                    (< (point) pos))
           (setq found t))))
     (unless found
       (goto-char pos)
       (message "No more changesets"))))
 
-(defun majutsu-find-revision-section (change-id commit-id)
-  "Return the log entry section matching CHANGE-ID or COMMIT-ID, or nil.
-
-Fast-path uses `magit-get-section' with the change id because
-`majutsu-revision-section' identity is defined in
-`magit-section-ident-value' to prefer change id.  If that fails
-and a commit id was supplied, fall back to a `magit-map-sections'
-scan that matches commit ids; this keeps support for callers that
-only know the commit without reimplementing our own DFS."
-  (let* ((change-id (and change-id (majutsu--normalize-id-value change-id)))
-         (commit-id (and commit-id (majutsu--normalize-id-value commit-id))))
-    (and change-id
-         (magit-get-section
-          (append `((majutsu-revision-section . ,change-id))
-                  '((lograph)) '((logbuf)))))))
-
-(defun majutsu-log--commit-only-at-point ()
-  "Return the raw commit id at point, or nil if unavailable."
-  (when-let* ((section (magit-current-section)))
-    (majutsu--section-commit-id section)))
-
-(defun majutsu-log--ids-at-point ()
-  "Return a plist (:change .. :commit .. :section ..) describing ids at point."
-  (when-let* ((section (magit-current-section)))
-    (let ((change (majutsu--section-change-id section))
-          (commit (majutsu--section-commit-id section)))
-      (when (or change commit)
-        (list :change change :commit commit :section section)))))
-
-(defun majutsu-log--revset-at-point ()
-  "Return the preferred revset (change id if possible) at point."
-  (when-let* ((ids (majutsu-log--ids-at-point)))
-    (let ((change (plist-get ids :change))
-          (commit (plist-get ids :commit)))
-      (if (and change (string-suffix-p "?" change))
-          (or commit change)
-        (or change commit)))))
-
-(defun majutsu-log--change-id-at-point ()
-  "Return change id for the log entry at point, or nil otherwise."
-  (majutsu--section-change-id (magit-current-section)))
-
-(defun majutsu-log--commit-id-at-point ()
-  "Get the changeset ID at point as a plain string (no text properties)."
-  (or (majutsu-log--commit-only-at-point)
-      (majutsu-log--change-id-at-point)))
+(defun majutsu-find-revision-section (id)
+  "Return the jj-commit section matching ID inside the log buffer."
+  (let ((id (majutsu-selection--normalize-value (string-trim (or id "")))))
+    (and id
+         (not (string-empty-p id))
+         (magit-get-section `((jj-commit . ,id) (lograph) (logbuf))))))
 
 ;;; Log Mode
 
@@ -1017,30 +1064,29 @@ only know the commit without reimplementing our own DFS."
   (setq-local revert-buffer-function #'majutsu-refresh-buffer)
   ;; Initialize per-buffer log state (keeps behavior aligned with Magit's pattern).
   (setq-local majutsu-log-buffer-state (majutsu-log--state-default))
-  ;; Clear rebase selections when buffer is killed
-  (add-hook 'kill-buffer-hook 'majutsu-rebase-clear-selections nil t)
-  ;; Clear new selections when buffer is killed
-  (add-hook 'kill-buffer-hook 'majutsu-new-clear-selections nil t)
-  ;; Clear squash selections when buffer is killed
-  (add-hook 'kill-buffer-hook 'majutsu-squash-clear-selections nil t)
-  ;; Clear duplicate selections when buffer is killed
-  (add-hook 'kill-buffer-hook 'majutsu-duplicate-clear-selections nil t))
+  (add-hook 'kill-buffer-hook #'majutsu-selection-session-end nil t))
 
 (defun majutsu-log-render ()
   "Render the log buffer using cached data."
   (let ((inhibit-read-only t))
     (erase-buffer)
     (magit-insert-section (logbuf)
-      (run-hooks 'majutsu-log-sections-hook))))
+      (run-hooks 'majutsu-log-sections-hook)
+      (majutsu-selection-render))))
 
-(defun majutsu-log--refresh-buffer (target-change target-commit)
+(defun majutsu-log--refresh-buffer (target-commit)
   "Implementation helper to refresh the current log buffer.
 Assumes `current-buffer' is a `majutsu-log-mode' buffer."
   (majutsu--assert-mode 'majutsu-log-mode)
   (let* ((root (majutsu--root))
          (buf (current-buffer))
-         (target-change (or target-change (majutsu-log--change-id-at-point)))
-         (target-commit (or target-commit (majutsu-log--commit-id-at-point))))
+         (pos (and (null target-commit)
+                   (when-let ((section (magit-section-at)))
+                     (pcase-let ((`(,line ,char)
+                                  (magit-section-get-relative-position section)))
+                       (list section line char)))))
+         (fallback-commit (and (null target-commit)
+                               (magit-section-value-if 'jj-commit))))
     (setq-local majutsu--repo-root root)
     (setq default-directory root)
     (setq majutsu-log--cached-entries nil)
@@ -1055,8 +1101,20 @@ Assumes `current-buffer' is a `majutsu-log-mode' buffer."
            (when (derived-mode-p 'majutsu-log-mode)
              (setq majutsu-log--cached-entries (majutsu-parse-log-entries nil output))
              (majutsu-log-render)
-             (unless (when target-change (majutsu--goto-log-entry target-change target-commit))
-               (majutsu-log-goto-@))))))
+             (cond
+              (target-commit
+               (unless (majutsu--goto-log-entry target-commit)
+                 (majutsu-log-goto-@)))
+              ((and pos
+                    (let ((section (nth 0 pos))
+                          (line (nth 1 pos))
+                          (char (nth 2 pos)))
+                      (if (get-buffer-window-list buf nil t)
+                          (magit-section-goto-successor section line char)
+                        (let ((magit-section-movement-hook nil))
+                          (magit-section-goto-successor section line char))))))
+              ((and fallback-commit (majutsu--goto-log-entry fallback-commit)))
+              (t (majutsu-log-goto-@)))))))
      (lambda (err)
        (when (buffer-live-p buf)
          (with-current-buffer buf
@@ -1065,7 +1123,8 @@ Assumes `current-buffer' is a `majutsu-log-mode' buffer."
                (erase-buffer)
                (insert "Error: " err)))))))))
 
-(defun majutsu-log-refresh (&optional target-change target-commit _ignore-auto _noconfirm)
+;;;###autoload
+(defun majutsu-log-refresh (&optional commit)
   "Refresh a majutsu log buffer for the current repository.
 When called outside a log buffer, try to refresh an existing log
 buffer for the same repository.  If none exists and the command
@@ -1077,12 +1136,13 @@ mutating the wrong buffer."
     (cond
      (buffer
       (with-current-buffer buffer
-        (majutsu-log--refresh-buffer target-change target-commit)))
+        (majutsu-log--refresh-buffer commit)))
      ((called-interactively-p 'interactive)
       (user-error "No Majutsu log buffer for this repository; open one with `majutsu-log`"))
      (t
       (majutsu--debug "Skipping log refresh: no log buffer for %s" (or root "unknown repo"))))))
 
+;;;###autoload
 (defun majutsu-log ()
   "Open the majutsu log buffer."
   (interactive)
@@ -1241,6 +1301,7 @@ mutating the wrong buffer."
                 input)
                (t (user-error "Limit must be a positive integer"))))))
 
+;;;###autoload
 (transient-define-prefix majutsu-log-transient ()
   "Transient interface for adjusting jj log options."
   :man-page "jj-log"

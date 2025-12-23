@@ -17,6 +17,8 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
+(require 'eieio)
+(require 'magit-section)
 
 ;;; Customization
 
@@ -83,19 +85,20 @@ Add new entries here to extend display behavior for additional buffers."
 
 ;;; Section Classes
 
-(defclass majutsu-revision-section (magit-section)
-  ((commit-id :initarg :commit-id)
-   (change-id :initarg :change-id)
-   (description :initarg :description)
-   (bookmarks :initarg :bookmarks)
-   (overlay   :initform nil
-              :documentation "Selection overlay used by transient UIs.")))
+(defclass majutsu-commit-section (magit-section)
+  ((overlay :initform nil
+            :documentation "Selection overlay used by transient UIs.")
+   (keymap :initform 'majutsu-commit-section-map)))
 
-(defclass majutsu-file-section (magit-section)
-  ((file :initarg :file)))
+(defclass majutsu-diff-section (magit-section)
+  ((keymap :initform 'majutsu-diff-section-map))
+  :abstract t)
 
-(defclass majutsu-hunk-section (magit-section)
-  ((file :initarg :file)
+(defclass majutsu-file-section (majutsu-diff-section)
+ ((keymap :initform 'majutsu-file-section-map)))
+
+(defclass majutsu-hunk-section (majutsu-diff-section)
+  ((keymap :initform 'majutsu-hunk-section-map)
    (start :initarg :hunk-start)
    (header :initarg :header)
    (painted :initform nil)
@@ -103,8 +106,9 @@ Add new entries here to extend display behavior for additional buffers."
    (heading-highlight-face :initform 'magit-diff-hunk-heading-highlight)
    (heading-selection-face :initform 'magit-diff-hunk-heading-selection)))
 
-(defclass majutsu-diffstat-file-section (magit-section)
-  ((file :initarg :file)))
+(setf (alist-get 'jj-commit magit--section-type-alist) 'majutsu-commit-section)
+(setf (alist-get 'jj-file   magit--section-type-alist) 'majutsu-file-section)
+(setf (alist-get 'jj-hunk   magit--section-type-alist) 'majutsu-hunk-section)
 
 ;;; Utilities
 
@@ -149,6 +153,35 @@ text properties."
    ((stringp value) (substring-no-properties value))
    ((and value (not (stringp value))) (format "%s" value))
    (t nil)))
+
+(defun majutsu--buffer-root (&optional buffer)
+  "Return the cached repo root for BUFFER (default `current-buffer').
+Falls back to `majutsu--root' when available.  This is used to match
+buffers to repositories when refreshing."
+  (with-current-buffer (or buffer (current-buffer))
+    (or (and (boundp 'majutsu--repo-root) majutsu--repo-root)
+        (ignore-errors (majutsu--root)))))
+
+(defun majutsu--find-mode-buffer (mode &optional root)
+  "Return a live buffer in MODE for ROOT (or any repo when ROOT is nil)."
+  (let ((root (or root (majutsu--buffer-root))))
+    (seq-find (lambda (buf)
+                (with-current-buffer buf
+                  (and (derived-mode-p mode)
+                       (or (null root)
+                           (equal (majutsu--buffer-root buf) root)))))
+              (buffer-list))))
+
+(defun majutsu--resolve-mode-buffer (mode &optional root)
+  "Prefer the current buffer if it is in MODE; otherwise find one for ROOT."
+  (if (derived-mode-p mode)
+      (current-buffer)
+    (majutsu--find-mode-buffer mode root)))
+
+(defun majutsu--assert-mode (mode)
+  "Signal a user error unless the current buffer derives from MODE."
+  (unless (derived-mode-p mode)
+    (user-error "Command is only valid in %s buffers" mode)))
 
 ;;; _
 (provide 'majutsu-base)
