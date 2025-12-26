@@ -123,11 +123,10 @@ With prefix ALL, include remote bookmarks."
       (view-mode 1))
     (majutsu-display-buffer buf 'log)))
 
-
 (defun jj--get-closest-parent-bookmark-names (&optional all-remotes)
   "Return bookmark names.
 When ALL-REMOTES is non-nil, include remote bookmarks formatted as NAME@REMOTE."
-  (let* ((current (or (majutsu-log--revset-at-point) "@"))
+  (let* ((current (or (magit-section-value-if 'jj-commit) "@"))
          (template (if all-remotes
                        "if(remote, name ++ '@' ++ remote ++ '\n', '')"
                      "name ++ '\n'"))
