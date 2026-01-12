@@ -1,6 +1,6 @@
 ;;; majutsu-base.el --- Early utilities for Majutsu  -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 0WD0
+;; Copyright (C) 2025-2026 0WD0
 
 ;; Author: 0WD0 <wd.1105848296@gmail.com>
 ;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
@@ -19,17 +19,14 @@
 (require 'subr-x)
 (require 'eieio)
 (require 'magit-section)
+(require 'magit-mode)  ; for `majutsu-display-function'
+(require 'majutsu-jj)
 
-;;; Customization
+;;; Options
 
 (defgroup majutsu nil
   "Interface to jj version control system."
   :group 'tools)
-
-(defcustom majutsu-executable "jj"
-  "Path to jj executable."
-  :type 'string
-  :group 'majutsu)
 
 (defcustom majutsu-debug nil
   "Enable debug logging for jj operations."
@@ -42,46 +39,35 @@
   :group 'majutsu)
 
 (defcustom majutsu-confirm-critical-actions t
-  "If non-nil, prompt for confirmation before undo/redo/abandon operations."
+  "If non-nil, prompt for confirmation before critical operations."
   :type 'boolean
   :group 'majutsu)
 
-(defcustom majutsu-with-editor-envvar "JJ_EDITOR"
-  "Environment variable used to tell jj which editor to invoke."
-  :type 'string
+(defconst majutsu--confirm-actions
+  '((const undo)
+    (const redo)
+    (const abandon)
+    (const rebase)
+    (const workspace-forget))
+  "Actions that may require confirmation.")
+
+(defcustom majutsu-no-confirm nil
+  "A list of symbols for actions Majutsu should not confirm, or t.
+
+This is modeled after Magit's `magit-no-confirm`.  If this is t,
+then no confirmation is required.  Otherwise, each symbol stands
+for a class of actions that would normally ask for confirmation."
+  :type `(choice (const :tag "Never require confirmation" t)
+                 (set   :tag "Require confirmation except for"
+                        ,@majutsu--confirm-actions))
   :group 'majutsu)
 
-(defcustom majutsu-default-display-function #'pop-to-buffer
-  "Fallback function used to display Majutsu buffers.
-The function must accept one argument: the buffer to display."
-  :type '(choice
-          (function-item switch-to-buffer)
-          (function-item pop-to-buffer)
-          (function-item display-buffer)
-          (function :tag "Custom function"))
+(defcustom majutsu-slow-confirm nil
+  "A list of actions that should use `yes-or-no-p' instead of `y-or-n-p'."
+  :type `(choice (const :tag "Use yes-or-no for all" t)
+                 (set   :tag "Use yes-or-no for"
+                        ,@majutsu--confirm-actions))
   :group 'majutsu)
-
-(defcustom majutsu-display-functions
-  '((log . pop-to-buffer)
-    (op-log . pop-to-buffer)
-    (diff . pop-to-buffer)
-    (message . pop-to-buffer))
-  "Alist mapping Majutsu buffer kinds to display functions.
-Each function must accept one argument: the buffer to display.
-Add new entries here to extend display behavior for additional buffers."
-  :type '(alist :key-type (symbol :tag "Buffer kind")
-          :value-type (choice
-                       (function-item switch-to-buffer)
-                       (function-item pop-to-buffer)
-                       (function-item display-buffer)
-                       (function :tag "Custom function")))
-  :group 'majutsu)
-
-(defun majutsu--display-function (kind)
-  "Return display function for KIND or the default fallback."
-  (or (alist-get kind majutsu-display-functions nil nil #'eq)
-      majutsu-default-display-function
-      #'pop-to-buffer))
 
 ;;; Section Classes
 
@@ -95,12 +81,19 @@ Add new entries here to extend display behavior for additional buffers."
   :abstract t)
 
 (defclass majutsu-file-section (majutsu-diff-section)
- ((keymap :initform 'majutsu-file-section-map)))
+  ((keymap :initform 'majutsu-file-section-map)
+   (header :initarg :header
+           :initform nil
+           :documentation "Raw file header text (diff --git + extended headers).")))
 
 (defclass majutsu-hunk-section (majutsu-diff-section)
   ((keymap :initform 'majutsu-hunk-section-map)
-   (start :initarg :hunk-start)
-   (header :initarg :header)
+   (fontified :initform nil)
+   (combined :initarg :combined :initform nil)
+   (from-range :initarg :from-range :initform nil)
+   (from-ranges :initarg :from-ranges :initform nil)
+   (to-range :initarg :to-range :initform nil)
+   (about :initarg :about :initform nil)
    (painted :initform nil)
    (refined :initform nil)
    (heading-highlight-face :initform 'magit-diff-hunk-heading-highlight)
@@ -110,18 +103,23 @@ Add new entries here to extend display behavior for additional buffers."
 (setf (alist-get 'jj-file   magit--section-type-alist) 'majutsu-file-section)
 (setf (alist-get 'jj-hunk   magit--section-type-alist) 'majutsu-hunk-section)
 
+;; Workspace sections (`jj workspace list`)
+
+(defclass majutsu-workspace-section (magit-section) ())
+
+(setf (alist-get 'jj-workspace magit--section-type-alist) 'majutsu-workspace-section)
+
 ;;; Utilities
 
-(defvar-local majutsu--repo-root nil
-  "Cached repository root for the current buffer.")
-
-(defun majutsu--root ()
-  "Find root of the current repository."
-  (let ((root (or (and (boundp 'majutsu--repo-root) majutsu--repo-root)
-                  (locate-dominating-file default-directory ".jj"))))
-    (unless root
-      (user-error "Cannot find root -- not in a JJ repo"))
-    root))
+(defun majutsu--ensure-flag (args flag &optional position)
+  "Return ARGS ensuring FLAG is present once.
+POSITION may be `front' to insert FLAG at the beginning; otherwise FLAG
+is appended."
+  (if (member flag args)
+      args
+    (if (eq position 'front)
+        (cons flag args)
+      (append args (list flag)))))
 
 (defun majutsu--debug (format-string &rest args)
   "Log debug message if `majutsu-debug' is enabled."
@@ -134,6 +132,71 @@ Add new entries here to extend display behavior for additional buffers."
     (majutsu--debug "User message: %s" msg)
     (message "%s" msg)))
 
+(defun majutsu-y-or-n-p (prompt &optional action)
+  "Ask PROMPT with y/n or yes/no depending on ACTION settings."
+  (if (or (eq majutsu-slow-confirm t)
+          (and action (member action majutsu-slow-confirm)))
+      (yes-or-no-p prompt)
+    (y-or-n-p prompt)))
+
+(defun majutsu-confirm (action prompt)
+  "Return non-nil if ACTION is confirmed.
+
+ACTION is a symbol such as `rebase' or `abandon'.  PROMPT should
+end with a question mark and space."
+  (cond
+   ((not majutsu-confirm-critical-actions) t)
+   ((eq majutsu-no-confirm t) t)
+   ((and action (memq action majutsu-no-confirm)) t)
+   (t (majutsu-y-or-n-p prompt action))))
+
+;;; Completing Read
+
+(defun majutsu--make-completion-table (candidates &optional category)
+  "Wrap CANDIDATES in a completion table.
+When CATEGORY is non-nil, set it in metadata to control UI icons/styling."
+  (let ((metadata `(metadata (display-sort-function . identity)
+                             ,@(and category `((category . ,category))))))
+    (lambda (string pred action)
+      (if (eq action 'metadata)
+          metadata
+        (complete-with-action action candidates string pred)))))
+
+(defun majutsu-completing-read (prompt collection &optional predicate require-match
+                                       initial-input hist def category)
+  "Read a choice with completion, preserving CATEGORY metadata.
+Like `completing-read' but uses `format-prompt' and supports CATEGORY
+for completion UI styling (icons, grouping)."
+  (let ((table (if category
+                   (majutsu--make-completion-table collection category)
+                 collection)))
+    (completing-read (format-prompt prompt def)
+                     table predicate require-match
+                     initial-input hist def)))
+
+(defun majutsu-completing-read-multiple (prompt collection &optional predicate require-match
+                                                initial-input hist def category)
+  "Read multiple choices with completion, preserving CATEGORY metadata.
+Like `completing-read-multiple' but uses `format-prompt' and supports CATEGORY."
+  (let ((table (if category
+                   (majutsu--make-completion-table collection category)
+                 collection)))
+    (completing-read-multiple (format-prompt prompt def)
+                              table predicate require-match
+                              initial-input hist def)))
+
+(defun majutsu-read-string (prompt &optional initial-input history default-value)
+  "Read a string from the minibuffer, prompting with PROMPT.
+Uses `format-prompt' for consistent formatting.  Empty input returns
+DEFAULT-VALUE if non-nil, otherwise signals an error."
+  (let ((val (read-string (format-prompt prompt default-value)
+                          initial-input history default-value)))
+    (if (string-empty-p val)
+        (if default-value
+            default-value
+          (user-error "Need non-empty input"))
+      val)))
+
 (defun majutsu-display-buffer (buffer &optional kind display-function)
   "Display BUFFER using a function chosen for KIND or DISPLAY-FUNCTION.
 If DISPLAY-FUNCTION is non-nil, call it directly.  Otherwise look up
@@ -141,7 +204,7 @@ KIND (a symbol such as `log', `diff' or `message') via
 `majutsu-display-functions' and fall back to
 `majutsu-default-display-function' when no match is found."
   (let* ((display-fn (or display-function
-                         (majutsu--display-function kind))))
+                         (majutsu-display-function kind))))
     (funcall display-fn buffer)
     (or (get-buffer-window buffer t)
         (selected-window))))
@@ -155,12 +218,11 @@ text properties."
    (t nil)))
 
 (defun majutsu--buffer-root (&optional buffer)
-  "Return the cached repo root for BUFFER (default `current-buffer').
-Falls back to `majutsu--root' when available.  This is used to match
-buffers to repositories when refreshing."
+  "Return the cached root for BUFFER (default `current-buffer').
+
+This is used to match buffers to repositories when refreshing."
   (with-current-buffer (or buffer (current-buffer))
-    (or (and (boundp 'majutsu--repo-root) majutsu--repo-root)
-        (ignore-errors (majutsu--root)))))
+    (and (boundp 'majutsu--default-directory) majutsu--default-directory)))
 
 (defun majutsu--find-mode-buffer (mode &optional root)
   "Return a live buffer in MODE for ROOT (or any repo when ROOT is nil)."

@@ -1,12 +1,12 @@
 ;;; majutsu.el --- Interface to jj version control system  -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 0WD0
+;; Copyright (C) 2025-2026 0WD0
 
 ;; Author: 0WD0 <wd.1105848296@gmail.com>
 ;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
-;; Version: 0.3.0
+;; Version: 0.5.0
 ;; Package-Requires: ((emacs "29.1") (transient "0.5.0") (magit "3.3.0"))
 
 ;;; Commentary:
@@ -21,6 +21,8 @@
 (require 'majutsu-process)
 (require 'majutsu-log)
 (require 'majutsu-diff)
+(require 'majutsu-jjdescription)
+(require 'majutsu-selection)
 
 ;;; Aliases
 
@@ -38,46 +40,53 @@ Instead of invoking this alias for `majutsu-log' using
 ;;;###autoload
 (transient-define-prefix majutsu-dispatch ()
   "Top-level Majutsu command dispatcher."
-  [:description "Majutsu Commands"
-   :class transient-columns
-   ["Basic Operations"
-    ("g" "Refresh log" majutsu-log-refresh)
-    ("c" "Commit" majutsu-commit)
-    ("e" "Edit change" majutsu-edit-changeset)
-    ("u" "Undo" majutsu-undo)
-    ("R" "Redo" majutsu-redo)
-    ("l" "Log options" majutsu-log-transient)
-    ("N" "New" majutsu-new)
-    ("n" "New (transient)" majutsu-new-transient)
-    ("y" "Duplicate (transient)" majutsu-duplicate-transient)
-    ("Y" "Duplicate" majutsu-duplicate)
-    ("a" "Abandon" majutsu-abandon)
-    ("d" "Describe" majutsu-describe)
-    ("s" "Squash" majutsu-squash-transient)]
-   ["Advanced"
-    ("r" "Rebase" majutsu-rebase-transient)
-    ("b" "Bookmarks" majutsu-bookmark-transient)
-    ("G" "Git" majutsu-git-transient)]
-   ["Diff & Fix"
-    ("D" "Diff menu" majutsu-diff-transient)
-    ("E" "DiffEdit (ediff)" majutsu-diffedit-emacs)
-    ("M" "DiffEdit (smerge)" majutsu-diffedit-smerge)]
-   ["Exit"
-    ("?" "Help" transient-help)
-    ("q" "Quit" transient-quit-one)]])
+  ["Transient and dwim commands"
+   [("k" "Abandon"           majutsu-abandon)
+    ("b" "Bookmarks"         majutsu-bookmark)
+    ("c" "Describe"          majutsu-describe)
+    ("C" "Commit"            majutsu-commit)
+    ("d" "Diff"              majutsu-diff)
+    ("D" "Diff (dwim)"       majutsu-diff-dwim)
+    ("e" "Edit change"       majutsu-edit-changeset)
+    ("E" "DiffEdit (ediff)"  majutsu-diffedit-emacs)]
+   [("G" "Git"               majutsu-git-transient)
+    ("l" "Log options"       majutsu-log-transient)
+    ("M" "DiffEdit (smerge)" majutsu-diffedit-smerge)
+    ("o" "New"               majutsu-new)
+    ("O" "New (dwim)"        majutsu-new-dwim)
+    ("r" "Rebase"            majutsu-rebase)
+    ("R" "Restore"           majutsu-restore)]
+   [("s" "Squash"            majutsu-squash)
+    ("S" "Split"             majutsu-split)
+    ("y" "Duplicate"         majutsu-duplicate)
+    ("Y" "Duplicate (dwim)"  majutsu-duplicate-dwim)
+    ("Z" "Workspaces"        majutsu-workspace)
+    ("C-/" "Undo"            majutsu-undo)
+    ("C-?" "Redo"            majutsu-redo)]]
+  ["Essential commands"
+   :if-derived majutsu-mode
+   [("g" "Refresh"           majutsu-refresh)
+    ("q" "Quit"              quit-window)]
+   [("?" "Help"              transient-help)
+    ("$" "Process buffer"    majutsu-process-buffer)]
+   [("C-x m"    "Show all key bindings"    describe-mode)]])
 
 (provide 'majutsu)
 
 (cl-eval-when (load eval)
+  (require 'majutsu-bookmark)
   (require 'majutsu-duplicate)
   (require 'majutsu-edit)
-  (require 'majutsu-op)
   (require 'majutsu-git)
+  (require 'majutsu-interactive)
   (require 'majutsu-rebase)
   (require 'majutsu-restore)
+  (require 'majutsu-split)
+  (require 'majutsu-squash)
   (require 'majutsu-commit)
   (require 'majutsu-new)
-  (require 'majutsu-bookmark))
+  (require 'majutsu-op)
+  (require 'majutsu-workspace))
 
 (with-eval-after-load 'evil
   (require 'majutsu-evil nil t))

@@ -1,6 +1,6 @@
 ;;; majutsu-template.el -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 0WD0
+;; Copyright (C) 2025-2026 0WD0
 
 ;; Author: 0WD0 <wd.1105848296@gmail.com>
 ;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
@@ -943,6 +943,7 @@ participate in keyword sugar."
     (OperationId
      (short :args ((len Integer :optional t)) :returns String))
     (RepoPath
+     (absolute :returns String :keyword t)
      (display :returns String :keyword t)
      (parent :returns Option :keyword t))
     (ShortestIdPrefix
@@ -1100,9 +1101,13 @@ Further passes (type-checking, rendering) operate on these nodes."
   (:returns Template :doc "label helper." :flavor :builtin))
 
 (majutsu-template-defun json ((value Template))
-  (:returns Template :doc "json(FORM)." :flavor :builtin))
+  (:returns Template :doc "json(VALUE)." :flavor :builtin))
 
-;; str/raw/join are defined manually to avoid recursion or for custom logic.
+(majutsu-template-defun join ((separator Template)
+                              (content Template :rest t))
+  (:returns Template :doc "join(SEP, CONTENT...)." :flavor :builtin))
+
+;; str/raw are defined manually to avoid recursion or for custom logic.
 ;; We register their metadata here.
 
 (majutsu-template--register-function
@@ -1118,12 +1123,12 @@ Further passes (type-checking, rendering) operate on these nodes."
               (majutsu-template--make-arg :name 'type :type 'Template :optional t))
   :returns 'Template :doc "Raw literal helper." :flavor :custom))
 
-(majutsu-template-defun join ((separator Template)
-                              (collection Template)
-                              (var Template)
-                              (body Template))
+(majutsu-template-defun map-join ((separator Template)
+                                  (collection Template)
+                                  (var Template)
+                                  (body Template))
   (:returns Template :doc "map-then-join helper.")
-  (majutsu-template--join-impl separator collection var body))
+  (majutsu-template--map-join-impl separator collection var body))
 
 (majutsu-template-defun map ((collection Template)
                              (var Template)
@@ -1331,7 +1336,7 @@ CONTEXT is used in error messages."
     (majutsu-template--resolve-call-name (eval expr)))
    (t expr)))
 
-(defun majutsu-template--join-impl (sep coll var body)
+(defun majutsu-template--map-join-impl (sep coll var body)
   "Return node for COLL.map(|VAR| BODY).join(SEP)."
   (let* ((sep-node (majutsu-template--normalize sep))
          (coll-node (majutsu-template--normalize coll))
@@ -1469,16 +1474,7 @@ Optional SELF-TYPE overrides `majutsu-template-default-self-type'."
       (user-error "majutsu-template: unknown operator %S" op)))))
 
 ;;;###autoload
-(defmacro tpl (form)
-  "Expand a template program FORM (must be a vector literal) into the EDSL AST."
-  (unless (vectorp form)
-    (user-error "tpl: top-level form must be a vector, e.g., [:concat ...]"))
-  (let ((majutsu-template--allow-eval t))
-    (let ((node (majutsu-template--rewrite form)))
-      `(quote ,node))))
-
-;;;###autoload
-(defmacro tpl-compile (form &optional self-type)
+(defmacro majutsu-tpl (form &optional self-type)
   "Expand and compile FORM to a jj template string.
 Vector literals are compiled at macro-expansion time IF SELF-TYPE is provided
 as a constant.

@@ -1,6 +1,6 @@
 ;;; majutsu-duplicate.el -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 0WD0
+;; Copyright (C) 2025-2026 0WD0
 
 ;; Author: 0WD0 <wd.1105848296@gmail.com>
 ;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
@@ -15,167 +15,165 @@
 ;;; Code:
 
 (require 'majutsu)
+(require 'majutsu-selection)
+
+(defclass majutsu-duplicate-option (majutsu-selection-option)
+  ((selection-key :initarg :selection-key :initform nil)))
+
+(defclass majutsu-duplicate--toggle-option (majutsu-selection-toggle-option)
+  ())
 
 ;;; Duplicate
+
+(defun majutsu-duplicate-arguments ()
+  "Return the current duplicate arguments.
+If inside the transient, return transient args.
+Otherwise, if no -r is set, add -r from point (or region values, or @)."
+  (let ((args (if (eq transient-current-command 'majutsu-duplicate)
+                  (transient-args 'majutsu-duplicate)
+                '())))
+    (unless (cl-some (lambda (arg) (string-prefix-p "-r" arg)) args)
+      (let ((revsets (or (magit-region-values nil t)
+                         (and (magit-section-value-if 'jj-commit)
+                              (list (magit-section-value-if 'jj-commit)))
+                         (list "@"))))
+        (dolist (rev revsets)
+          (push (concat "-r" rev) args))))
+    args))
+
+;;;###autoload
+(defun majutsu-duplicate-dwim ()
+  "Duplicate the changeset at point.
+With prefix ARG, open the duplicate transient."
+  (interactive)
+  (let ((args  (majutsu-duplicate-arguments)))
+    (majutsu-run-jj "duplicate" args)))
+
+;;; Duplicate Transient
+(transient-define-argument majutsu-duplicate:-r ()
+  :description "Source"
+  :class 'majutsu-duplicate-option
+  :selection-key 'source
+  :selection-label "[SRC]"
+  :selection-face '(:background "goldenrod" :foreground "black")
+  :selection-type 'multi
+  :key "-r"
+  :argument "-r"
+  :multi-value 'repeat
+  :reader #'majutsu-diff--transient-read-revset)
+
+(transient-define-argument majutsu-duplicate:--onto ()
+  :description "Onto"
+  :class 'majutsu-duplicate-option
+  :selection-key 'onto
+  :selection-label "[ONTO]"
+  :selection-face '(:background "dark green" :foreground "white")
+  :selection-type 'multi
+  :key "-o"
+  :argument "--onto="
+  :multi-value 'repeat
+  :reader #'majutsu-diff--transient-read-revset)
+
+(transient-define-argument majutsu-duplicate:--after ()
+  :description "After"
+  :class 'majutsu-duplicate-option
+  :selection-key 'after
+  :selection-label "[AFTER]"
+  :selection-face '(:background "dark blue" :foreground "white")
+  :selection-type 'multi
+  :key "-A"
+  :argument "--insert-after="
+  :multi-value 'repeat
+  :reader #'majutsu-diff--transient-read-revset)
+
+(transient-define-argument majutsu-duplicate:--before ()
+  :description "Before"
+  :class 'majutsu-duplicate-option
+  :selection-key 'before
+  :selection-label "[BEFORE]"
+  :selection-face '(:background "dark magenta" :foreground "white")
+  :selection-type 'multi
+  :key "-B"
+  :argument "--insert-before="
+  :multi-value 'repeat
+  :reader #'majutsu-diff--transient-read-revset)
+
+(transient-define-argument majutsu-duplicate:source ()
+  :description "Source (toggle at point)"
+  :class 'majutsu-duplicate--toggle-option
+  :selection-key 'source
+  :selection-type 'multi
+  :key "r"
+  :argument "-r"
+  :multi-value 'repeat)
+
+(transient-define-argument majutsu-duplicate:onto ()
+  :description "Onto (toggle at point)"
+  :class 'majutsu-duplicate--toggle-option
+  :selection-key 'onto
+  :selection-type 'multi
+  :key "o"
+  :argument "--onto="
+  :multi-value 'repeat)
+
+(transient-define-argument majutsu-duplicate:after ()
+  :description "After (toggle at point)"
+  :class 'majutsu-duplicate--toggle-option
+  :selection-key 'after
+  :selection-type 'multi
+  :key "a"
+  :argument "--insert-after="
+  :multi-value 'repeat)
+
+(transient-define-argument majutsu-duplicate:before ()
+  :description "Before (toggle at point)"
+  :class 'majutsu-duplicate--toggle-option
+  :selection-key 'before
+  :selection-type 'multi
+  :key "b"
+  :argument "--insert-before="
+  :multi-value 'repeat)
 
 (defun majutsu-duplicate-clear-selections ()
   "Clear duplicate selections."
   (interactive)
-  (majutsu-selection-clear)
-  (when (called-interactively-p 'interactive)
-    (message "Cleared duplicate selections")))
+  (when (consp transient--suffixes)
+    (dolist (obj transient--suffixes)
+      (when (and (cl-typep obj 'majutsu-duplicate-option)
+                 (memq (oref obj selection-key) '(source onto after before)))
+        (transient-infix-set obj nil))))
+  (when transient--prefix
+    (transient--redisplay))
+  (majutsu-selection-render)
+  (message "Cleared duplicate selections"))
 
-(defun majutsu-duplicate-toggle-source ()
-  "Toggle the commit at point as a duplicate source."
-  (interactive)
-  (majutsu-selection-toggle 'source))
-
-(defun majutsu-duplicate-toggle-destination ()
-  "Toggle the commit at point as a duplicate destination."
-  (interactive)
-  (majutsu-selection-toggle 'onto))
-
-(defun majutsu-duplicate-toggle-after ()
-  "Toggle the commit at point as a duplicate --after entry."
-  (interactive)
-  (majutsu-selection-toggle 'after))
-
-(defun majutsu-duplicate-toggle-before ()
-  "Toggle the commit at point as a duplicate --before entry."
-  (interactive)
-  (majutsu-selection-toggle 'before))
-
-(defun majutsu-duplicate--run-command (args)
-  "Execute jj duplicate with ARGS and refresh log."
-  (when (zerop (apply #'majutsu-call-jj args))
-    (message "Duplicated changeset(s)")
-    (majutsu-selection-session-end)
-    t))
-
-(defun majutsu-duplicate-execute ()
-  "Execute jj duplicate using transient selections."
-  (interactive)
-  (majutsu-duplicate--run-command (majutsu-duplicate--build-args)))
-
-;;;###autoload
-(defun majutsu-duplicate-transient ()
-  "Open the jj duplicate transient."
-  (interactive)
-  (majutsu-selection-session-begin
-   '((:key source
-      :label "[SRC]"
-      :face (:background "goldenrod" :foreground "black")
-      :type multi)
-     (:key onto
-      :label "[ONTO]"
-      :face (:background "dark green" :foreground "white")
-      :type multi)
-     (:key after
-      :label "[AFTER]"
-      :face (:background "dark blue" :foreground "white")
-      :type multi)
-     (:key before
-      :label "[BEFORE]"
-      :face (:background "dark magenta" :foreground "white")
-      :type multi)))
-  (add-hook 'transient-exit-hook #'majutsu-selection-session-end nil t)
-  (majutsu-duplicate-transient--internal))
-
-;;;###autoload
-(defun majutsu-duplicate (arg)
-  "Duplicate the changeset at point.
-With prefix ARG, open the duplicate transient."
-  (interactive "P")
-  (if arg
-      (majutsu-duplicate-transient)
-    (let* ((rev (magit-section-value-if 'jj-commit))
-           (args (majutsu-duplicate--build-args
-                  :sources (list (or rev "@")))))
-      (majutsu-duplicate--run-command args))))
-
-;;; Duplicate Transient
-
-(defun majutsu-duplicate--sources ()
-  "Return normalized duplicate source revsets."
-  (or (majutsu-selection-values 'source)
-      (list (or (magit-section-value-if 'jj-commit) "@"))))
-
-(defun majutsu-duplicate--sources-display ()
-  "Return human-readable description of duplicate sources."
-  (if-let* ((values (majutsu-selection-values 'source)))
-      (string-join values ", ")
-    (or (magit-section-value-if 'jj-commit) "@")))
-
-(defun majutsu-duplicate--summary ()
-  "Return a vector of descriptive fragments for duplicate state."
-  (let (parts)
-    (push (format "Sources: %s" (majutsu-duplicate--sources-display)) parts)
-    (when (> (majutsu-selection-count 'onto) 0)
-      (push (format "Destinations: %d" (majutsu-selection-count 'onto)) parts))
-    (when (> (majutsu-selection-count 'after) 0)
-      (push (format "--after: %d" (majutsu-selection-count 'after)) parts))
-    (when (> (majutsu-selection-count 'before) 0)
-      (push (format "--before: %d" (majutsu-selection-count 'before)) parts))
-    (nreverse parts)))
-
-(defun majutsu-duplicate--description ()
-  "Build duplicate transient description."
-  (let ((parts (majutsu-duplicate--summary)))
-    (if parts
-        (concat "JJ Duplicate | " (string-join parts " | "))
-      "JJ Duplicate")))
-
-(cl-defun majutsu-duplicate--build-args (&key sources destinations after before)
-  "Construct jj duplicate argument list."
-  (let* ((sources (or sources (majutsu-duplicate--sources)))
-         (destinations (or destinations (majutsu-selection-values 'onto)))
-         (after (or after (majutsu-selection-values 'after)))
-         (before (or before (majutsu-selection-values 'before)))
-         (args '("duplicate")))
-    (dolist (rev destinations)
-      (setq args (append args (list "--onto" rev))))
-    (dolist (rev after)
-      (setq args (append args (list "--after" rev))))
-    (dolist (rev before)
-      (setq args (append args (list "--before" rev))))
-    (setq args (append args sources))
-    args))
-
-(transient-define-prefix majutsu-duplicate-transient--internal ()
+(transient-define-prefix majutsu-duplicate ()
   "Internal transient for jj duplicate."
   :man-page "jj-duplicate"
-  :transient-suffix 'transient--do-exit
   :transient-non-suffix t
-  [:description majutsu-duplicate--description
+  [:description "JJ Duplicate"
    :class transient-columns
    ["Sources"
-    ("y" "Toggle source" majutsu-duplicate-toggle-source
-     :description (lambda ()
-                    (format "Toggle source (%d selected)"
-                            (majutsu-selection-count 'source)))
-     :transient t)
+    (majutsu-duplicate:-r)
+    (majutsu-duplicate:source)
     ("c" "Clear selections" majutsu-duplicate-clear-selections
      :transient t)]
    ["Placement"
-    ("o" "Toggle --onto" majutsu-duplicate-toggle-destination
-     :description (lambda ()
-                    (format "--onto (%d selected)"
-                            (majutsu-selection-count 'onto)))
-     :transient t)
-    ("a" "Toggle --after" majutsu-duplicate-toggle-after
-     :description (lambda ()
-                    (format "--after (%d selected)"
-                            (majutsu-selection-count 'after)))
-     :transient t)
-    ("b" "Toggle --before" majutsu-duplicate-toggle-before
-     :description (lambda ()
-                    (format "--before (%d selected)"
-                            (majutsu-selection-count 'before)))
-     :transient t)]
+    (majutsu-duplicate:--onto)
+    (majutsu-duplicate:--after)
+    (majutsu-duplicate:--before)
+    (majutsu-duplicate:onto)
+    (majutsu-duplicate:after)
+    (majutsu-duplicate:before)]
    ["Actions"
-    ("RET" "Duplicate changes" majutsu-duplicate-execute)
-    ("p" "Duplicate changes" majutsu-duplicate-execute)
-    ("q" "Quit" transient-quit-one)]])
+    ("y" "Duplicate changes" majutsu-duplicate-dwim)
+    ("RET" "Duplicate changes" majutsu-duplicate-dwim)
+    ("q" "Quit" transient-quit-one)]]
+  (interactive)
+  (transient-setup
+   'majutsu-duplicate nil nil
+   :scope
+   (majutsu-selection-session-begin)))
 
 ;;; _
 (provide 'majutsu-duplicate)

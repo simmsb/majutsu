@@ -1,6 +1,6 @@
 ;;; majutsu-rebase.el -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 0WD0
+;; Copyright (C) 2025-2026 0WD0
 
 ;; Author: 0WD0 <wd.1105848296@gmail.com>
 ;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
@@ -15,170 +15,215 @@
 ;;; Code:
 
 (require 'majutsu)
+(require 'majutsu-selection)
+
+(defclass majutsu-rebase-option (majutsu-selection-option)
+  ((selection-key :initarg :selection-key :initform nil)))
+
+(defclass majutsu-rebase--toggle-option (majutsu-selection-toggle-option)
+  ())
 
 ;;; majutsu-rebase
 
 ;;;###autoload
-(defun majutsu-rebase-clear-selections ()
-  "Clear all rebase selections."
-  (interactive)
-  (majutsu-selection-clear)
-  (message "Cleared all rebase selections"))
-
-;;;###autoload
-(defun majutsu-rebase-set-source ()
-  "Set the commit at point as rebase source."
-  (interactive)
-  (majutsu-selection-toggle 'source))
-
-;;;###autoload
-(defun majutsu-rebase-toggle-destination ()
-  "Toggle the commit at point as a rebase destination."
-  (interactive)
-  (majutsu-selection-toggle 'destination))
-
-;;;###autoload
-(defun majutsu-rebase-toggle-source-type ()
-  "Toggle rebase source type between -s, -b, and -r."
-  (interactive)
-  (setq majutsu-rebase-source-type
-        (cond
-         ((string= majutsu-rebase-source-type "-s") "-b")
-         ((string= majutsu-rebase-source-type "-b") "-r")
-         (t "-s"))))
-
-;;;###autoload
-(defun majutsu-rebase-toggle-dest-type ()
-  "Toggle rebase destination type between -o, -A, and -B."
-  (interactive)
-  (setq majutsu-rebase-dest-type
-        (cond
-         ((string= majutsu-rebase-dest-type "-o") "-A")
-         ((string= majutsu-rebase-dest-type "-A") "-B")
-         (t "-o"))))
-
-;;;###autoload
-(transient-define-suffix majutsu-rebase (args)
+(defun majutsu-rebase-execute (args)
   "Execute rebase with selected source and destinations.
 ARGS are passed from the transient."
-  (interactive (list (transient-args 'majutsu-rebase-transient--internal)))
-  (if (and (> (majutsu-selection-count 'source) 0)
-           (> (majutsu-selection-count 'destination) 0))
-      (let* ((source-revs (majutsu-selection-values 'source))
-             (source-display (majutsu-rebase--source-display))
-             (dest-revs (majutsu-selection-values 'destination))
-             (dest-display (majutsu-rebase--destination-display))
-             (skip-emptied? (member "--skip-emptied" args))
-             (keep-divergent? (member "--keep-divergent" args))
-             (ignore-immutable? (member "--ignore-immutable" args)))
-        (when (and source-revs dest-revs
-                   (yes-or-no-p (format "Rebase %s -> %s? " source-display dest-display)))
-          (let* ((dest-args
-                  (apply #'append
-                         (mapcar (lambda (dest)
-                                   (list majutsu-rebase-dest-type dest))
-                                 dest-revs)))
-                 (source-args
-                  (apply #'append
-                         (mapcar (lambda (source)
-                                   (list majutsu-rebase-source-type source))
-                                 source-revs)))
-                 (all-args (append '("rebase") source-args dest-args
-                                   (when skip-emptied? '("--skip-emptied"))
-                                   (when keep-divergent? '("--keep-divergent"))
-                                   (when ignore-immutable? '("--ignore-immutable"))))
-                 (progress-msg (format "Rebasing %s onto %s" source-display dest-display))
-                 (success-msg (format "Rebase completed: %s -> %s" source-display dest-display)))
-            (majutsu--message-with-log "%s..." progress-msg)
+  (interactive (list (transient-args 'majutsu-rebase)))
+  (let ((has-dest (seq-some (lambda (arg)
+                              (or (string-prefix-p "--onto=" arg)
+                                  (string-prefix-p "--insert-after=" arg)
+                                  (string-prefix-p "--insert-before=" arg)))
+                            args)))
+    (if has-dest
+        (when (majutsu-confirm 'rebase "Rebase with current selections? ")
+          (let ((all-args (cons "rebase" args)))
+            (majutsu--message-with-log "Rebasing...")
             (majutsu--debug "Running jj rebase with args: %s" (string-join all-args " "))
-            (when (zerop (apply #'majutsu-call-jj all-args))
-              (message "%s" success-msg)
-              (majutsu-selection-session-end)))))
-    (majutsu--message-with-log "Please select source (s) and at least one destination (d) first")))
-
-;;;###autoload
-(defun majutsu-rebase-transient ()
-  "Transient for jj rebase operations."
-  (interactive)
-  (majutsu-selection-session-begin
-   '((:key source
-      :label "[SOURCE]"
-      :face (:background "dark green" :foreground "white")
-      :type multi)
-     (:key destination
-      :label "[DEST]"
-      :face (:background "dark blue" :foreground "white")
-      :type multi)))
-  (add-hook 'transient-exit-hook #'majutsu-selection-session-end nil t)
-  (majutsu-rebase-transient--internal))
+            (when (zerop (apply #'majutsu-run-jj all-args))
+              (message "Rebase completed"))))
+      (majutsu--message-with-log "Please select destination (-o/-A/-B) first"))))
 
 ;;; Rebase Transient
 
-(defvar-local majutsu-rebase-source-type "-s"
-  "Flag to use for rebase source (-s, -b, or -r).")
+(transient-define-argument majutsu-rebase:--source ()
+  :description "Source"
+  :class 'majutsu-rebase-option
+  :selection-key 'source
+  :selection-label "[SRC]"
+  :selection-face '(:background "dark green" :foreground "white")
+  :selection-type 'multi
+  :key "-s"
+  :argument "--source="
+  :multi-value 'repeat
+  :reader #'majutsu-diff--transient-read-revset)
 
-(defvar-local majutsu-rebase-dest-type "-o"
-  "Flag to use for rebase destination (-o, -A, or -B).")
+(transient-define-argument majutsu-rebase:--branch ()
+  :description "Branch"
+  :class 'majutsu-rebase-option
+  :selection-key 'branch
+  :selection-label "[BRANCH]"
+  :selection-face '(:background "goldenrod" :foreground "black")
+  :selection-type 'multi
+  :key "-b"
+  :argument "--branch="
+  :multi-value 'repeat
+  :reader #'majutsu-diff--transient-read-revset)
 
-(defun majutsu-rebase--destination-display ()
-  "Return a comma-separated string for destination display."
-  (when-let* ((values (majutsu-selection-values 'destination)))
-    (string-join values ", ")))
+(transient-define-argument majutsu-rebase:--revisions ()
+  :description "Revisions"
+  :class 'majutsu-rebase-option
+  :selection-key 'revisions
+  :selection-label "[REVS]"
+  :selection-face '(:background "dark orange" :foreground "black")
+  :selection-type 'multi
+  :key "-r"
+  :argument "--revisions="
+  :multi-value 'repeat
+  :reader #'majutsu-diff--transient-read-revset)
 
-(defun majutsu-rebase--source-display ()
-  "Return a comma-separated string for source display."
-  (when-let* ((values (majutsu-selection-values 'source)))
-    (string-join values ", ")))
+(transient-define-argument majutsu-rebase:--onto ()
+  :description "Onto"
+  :class 'majutsu-rebase-option
+  :selection-key 'onto
+  :selection-label "[ONTO]"
+  :selection-face '(:background "dark cyan" :foreground "white")
+  :selection-type 'multi
+  :key "-o"
+  :argument "--onto="
+  :multi-value 'repeat
+  :reader #'majutsu-diff--transient-read-revset)
 
-(transient-define-prefix majutsu-rebase-transient--internal ()
+(transient-define-argument majutsu-rebase:--after ()
+  :description "After"
+  :class 'majutsu-rebase-option
+  :selection-key 'after
+  :selection-label "[AFTER]"
+  :selection-face '(:background "dark blue" :foreground "white")
+  :selection-type 'multi
+  :key "-A"
+  :argument "--insert-after="
+  :multi-value 'repeat
+  :reader #'majutsu-diff--transient-read-revset)
+
+(transient-define-argument majutsu-rebase:--before ()
+  :description "Before"
+  :class 'majutsu-rebase-option
+  :selection-key 'before
+  :selection-label "[BEFORE]"
+  :selection-face '(:background "dark magenta" :foreground "white")
+  :selection-type 'multi
+  :key "-B"
+  :argument "--insert-before="
+  :multi-value 'repeat
+  :reader #'majutsu-diff--transient-read-revset)
+
+(transient-define-argument majutsu-rebase:source ()
+  :description "Source (toggle at point)"
+  :class 'majutsu-rebase--toggle-option
+  :selection-key 'source
+  :selection-type 'multi
+  :key "s"
+  :argument "--source="
+  :multi-value 'repeat)
+
+(transient-define-argument majutsu-rebase:branch ()
+  :description "Branch (toggle at point)"
+  :class 'majutsu-rebase--toggle-option
+  :selection-key 'branch
+  :selection-type 'multi
+  :key "b"
+  :argument "--branch="
+  :multi-value 'repeat)
+
+(transient-define-argument majutsu-rebase:revisions ()
+  :description "Revisions (toggle at point)"
+  :class 'majutsu-rebase--toggle-option
+  :selection-key 'revisions
+  :selection-type 'multi
+  :key "r"
+  :argument "--revisions="
+  :multi-value 'repeat)
+
+(transient-define-argument majutsu-rebase:onto ()
+  :description "Onto (toggle at point)"
+  :class 'majutsu-rebase--toggle-option
+  :selection-key 'onto
+  :selection-type 'multi
+  :key "o"
+  :argument "--onto="
+  :multi-value 'repeat)
+
+(transient-define-argument majutsu-rebase:after ()
+  :description "After (toggle at point)"
+  :class 'majutsu-rebase--toggle-option
+  :selection-key 'after
+  :selection-type 'multi
+  :key "a"
+  :argument "--insert-after="
+  :multi-value 'repeat)
+
+(transient-define-argument majutsu-rebase:before ()
+  :description "Before (toggle at point)"
+  :class 'majutsu-rebase--toggle-option
+  :selection-key 'before
+  :selection-type 'multi
+  :key "B"
+  :argument "--insert-before="
+  :multi-value 'repeat)
+
+(defun majutsu-rebase-clear-selections ()
+  "Clear all rebase selections."
+  (interactive)
+  (when (consp transient--suffixes)
+    (dolist (obj transient--suffixes)
+      (when (and (cl-typep obj 'majutsu-rebase-option)
+                 (memq (oref obj selection-key) '(source branch revisions onto after before)))
+        (transient-infix-set obj nil))))
+  (when transient--prefix
+    (transient--redisplay))
+  (majutsu-selection-render)
+  (message "Cleared all rebase selections"))
+
+(transient-define-prefix majutsu-rebase ()
   "Internal transient for jj rebase operations."
   :man-page "jj-rebase"
-  :transient-suffix 'transient--do-exit
+  :incompatible '(("--source=" "--branch=")
+                  ("--source=" "--revisions=")
+                  ("--branch=" "--revisions=")
+                  ("--onto=" "--insert-after=")
+                  ("--onto=" "--insert-before="))
   :transient-non-suffix t
-  [:description
-   (lambda ()
-     (concat "JJ Rebase"
-             (when-let* ((source (majutsu-rebase--source-display)))
-               (format " | Source (%s): %s" majutsu-rebase-source-type source))
-             (when (> (majutsu-selection-count 'destination) 0)
-               (format " | Destinations (%s): %s"
-                       majutsu-rebase-dest-type
-                       (majutsu-rebase--destination-display)))))
+  [:description "JJ Rebase"
    :class transient-columns
-   ["Selection"
-    ("s" "Set source" majutsu-rebase-set-source
-     :description (lambda ()
-                    (if (> (majutsu-selection-count 'source) 0)
-                        (format "Set source (current: %s)" (majutsu-rebase--source-display))
-                      "Set source"))
-     :transient t)
-    ("S" "Toggle source type" majutsu-rebase-toggle-source-type
-     :description (lambda () (format "Source type (%s)" majutsu-rebase-source-type))
-     :transient t)
-    ("d" "Toggle destination" majutsu-rebase-toggle-destination
-     :description (lambda ()
-                    (format "Toggle destination (%d selected)"
-                            (majutsu-selection-count 'destination)))
-     :transient t)
-    ("D" "Toggle dest type" majutsu-rebase-toggle-dest-type
-     :description (lambda () (format "Dest type (%s)" majutsu-rebase-dest-type))
-     :transient t)
+   ["Source"
+    (majutsu-rebase:--source)
+    (majutsu-rebase:--branch)
+    (majutsu-rebase:--revisions)
+    (majutsu-rebase:source)
+    (majutsu-rebase:branch)
+    (majutsu-rebase:revisions)]
+   ["Destination"
+    (majutsu-rebase:--onto)
+    (majutsu-rebase:--after)
+    (majutsu-rebase:--before)
+    (majutsu-rebase:onto)
+    (majutsu-rebase:after)
+    (majutsu-rebase:before)
     ("c" "Clear selections" majutsu-rebase-clear-selections
      :transient t)]
    ["Options"
-    ("-se" "Skip emptied" "--skip-emptied")
+    ("-ke" "Skip emptied" "--skip-emptied")
     ("-kd" "Keep divergent" "--keep-divergent")
-    (majutsu-transient-arg-ignore-immutable)]
+   (majutsu-transient-arg-ignore-immutable)]
    ["Actions"
-    ("r" "Execute rebase" majutsu-rebase
-     :description (lambda ()
-                    (if (and (> (majutsu-selection-count 'source) 0)
-                             (> (majutsu-selection-count 'destination) 0))
-                        (format "Rebase %s -> %s"
-                                (majutsu-rebase--source-display)
-                                (majutsu-rebase--destination-display))
-                      "Execute rebase (select source & destinations first)")))
-    ("q" "Quit" transient-quit-one)]])
+    ("RET" "Execute rebase" majutsu-rebase-execute)
+    ("q" "Quit" transient-quit-one)]]
+  (interactive)
+  (transient-setup
+   'majutsu-rebase nil nil
+   :scope
+   (majutsu-selection-session-begin)))
 
 ;;; _
 (provide 'majutsu-rebase)

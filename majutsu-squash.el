@@ -1,6 +1,6 @@
 ;;; majutsu-squash.el -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 0WD0
+;; Copyright (C) 2025-2026 0WD0
 
 ;; Author: 0WD0 <wd.1105848296@gmail.com>
 ;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
@@ -15,142 +15,227 @@
 ;;; Code:
 
 (require 'majutsu)
+(require 'majutsu-selection)
+(require 'majutsu-interactive)
+
+(defclass majutsu-squash-option (majutsu-selection-option)
+  ((selection-key :initarg :selection-key :initform nil)))
+
+(defclass majutsu-squash--toggle-option (majutsu-selection-toggle-option)
+  ())
 
 ;;; majutsu-squash
 
-;;;###autoload
+(defun majutsu-squash-arguments ()
+  "Return the current squash arguments.
+If inside the transient, return transient args.
+Otherwise, if no --revision/--from/--into is set and point is on
+a jj-commit section, add --revision from that section."
+  (let ((args (if (eq transient-current-command 'majutsu-squash)
+                  (transient-args 'majutsu-squash)
+                '())))
+    (unless (cl-some (lambda (arg)
+                       (or (string-prefix-p "--revision=" arg)
+                           (string-prefix-p "--from=" arg)
+                           (string-prefix-p "--into=" arg)))
+                     args)
+      (when-let* ((rev (magit-section-value-if 'jj-commit)))
+        (push (concat "--revision=" rev) args)))
+    args))
+
+(defun majutsu-squash--default-args ()
+  "Return default args from diff buffer context."
+  (with-current-buffer (majutsu-interactive--selection-buffer)
+    (when (derived-mode-p 'majutsu-diff-mode)
+      (mapcar (##if (string-prefix-p "--revisions=" %) (concat "--revision=" (substring % 12)))
+              majutsu-buffer-diff-range))))
+
+(defun majutsu-squash-execute (args)
+  "Execute squash with selections recorded in the transient."
+  (interactive (list (majutsu-squash-arguments)))
+  (let* ((selection-buf (majutsu-interactive--selection-buffer))
+         ;; Generate patch for SELECTED content (invert=nil)
+         ;; This is what gets squashed into parent
+         (patch (majutsu-interactive-build-patch-if-selected selection-buf nil nil)))
+    (if patch
+        (progn
+          ;; reverse=t means reset $right to $left, then apply patch forward
+          ;; Result: $right = selected content = what gets squashed
+          (majutsu-interactive-run-with-patch "squash" args patch t)
+          (with-current-buffer selection-buf
+            (majutsu-interactive-clear)))
+      (majutsu-run-jj-with-editor (cons "squash" args)))))
+
+;;;; Infix Commands
+
+(transient-define-argument majutsu-squash:--revision ()
+  :description "Revision"
+  :class 'majutsu-squash-option
+  :selection-key 'revision
+  :selection-label "[REV]"
+  :selection-face '(:background "goldenrod" :foreground "black")
+  :selection-type 'single
+  :key "-r"
+  :argument "--revision="
+  :reader #'majutsu-diff--transient-read-revset)
+
+(transient-define-argument majutsu-squash:--from ()
+  :description "From"
+  :class 'majutsu-squash-option
+  :selection-key 'from
+  :selection-label "[FROM]"
+  :selection-face '(:background "dark orange" :foreground "black")
+  :selection-type 'multi
+  :key "-f"
+  :argument "--from="
+  :multi-value 'repeat
+  :reader #'majutsu-diff--transient-read-revset)
+
+(transient-define-argument majutsu-squash:--into ()
+  :description "Into"
+  :class 'majutsu-squash-option
+  :selection-key 'into
+  :selection-label "[INTO]"
+  :selection-face '(:background "dark cyan" :foreground "white")
+  :selection-type 'single
+  :key "-t"
+  :argument "--into="
+  :reader #'majutsu-diff--transient-read-revset)
+
+(transient-define-argument majutsu-squash:--onto ()
+  :description "Onto"
+  :class 'majutsu-squash-option
+  :selection-key 'onto
+  :selection-label "[ONTO]"
+  :selection-face '(:background "dark cyan" :foreground "white")
+  :selection-type 'multi
+  :key "-o"
+  :argument "--onto="
+  :multi-value 'repeat
+  :reader #'majutsu-diff--transient-read-revset)
+
+(transient-define-argument majutsu-squash:--insert-after ()
+  :description "Insert after"
+  :class 'majutsu-squash-option
+  :selection-key 'after
+  :selection-label "[AFTER]"
+  :selection-face '(:background "dark magenta" :foreground "white")
+  :selection-type 'multi
+  :key "-A"
+  :argument "--insert-after="
+  :multi-value 'repeat
+  :reader #'majutsu-diff--transient-read-revset)
+
+(transient-define-argument majutsu-squash:--insert-before ()
+  :description "Insert before"
+  :class 'majutsu-squash-option
+  :selection-key 'before
+  :selection-label "[BEFORE]"
+  :selection-face '(:background "dark sea green" :foreground "black")
+  :selection-type 'multi
+  :key "-B"
+  :argument "--insert-before="
+  :multi-value 'repeat
+  :reader #'majutsu-diff--transient-read-revset)
+
+(transient-define-argument majutsu-squash:from ()
+  :description "From (toggle at point)"
+  :class 'majutsu-squash--toggle-option
+  :selection-key 'from
+  :selection-type 'multi
+  :key "f"
+  :argument "--from="
+  :multi-value 'repeat)
+
+(transient-define-argument majutsu-squash:into ()
+  :description "Into (toggle at point)"
+  :class 'majutsu-squash--toggle-option
+  :selection-key 'into
+  :selection-type 'single
+  :key "t"
+  :argument "--into=")
+
+(transient-define-argument majutsu-squash:onto ()
+  :description "Onto (toggle at point)"
+  :class 'majutsu-squash--toggle-option
+  :selection-key 'onto
+  :selection-type 'multi
+  :key "o"
+  :argument "--onto="
+  :multi-value 'repeat)
+
+(transient-define-argument majutsu-squash:insert-after ()
+  :description "Insert after (toggle at point)"
+  :class 'majutsu-squash--toggle-option
+  :selection-key 'after
+  :selection-type 'multi
+  :key "a"
+  :argument "--insert-after="
+  :multi-value 'repeat)
+
+(transient-define-argument majutsu-squash:insert-before ()
+  :description "Insert before (toggle at point)"
+  :class 'majutsu-squash--toggle-option
+  :selection-key 'before
+  :selection-type 'multi
+  :key "b"
+  :argument "--insert-before="
+  :multi-value 'repeat)
+
 (defun majutsu-squash-clear-selections ()
   "Clear all squash selections."
   (interactive)
-  (majutsu-selection-clear)
+  (when (consp transient--suffixes)
+    (dolist (obj transient--suffixes)
+      (when (and (cl-typep obj 'majutsu-squash-option)
+                 (memq (oref obj selection-key) '(revision from into onto after before)))
+        (transient-infix-set obj nil))))
+  (when transient--prefix
+    (transient--redisplay))
+  (majutsu-selection-render)
   (message "Cleared all squash selections"))
 
-;;;###autoload
-(defun majutsu-squash-set-from ()
-  "Set the commit at point as squash `from' source."
-  (interactive)
-  (majutsu-selection-toggle 'from))
+;;;; Prefix
 
-;;;###autoload
-(defun majutsu-squash-set-into ()
-  "Set the commit at point as squash `into' destination."
-  (interactive)
-  (majutsu-selection-select 'into))
-
-;;;###autoload
-(defun majutsu-squash-execute (&optional args)
-  "Execute squash with selections recorded in the transient."
-  (interactive (list (transient-args 'majutsu-squash-transient--internal)))
-  (let* ((keep (member "--keep" args))
-         (ignore-immutable (member "--ignore-immutable" args))
-         (from-revsets (or (majutsu-selection-values 'from)
-                           (and-let* ((rev (magit-section-value-if 'jj-commit)))
-                             (list rev))))
-         (into (car (majutsu-selection-values 'into))))
-    (cond
-     ((and from-revsets into)
-      (majutsu--squash-run from-revsets into keep ignore-immutable))
-     (from-revsets
-      (majutsu--squash-run from-revsets nil keep ignore-immutable))
-     ((magit-section-value-if 'jj-commit)
-      (majutsu--squash-run (list (magit-section-value-if 'jj-commit)) nil keep ignore-immutable))
-     (t
-      (majutsu--message-with-log "No commit selected for squash")))))
-
-(defun majutsu--squash-run (from-list into keep ignore-immutable)
-  "Run jj squash using with-editor."
-  (let* ((froms (seq-filter (lambda (rev)
-                              (and rev (not (string-empty-p (string-trim rev)))))
-                            (mapcar (lambda (rev) (and rev (string-trim rev)))
-                                    from-list)))
-         (froms (or froms '("@")))
-         (args (append '("squash")
-                       (apply #'append (mapcar (lambda (rev) (list "--from" rev)) froms))
-                       (when into (list "--into" into))
-                       (when keep '("--keep-emptied"))
-                       (when ignore-immutable '("--ignore-immutable"))))
-         (from-display (string-join froms ", "))
-         (success-msg (if into
-                          (format "Squashed %s into %s" from-display into)
-                        (format "Squashed %s into parent" from-display))))
-    (majutsu--with-editor-run args success-msg "Squash failed"
-                              #'majutsu-selection-session-end)))
-
-;;;###autoload
-(defun majutsu-squash-transient ()
-  "Transient for jj squash operations."
-  (interactive)
-  (majutsu-selection-session-begin
-   '((:key from
-      :label "[FROM]"
-      :face (:background "dark orange" :foreground "white")
-      :type multi)
-     (:key into
-      :label "[INTO]"
-      :face (:background "dark cyan" :foreground "white")
-      :type single)))
-  (add-hook 'transient-exit-hook #'majutsu-selection-session-end nil t)
-  (majutsu-squash-transient--internal))
-
-(defun majutsu-mode-bury-squash ()
-  (interactive)
-  (transient-quit-one))
-
-;;; Squash Transient
-
-(defun majutsu-squash--from-display ()
-  "Return a display string for the squash source."
-  (when-let* ((values (majutsu-selection-values 'from)))
-    (string-join values ", ")))
-
-(defun majutsu-squash--into-display ()
-  "Return a display string for the squash destination."
-  (car (majutsu-selection-values 'into)))
-
-(transient-define-prefix majutsu-squash-transient--internal ()
+(transient-define-prefix majutsu-squash ()
   "Internal transient for jj squash operations."
   :man-page "jj-squash"
-  :transient-suffix 'transient--do-exit
   :transient-non-suffix t
-  [:description
-   (lambda ()
-     (concat "JJ Squash"
-             (when-let* ((from (majutsu-squash--from-display)))
-               (format " | From: %s" from))
-             (when-let* ((into (majutsu-squash--into-display)))
-               (format " | Into: %s" into))))
+  :incompatible '(("--revision=" "--onto=")
+                  ("--revision=" "--insert-after=")
+                  ("--revision=" "--insert-before="))
+  [
+   :description "JJ Squash"
    ["Selection"
-    ("f" "Set from" majutsu-squash-set-from
-     :description (lambda ()
-                    (if (> (majutsu-selection-count 'from) 0)
-                        (format "Set from (current: %s)" (majutsu-squash--from-display))
-                      "Set from"))
-     :transient t)
-    ("t" "Set into" majutsu-squash-set-into
-     :description (lambda ()
-                    (if (> (majutsu-selection-count 'into) 0)
-                        (format "Set into (current: %s)" (majutsu-squash--into-display))
-                      "Set into"))
-     :transient t)
-    ("c" "Clear selections" majutsu-squash-clear-selections
-     :transient t)]
+    (majutsu-squash:--revision)
+    (majutsu-squash:--from)
+    (majutsu-squash:--into)
+    (majutsu-squash:--onto)
+    (majutsu-squash:--insert-after)
+    (majutsu-squash:--insert-before)
+    (majutsu-squash:from)
+    (majutsu-squash:into)
+    (majutsu-squash:onto)
+    (majutsu-squash:insert-after)
+    (majutsu-squash:insert-before)
+    ("c" "Clear selections" majutsu-squash-clear-selections :transient t)]
+   ["Patch Selection" :if majutsu-interactive-selection-available-p
+    (majutsu-interactive:select-hunk)
+    (majutsu-interactive:select-file)
+    (majutsu-interactive:select-region)
+    ("C" "Clear patch selections" majutsu-interactive-clear :transient t)]
    ["Options"
-    ("-k" "Keep emptied commit" "--keep")
+    ("-k" "Keep emptied commit" "-k")
     (majutsu-transient-arg-ignore-immutable)]
    ["Actions"
-    ("s" "Execute squash" majutsu-squash-execute
-     :description (lambda ()
-                    (cond
-                     ((and (> (majutsu-selection-count 'from) 0)
-                           (> (majutsu-selection-count 'into) 0))
-                      (format "Squash %s into %s"
-                              (majutsu-squash--from-display)
-                              (majutsu-squash--into-display)))
-                     ((> (majutsu-selection-count 'from) 0)
-                      (format "Squash %s into parent" (majutsu-squash--from-display)))
-                     (t "Execute squash (select commits first)"))))
-    ("q" "Quit" transient-quit-one)
-    ("b" "Bury" majutsu-mode-bury-squash)]])
+    ("s" "Execute squash" majutsu-squash-execute)
+    ("q" "Quit" transient-quit-one)]]
+  (interactive)
+  (transient-setup
+   'majutsu-squash nil nil
+   :scope
+   (majutsu-selection-session-begin)
+   :value (or (majutsu-squash--default-args) '())))
 
 ;;; _
 (provide 'majutsu-squash)

@@ -1,6 +1,6 @@
 ;;; majutsu-op.el --- JJ Operation view for majutsu  -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 0WD0
+;; Copyright (C) 2025-2026 0WD0
 
 ;; Author: 0WD0 <wd.1105848296@gmail.com>
 ;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
@@ -21,11 +21,10 @@
 (defun majutsu-undo ()
   "Undo the last change."
   (interactive)
-  (if (and majutsu-confirm-critical-actions
-           (not (yes-or-no-p "Undo the most recent change? ")))
+  (if (not (majutsu-confirm 'undo "Undo the most recent change? "))
       (message "Undo canceled")
     (let ((revset (magit-section-value-if 'jj-commit)))
-      (when (zerop (majutsu-call-jj "undo"))
+      (when (zerop (majutsu-run-jj "undo"))
         (when revset
           (majutsu-goto-commit revset))))))
 
@@ -35,11 +34,10 @@
 (defun majutsu-redo ()
   "Redo the last undone change."
   (interactive)
-  (if (and majutsu-confirm-critical-actions
-           (not (yes-or-no-p "Redo the previously undone change? ")))
+  (if (not (majutsu-confirm 'redo "Redo the previously undone change? "))
       (message "Redo canceled")
     (let ((revset (magit-section-value-if 'jj-commit)))
-      (when (zerop (majutsu-call-jj "redo"))
+      (when (zerop (majutsu-run-jj "redo"))
         (when revset
           (majutsu-goto-commit revset))))))
 
@@ -52,7 +50,7 @@
    (description :initarg :description)))
 
 (defconst majutsu--op-log-template
-  (tpl-compile
+  (majutsu-tpl
    [:separate "\x1e"
               [:call 'id.short]
               [:user]
@@ -70,7 +68,7 @@
       majutsu-op-log--cached-entries
     (with-current-buffer (or buf (current-buffer))
       (let* ((args (list "op" "log" "--no-graph" "-T" majutsu--op-log-template))
-             (output (or log-output (apply #'majutsu-run-jj args))))
+             (output (or log-output (apply #'majutsu-jj-string args))))
         (when (and output (not (string-empty-p output)))
           (let ((lines (split-string output "\n" t))
                 (entries '()))
@@ -97,38 +95,15 @@
 
 (defun majutsu-op-log-render ()
   "Render the op log buffer."
-  (let ((inhibit-read-only t))
-    (erase-buffer)
-    (magit-insert-section (oplog)
-      (majutsu-op-log-insert-entries))))
+  (magit-insert-section (oplog)
+    (majutsu-op-log-insert-entries)))
 
-(defun majutsu-op-log-refresh ()
+(defun majutsu-op-log-refresh-buffer ()
   "Refresh the op log buffer."
   (interactive)
   (majutsu--assert-mode 'majutsu-op-log-mode)
-  (let ((root (majutsu--root))
-        (buf (current-buffer)))
-    (setq-local majutsu--repo-root root)
-    (setq default-directory root)
-    (setq majutsu-op-log--cached-entries nil)
-    (let ((inhibit-read-only t))
-      (erase-buffer)
-      (insert "Loading..."))
-    (majutsu-run-jj-async
-     (list "op" "log" "--no-graph" "-T" majutsu--op-log-template)
-     (lambda (output)
-       (when (buffer-live-p buf)
-         (with-current-buffer buf
-           (when (derived-mode-p 'majutsu-op-log-mode)
-             (setq majutsu-op-log--cached-entries (majutsu-parse-op-log-entries nil output))
-             (majutsu-op-log-render)))))
-     (lambda (err)
-       (when (buffer-live-p buf)
-         (with-current-buffer buf
-           (when (derived-mode-p 'majutsu-op-log-mode)
-             (let ((inhibit-read-only t))
-               (erase-buffer)
-               (insert "Error: " err)))))))))
+  (setq majutsu-op-log--cached-entries nil)
+  (majutsu-op-log-render))
 
 (defvar-keymap majutsu-op-log-mode-map
   :doc "Keymap for `majutsu-op-log-mode'."
@@ -143,14 +118,11 @@
 (defun majutsu-op-log ()
   "Open the majutsu operation log."
   (interactive)
-  (let* ((root (majutsu--root))
-         (buffer (get-buffer-create (format "*majutsu-op: %s*" (file-name-nondirectory (directory-file-name root))))))
-    (with-current-buffer buffer
-      (majutsu-op-log-mode)
-      (setq-local majutsu--repo-root root)
-      (setq default-directory root)
-      (majutsu-op-log-refresh))
-    (majutsu-display-buffer buffer 'op-log)))
+  (let* ((root (majutsu--toplevel-safe))
+         (repo (file-name-nondirectory (directory-file-name root))))
+    (majutsu-setup-buffer #'majutsu-op-log-mode nil
+      :buffer (format "*majutsu-op: %s*" repo)
+      :directory root)))
 
 ;;; _
 (provide 'majutsu-op)

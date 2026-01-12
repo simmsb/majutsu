@@ -1,6 +1,6 @@
 ;;; majutsu-evil.el --- Evil bindings for Majutsu -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025 0WD0
+;; Copyright (C) 2025-2026 0WD0
 
 ;; Author: 0WD0 <wd.1105848296@gmail.com>
 ;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
@@ -15,6 +15,9 @@
 ;;; Code:
 
 (require 'majutsu)
+
+(declare-function turn-off-evil-snipe-mode "evil-snipe" ())
+(declare-function turn-off-evil-snipe-override-mode "evil-snipe" ())
 
 (eval-when-compile
   ;; Silence byte-compile when Evil isn't installed at build time.
@@ -50,8 +53,7 @@ When nil, Majutsu leaves Evil's state untouched."
 STATES can be a symbol or list.  KEYMAP can be a symbol or list of
 symbols/maps.  Mirrors `evil-collection-define-key' to defer any
 macro expansion until Evil is actually present."
-  (declare (indent 2)
-           (states keymap &rest bindings))
+  (declare (indent 2))
   (when (and (featurep 'evil) (fboundp 'evil-define-key*))
     (let* ((states (if (listp states) states (list states)))
            (maps (if (listp keymap) keymap (list keymap))))
@@ -79,37 +81,39 @@ macro expansion until Evil is actually present."
   "Install Evil keybindings for Majutsu maps."
   ;; Normal/visual/motion share the same bindings for navigation commands.
   (majutsu-evil--define-keys '(normal visual motion) 'majutsu-mode-map
-    (kbd "R") #'majutsu-refresh
+    (kbd "R") #'majutsu-restore
     (kbd "g r") #'majutsu-refresh
     (kbd "`") #'majutsu-process-buffer
     (kbd "c") #'majutsu-describe
     (kbd "C") #'majutsu-commit
-    (kbd "o") #'majutsu-new-transient
+    (kbd "o") #'majutsu-new
     (kbd "e") #'majutsu-edit-changeset
     (kbd "u") #'majutsu-undo
     (kbd "C-r") #'majutsu-redo
     (kbd "x") #'majutsu-abandon
-    (kbd "s") #'majutsu-squash-transient
+    (kbd "s") #'majutsu-squash
+    (kbd "S") #'majutsu-split
     (kbd "L") #'majutsu-log-transient
-    (kbd "b") #'majutsu-bookmark-transient
-    (kbd "r") #'majutsu-rebase-transient
-    (kbd "d") #'majutsu-diff-transient
-    (kbd "D") #'majutsu-diff
+    (kbd "b") #'majutsu-bookmark
+    (kbd "r") #'majutsu-rebase
+    (kbd "d") #'majutsu-diff
+    (kbd "D") #'majutsu-diff-dwim
+    (kbd "*") #'majutsu-workspace
     (kbd "E") #'majutsu-diffedit-emacs
     (kbd "M") #'majutsu-diffedit-smerge
     (kbd "?") #'majutsu-dispatch
     (kbd "RET") #'majutsu-visit-thing)
 
   (majutsu-evil--define-keys 'normal 'majutsu-mode-map
-    (kbd "y") #'majutsu-duplicate-transient
-    (kbd "Y") #'majutsu-duplicate)
+    (kbd "y") #'majutsu-duplicate
+    (kbd "Y") #'majutsu-duplicate-dwim)
 
   (majutsu-evil--define-keys '(normal visual) 'majutsu-diff-mode-map
     (kbd "g d") #'majutsu-jump-to-diffstat-or-diff)
 
   (majutsu-evil--define-keys '(normal visual motion) 'majutsu-log-mode-map
     (kbd ".") #'majutsu-log-goto-@
-    (kbd "O") #'majutsu-new
+    (kbd "O") #'majutsu-new-dwim
     (kbd "I") #'majutsu-new-with-before
     (kbd "A") #'majutsu-new-with-after))
 
