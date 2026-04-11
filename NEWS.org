@@ -8,11 +8,100 @@
 - Add ~majutsu-revert~ transient for =jj revert= with source revision selection
   and destination placement options (=--onto= / =--insert-after= /
   =--insert-before=).
+- Add ~majutsu-metaedit~ transient for =jj metaedit= with a single-revision
+  default from point and metadata flags (message/author/timestamp/update).
+- Add ~majutsu-simplify-parents~ transient for =jj simplify-parents= with
+  both =--source= and =--revisions= options.
+- Add ~majutsu-find-file-other-window~ and ~majutsu-find-file-other-frame~
+  to open blob snapshots in another window or frame.
+- Add visible DAG relation navigation in log buffers: ~[~ jumps to a parent
+  revision and ~]~ jumps to a child revision, prompting when multiple
+  visible targets exist.
+- Add explicit semantic copy commands for log buffers:
+  ~majutsu-copy-section-value~, ~majutsu-log-copy-field~,
+  ~majutsu-log-copy-entry-field~, ~majutsu-log-copy-commit-id~, and
+  ~majutsu-log-copy-module~. They are exposed through the dispatcher in
+  log buffers (and remain callable via ~M-x~), without claiming a dedicated
+  direct key binding yet.
+- Add ~majutsu-section.el~ as a thin Majutsu-local visibility layer over
+  Magit's section commands, so log commit fold/unfold preserves display-only
+  graph prefixes more reliably, including Evil / evil-collection fold paths
+  that dispatch through standard Magit section commands.
 
 ** Changed
 
+- Rework the template DSL around explicit and bindable receivers.
+  ~majutsu-template-defun~ can now temporarily rebind implicit ~self~ with
+  ~:bind-self~, explicit ~[:self]~ / ~[:self N]~ forms can refer to the
+  current or outer receiver, and top-level implicit ~self~ bindings are now
+  installed only at public compile entry points. The extension API was also
+  simplified: body-less ~majutsu-template-defun~ forms now default to direct
+  wrappers for same-name jj callables, while body-less owner-bound
+  ~majutsu-template-defmethod~ / ~majutsu-template-defkeyword~ declarations
+  remain metadata-only and bodyful ones lower through their local DSL body.
+  Local log helpers such as ~canonical-log-id~, ~short-change-id~, and
+  ~short-change-id-with-offset~ now use that owner-bound lowering model.
+- Add first-class anonymous functions via ~[:lambda [arg] body]~ and concise
+  ~[:|arg| body]~ sugar, compile-time lambda application via ~[:call ...]~ /
+  ~[[:lambda ...] arg]~, and a dedicated ~majutsu-template-defspecial~ layer
+  for syntax-level lowering. Historical higher-order surface forms such as
+  ~:map~, ~:filter~, ~:any~, ~:all~, ~:map-join~, and the anaphoric ~:--map~ family now
+  lower through the same core lambda/method forms instead of relying on
+  separate helper implementations.
+- Start a semantic typing pass in the DSL. Helper arguments now receive basic
+  type validation, method chains propagate result types, list operations keep
+  track of their element types, and deferred lambda specialization remains
+  available without restoring general unknown-self fallback. Untyped ~:raw~
+  snippets now default to =Unknown=, broad expression placeholders use =Any=,
+  printable content uses =Template=, and mapped list results are represented
+  as ordinary refs like ~(:list String)~ instead of pseudo-types such as
+  ~ListTemplate~.
+- Align more builtin metadata and conversions with upstream =jj=. Option/list
+  receivers keep chaining through their contained types, ~RefSymbol~ behaves
+  like a string for both method dispatch and helper argument checks, literal-
+  only parameters such as ~contained_in()~ now receive a first literal-aware
+  validation pass, and ~if()~ now follows upstream's conditional-~Any~ model
+  with consumption-site validation instead of eager joined result typing.
+- Tighten builtin helper and operator typing to better match upstream.
+  Helpers such as ~fill()~, ~hash()~, ~stringify()~, ~config()~,
+  ~git_web_url()~, ~label()~, ~str()~, ~raw()~, ~call()~, and ~method()~ now
+  carry more precise argument/return metadata, and operator checks no longer
+  pretend that arbitrary template values are valid integer or boolean inputs.
+- Remove ~majutsu-find-file-at-point~. Use ~majutsu-find-file~ instead; it
+  still defaults revset/path from the current context.
+- Remove the dedicated ~v~ binding from diff file sections, following Magit's
+  split between explicit ~majutsu-find-file~ commands and diff-specific visit
+  commands.
+- Remove ~majutsu-log-field-faces~. Configure log field face policy directly
+  in ~majutsu-log-commit-columns~ using each field's ~:face~ property.
+- Add a ~tail~ log module for right-aligned auxiliary fields on the anchor
+  line. The sequential log protocol now uses ~S/T/B/M/E~, so author/timestamp
+  and similar fields can live in a dedicated tail segment instead of being
+  folded into the left heading text. Tail text remains searchable as real
+  buffer text, but copying a mixed heading+tail region strips the tail by
+  default while copying the tail itself preserves it. Graph prefixes and
+  graph-related body indentation are now rendered as display-only
+  ~line-prefix~/~wrap-prefix~ decoration, so they no longer interfere with
+  ordinary copying or cursor movement. Rendered log spans now carry
+  field/column/entry/decoration properties so explicit copy commands can
+  target section values, individual fields, whole visible modules, or hidden
+  entry metadata. Hidden transport fields now always include ~commit-id~, so
+  copying the current commit hash does not depend on whether that field is
+  shown in the visible layout.
+- Refine log column ~:post~ handling: transport decoding now happens before
+  postprocessors, explicit ~:post~ functions run per column instance, and
+  repeated fields can project to different values in different modules.
+- Rework workspace list rendering around a single structured
+  =jj workspace list -T= template/parse pipeline. Workspace sections now show
+  resolved workspace roots when available, treat unavailable roots as empty
+  data instead of propagating raw jj error strings, and reuse parsed section
+  roots before falling back to =jj workspace root --name=.
+
 ** Fixed
 
+- Add a consistent ~RET~ execute binding to ~majutsu-squash~ and
+  ~majutsu-split~ transients (while keeping ~s~), so selection-driven command
+  transients share the same confirm/execute key.
 - Prevent =majutsu-ediff-resolve= from auto-resolving conflicts on no-op quit,
   and preserve partial conflict resolution by using git-style conflict markers
   that jj can parse as still-unresolved regions. Edited merge sessions now ask
