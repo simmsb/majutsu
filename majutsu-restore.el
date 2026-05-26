@@ -17,15 +17,12 @@
 ;;; Code:
 
 (require 'majutsu)
-(require 'majutsu-file)
-(require 'majutsu-selection)
-(require 'majutsu-interactive)
 
 (defclass majutsu-restore-option (majutsu-selection-option)
   ())
 
 (defclass majutsu-restore--toggle-option (majutsu-selection-toggle-option)
-  ())
+  ((if-not :initform #'majutsu-interactive-selection-available-p)))
 
 ;;; Abandon
 

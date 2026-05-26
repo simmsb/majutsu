@@ -22,7 +22,7 @@
   ())
 
 (defclass majutsu-squash--toggle-option (majutsu-selection-toggle-option)
-  ())
+  ((if-not :initform #'majutsu-interactive-selection-available-p)))
 
 ;;; majutsu-squash
 
@@ -186,7 +186,7 @@ a jj-commit section, add --revision from that section."
                   ("--revision=" "--insert-after=")
                   ("--revision=" "--insert-before=")
                   ("--revision=" "--from=")
-                  ("--revision=" "--to="))
+                  ("--revision=" "--into="))
   [
    :description "JJ Squash"
    ["Selection"

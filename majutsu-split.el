@@ -17,15 +17,12 @@
 ;;; Code:
 
 (require 'majutsu)
-(require 'majutsu-file)
-(require 'majutsu-selection)
-(require 'majutsu-interactive)
 
 (defclass majutsu-split-option (majutsu-selection-option)
   ())
 
 (defclass majutsu-split--toggle-option (majutsu-selection-toggle-option)
-  ())
+  ((if-not :initform #'majutsu-interactive-selection-available-p)))
 
 (defun majutsu-split--default-args ()
   "Return default args from diff buffer context."

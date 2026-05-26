@@ -17,15 +17,12 @@
 ;;; Code:
 
 (require 'majutsu)
-(require 'majutsu-file)
-(require 'majutsu-selection)
-(require 'majutsu-interactive)
 
 (defclass majutsu-absorb-option (majutsu-selection-option)
   ())
 
 (defclass majutsu-absorb--toggle-option (majutsu-selection-toggle-option)
-  ())
+  ((if-not :initform #'majutsu-interactive-selection-available-p)))
 
 (defun majutsu-absorb--default-args ()
   "Return default args from diff buffer context."
