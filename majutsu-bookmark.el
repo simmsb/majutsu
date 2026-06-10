@@ -241,7 +241,7 @@ When ALL-REMOTES is non-nil, include remote bookmarks formatted as NAME@REMOTE."
                        (and all-remotes '("--all"))
                        (list "-T" template)))
          (res (apply #'majutsu-jj-string args)))
-    (when res (delete-dups (split-string  "\n" t)))))
+    (when res (delete-dups (split-string res "\n" t)))))
 
 ;;;###autoload
 (defun majutsu-read-bookmarks (prompt &optional _init-input _history)
