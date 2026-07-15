@@ -21,22 +21,16 @@
 (defclass majutsu-absorb-option (majutsu-selection-option)
   ())
 
-(defclass majutsu-absorb--toggle-option (majutsu-selection-toggle-option)
-  ((if-not :initform #'majutsu-interactive-selection-available-p)))
-
 (defun majutsu-absorb--default-args ()
   "Return default args from diff buffer context."
-  (with-current-buffer (majutsu-interactive--selection-buffer)
-    (when (derived-mode-p 'majutsu-diff-mode)
-      (when-let* ((source
-                   (seq-some (lambda (arg)
-                               (cond
-                                ((string-prefix-p "--revisions=" arg)
-                                 (concat "--from=" (substring arg 12)))
-                                ((string-prefix-p "--from=" arg)
-                                 arg)))
-                             majutsu-buffer-diff-range)))
-        (list source)))))
+  (when (derived-mode-p 'majutsu-diff-mode)
+    (when-let* ((source (or (when-let* ((rev (transient-arg-value
+                                              "--revisions=" majutsu-buffer-diff-range)))
+                              (concat "--from=" rev))
+                            (when-let* ((from (transient-arg-value
+                                               "--from=" majutsu-buffer-diff-range)))
+                              (concat "--from=" from)))))
+      (list source))))
 
 (defun majutsu-absorb-arguments ()
   "Return the current absorb arguments.
@@ -46,19 +40,22 @@ jj-commit section, add --from from that section."
   (let ((args (if (eq transient-current-command 'majutsu-absorb)
                   (transient-args 'majutsu-absorb)
                 '())))
-    (unless (cl-some (lambda (arg)
-                       (or (string-prefix-p "--from=" arg)
-                           (string-prefix-p "--into=" arg)))
-                     args)
+    (unless (or (transient-arg-value "--from=" args)
+                (transient-arg-value "--into=" args))
       (when-let* ((rev (magit-section-value-if 'jj-commit)))
         (push (concat "--from=" rev) args)))
     args))
 
-;;;###autoload
-(defun majutsu-absorb-execute (args)
+;;;###autoload(autoload 'majutsu-absorb-execute "majutsu-absorb" nil t)
+(transient-define-suffix majutsu-absorb-execute (args)
   "Execute jj absorb with ARGS from the transient."
+  :description "Absorb"
+  :class 'majutsu-transient-default-action-suffix
   (interactive (list (majutsu-absorb-arguments)))
-  (let ((exit (apply #'majutsu-run-jj "absorb" args)))
+  (pcase-let* ((`(,args ,filesets) (majutsu-filesets-split-transient-value args))
+               (exit (apply #'majutsu-run-jj
+                            "absorb"
+                            (majutsu-jj-append-filesets args filesets))))
     (when (zerop exit)
       (message "Absorb completed"))))
 
@@ -69,32 +66,23 @@ jj-commit section, add --from from that section."
   :class 'majutsu-absorb-option
   :selection-label "[FROM]"
   :selection-face '(:background "dark orange" :foreground "black")
-  :key "-f"
+  :selection-toggle-key "f"
+  :selection-toggle-if-not #'majutsu-interactive-selection-available-p
+  :shortarg "-f"
   :argument "--from="
-  :reader #'majutsu-diff--transient-read-revset)
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-absorb:--into ()
   :description "Into"
   :class 'majutsu-absorb-option
   :selection-label "[INTO]"
   :selection-face '(:background "dark cyan" :foreground "white")
-  :key "-t"
+  :selection-toggle-key "t"
+  :selection-toggle-if-not #'majutsu-interactive-selection-available-p
+  :shortarg "-t"
   :argument "--into="
   :multi-value 'repeat
-  :reader #'majutsu-diff--transient-read-revset)
-
-(transient-define-argument majutsu-absorb:from ()
-  :description "From (toggle at point)"
-  :class 'majutsu-absorb--toggle-option
-  :key "f"
-  :argument "--from=")
-
-(transient-define-argument majutsu-absorb:into ()
-  :description "Into (toggle at point)"
-  :class 'majutsu-absorb--toggle-option
-  :key "t"
-  :argument "--into="
-  :multi-value 'repeat)
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-absorb:-- ()
   :description "Limit to files"
@@ -111,23 +99,20 @@ jj-commit section, add --from from that section."
 (transient-define-prefix majutsu-absorb ()
   "Transient for jj absorb operations."
   :man-page "jj-absorb"
+  :description "JJ Absorb"
+  :class 'majutsu-jj-transient-prefix
+  :jj-command "absorb"
   :transient-non-suffix t
-  [
-   :description "JJ Absorb"
-   ["Selection"
+  [["Selection"
     (majutsu-absorb:--from)
     (majutsu-absorb:--into)
-    (majutsu-absorb:from)
-    (majutsu-absorb:into)
     ("c" "Clear selections" majutsu-selection-clear :transient t)]
    ["Paths"
     (majutsu-absorb:--)]
    ["Options"
     (majutsu-transient-arg-ignore-immutable)]
    ["Actions"
-    ("a" "Absorb" majutsu-absorb-execute)
-    ("RET" "Absorb" majutsu-absorb-execute)
-    ("q" "Quit" transient-quit-one)]]
+    ("a" "Absorb" majutsu-absorb-execute)]]
   (interactive)
   (let* ((file (majutsu-file-at-point))
          (files (cond
@@ -136,9 +121,7 @@ jj-commit section, add --from from that section."
                        majutsu-buffer-diff-filesets)
                   majutsu-buffer-diff-filesets)))
          (default-args (majutsu-absorb--default-args))
-         (value (if files
-                    (append default-args (list (cons "--" files)))
-                  default-args)))
+         (value (majutsu-filesets-build-transient-value default-args files)))
     (transient-setup
      'majutsu-absorb nil nil
      :scope (majutsu-selection-session-begin)

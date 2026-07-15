@@ -321,17 +321,147 @@ Results are cached in `majutsu-file--list-cache`."
   "Return list of file paths for REVSET (default \"@\")."
   (majutsu-file--list (or revset "@") (majutsu-file--root)))
 
+(defconst majutsu-file--completion-field-separator (string 31)
+  "Separator inserted between file completion fields.")
+
+(defconst majutsu-file--completion-template
+  (let ((sep (format "\"%s\"" majutsu-file--completion-field-separator)))
+    (concat
+     (string-join
+      (list "path"
+            sep "file_type"
+            sep "if(executable, \"t\", \"\")"
+            sep "if(conflict, \"t\", \"\")")
+      " ++ ")
+     " ++ \"\\n\""))
+  "Template used to collect file completion metadata.")
+
+(defun majutsu-file--split-completion-fields (value)
+  "Split file completion VALUE by `majutsu-file--completion-field-separator'."
+  (majutsu--split-fields value majutsu-file--completion-field-separator))
+
+(defun majutsu-file--parse-completion-line (line)
+  "Parse one file completion LINE into a plist."
+  (let* ((fields (majutsu-file--split-completion-fields (or line "")))
+         (path (nth 0 fields)))
+    (when (and (stringp path) (not (string-empty-p path)))
+      (list :path path
+            :file-type (nth 1 fields)
+            :executable (majutsu--field-bool-p (nth 2 fields))
+            :conflict (majutsu--field-bool-p (nth 3 fields))))))
+
+(defun majutsu-file--completion-entries (revset root)
+  "Return structured file completion entries for REVSET in ROOT."
+  (let ((default-directory root)
+        (normalized (majutsu-file--normalize-revset revset))
+        entries)
+    (dolist (line (majutsu-jj-lines "file" "list" "-r" normalized
+                                    "-T" majutsu-file--completion-template))
+      (when-let* ((entry (majutsu-file--parse-completion-line line)))
+        (push entry entries)))
+    (nreverse entries)))
+
+(defun majutsu-file--summary-status-label (code)
+  "Return a human-readable status label for jj diff summary CODE."
+  (pcase code
+    ("M" "modified")
+    ("A" "added")
+    ("D" "deleted")
+    ("R" "renamed")
+    ("C" "copied")
+    (_ code)))
+
+(defun majutsu-file--parse-summary-line (line)
+  "Parse one `jj diff --summary` LINE into a plist."
+  (when (string-match "\\`\\([A-Z]\\) \\(.*\\)\\'" (or line ""))
+    (let ((code (match-string 1 line))
+          (path (match-string 2 line)))
+      (list :path path
+            :status (majutsu-file--summary-status-label code)
+            :status-code code))))
+
+(defun majutsu-file--summary-entry-map (revset root)
+  "Return a hash table of changed file entries for REVSET in ROOT."
+  (let ((default-directory root)
+        (normalized (majutsu-file--normalize-revset revset))
+        (entries (make-hash-table :test #'equal)))
+    (condition-case nil
+        (dolist (line (majutsu-jj-lines "diff" "--summary" "-r" normalized))
+          (when-let* ((entry (majutsu-file--parse-summary-line line))
+                      (path (plist-get entry :path)))
+            (puthash path entry entries)))
+      (error nil))
+    entries))
+
+(defun majutsu-file--completion-status-face (status)
+  "Return a face for file STATUS."
+  (pcase status
+    ((or "added" "copied") 'success)
+    ("deleted" 'error)
+    ("renamed" 'warning)
+    ("modified" 'majutsu-completion-key)
+    (_ 'majutsu-completion-documentation)))
+
+(defun majutsu-file--completion-suffix (entry)
+  "Return aligned completion suffix for file ENTRY."
+  (let ((status (plist-get entry :status))
+        (file-type (or (plist-get entry :file-type) "file")))
+    (majutsu-completion-annotation
+     (majutsu-completion-column
+      (if (plist-get entry :conflict) "conflict" file-type)
+      10 (if (plist-get entry :conflict) 'warning 'majutsu-completion-key))
+     (majutsu-completion-column
+      status 10 (majutsu-file--completion-status-face status))
+     (majutsu-completion-column
+      (and (plist-get entry :executable) "executable")
+      10 'majutsu-completion-type))))
+
+(defun majutsu-file--completion-suffix-function (entries)
+  "Return candidate suffix function backed by file ENTRIES."
+  (majutsu-completion-entry-suffix-function
+   entries
+   #'majutsu-file--completion-suffix))
+
+(defun majutsu-file-candidate-data (&optional revset root candidates)
+  "Return completion payload for file CANDIDATES in REVSET at ROOT."
+  (let* ((revset (or revset "@"))
+         (root (or root (majutsu-file--root)))
+         (candidates (or candidates (majutsu-file--list revset root)))
+         (statuses (majutsu-file--summary-entry-map revset root))
+         (entries (make-hash-table :test #'equal)))
+    (condition-case nil
+        (dolist (entry (majutsu-file--completion-entries revset root))
+          (when-let* ((path (plist-get entry :path)))
+            (when-let* ((status (gethash path statuses)))
+              (setq entry (append status entry)))
+            (puthash path entry entries)))
+      (error nil))
+    (dolist (path candidates)
+      (when (and (not (gethash path entries))
+                 (gethash path statuses))
+        (puthash path (gethash path statuses) entries)))
+    (list :category 'majutsu-file
+          :candidates candidates
+          :entries entries
+          :annotation-suffix-function
+          (majutsu-file--completion-suffix-function entries))))
+
+(defvar majutsu-file-path-history nil
+  "Minibuffer history for repo-relative file path prompts.")
+
 (defun majutsu-read-files (prompt initial-input history &optional list-fn)
   "Read multiple files with completion.
 PROMPT, INITIAL-INPUT, HISTORY are standard reader args.
 LIST-FN defaults to `majutsu-file-list'."
-  (let ((root (majutsu-file--root)))
-    (majutsu-completing-read-multiple
-     prompt
-     (funcall (or list-fn #'majutsu-file-list))
+  (let* ((root (majutsu-file--root))
+         (candidates (funcall (or list-fn #'majutsu-file-list)))
+         (payload (majutsu-file-candidate-data "@" root candidates)))
+    (majutsu-completing-read-multiple-payload
+     prompt payload
      nil nil
      (or initial-input (majutsu-file--path-at-point root))
-     history)))
+     (or history 'majutsu-file-path-history)
+     nil nil nil root)))
 
 (defun majutsu-file--buffer-name (revset path)
   "Return a blob buffer name for REVSET and PATH."
@@ -356,10 +486,13 @@ LIST-FN defaults to `majutsu-file-list'."
   "Prompt for a file path from REVSET.
 DEFAULT is the initial file choice when present in REVSET file list."
   (let* ((paths (majutsu-file--list revset root))
+         (payload (majutsu-file-candidate-data revset root paths))
          (default (or default (majutsu-file--path-at-point root))))
     (when (and default (not (member default paths)))
       (setq default nil))
-    (completing-read "Find file: " paths nil t nil nil default)))
+    (majutsu-completing-read-payload "Find file" payload nil t nil
+                                     'majutsu-file-path-history
+                                     default nil nil root)))
 
 (defun majutsu-file--diff-range-value (range prefix)
   "Return the value in RANGE for argument starting with PREFIX."

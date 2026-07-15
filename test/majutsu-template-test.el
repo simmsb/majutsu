@@ -224,6 +224,36 @@
             [:raw "outer" :Commit]])
           "if(outer.root(), inner.description(), outer.description())"))
 
+(ert-deftest test-majutsu-template-curried-lambda-captures-outer-binding ()
+  (mt--is (majutsu-tpl
+           [[[:|marker|
+              [:|commit|
+               [:concat marker " " commit]]]
+             "-"]
+            "C"])
+          "concat(\"-\", \" \", \"C\")")
+  (mt--is (majutsu-tpl
+           [:method [:raw "xs"]
+            :map [:|c|
+                  [[[:|marker|
+                     [:|commit|
+                      [:concat marker " " commit]]]
+                    "-"]
+                   c]]
+            :join ""])
+          "xs.map(|c| concat(\"-\", \" \", c)).join(\"\")"))
+
+(ert-deftest test-majutsu-template-curried-lambda-captures-outer-self ()
+  (mt--is (majutsu-tpl
+           [[[:|outer|
+              [:|inner|
+               [:concat [:method [:self 1] :description]
+                        " -> "
+                        [:method [:self] :description]]]]
+             [:raw "lhs" :Commit]]
+            [:raw "rhs" :Commit]])
+          "concat(lhs.description(), \" -> \", rhs.description())"))
+
 (ert-deftest test-majutsu-template-defspecial-basic ()
   (mt--is (majutsu-tpl [:test-special-wrap [:str "x"]])
           "concat(\"<\", \"x\", \">\")"))
@@ -295,6 +325,12 @@
                         [:json [:raw "self.commit_id()"]]
                         [:str "}"]])
           "concat(\"{\", \"\\\"root\\\":\", if(self.root(), true, false), \",\\\"commit_id\\\":\", json(self.commit_id()), \"}\")"))
+
+(ert-deftest test-majutsu-template-json-requires-serializable-value ()
+  "The local type checker should match jj's `json' argument contract."
+  (should-error (majutsu-template-compile '[:json [:if t "x"]]))
+  (mt--is (majutsu-template-compile '[:json [:if t "x" ""]])
+          "json(if(true, \"x\", \"\"))"))
 
 (ert-deftest test-majutsu-template-string-escape ()
   ;; Quote and backslash
@@ -609,7 +645,7 @@
   (let ((node (majutsu-template--rewrite '[:method [:raw "ts" :Timestamp] :since [:raw "start" :Timestamp] :duration])))
     (should (eq (majutsu-template-node-type node) 'String)))
   (let ((node (majutsu-template--rewrite '[:method [:raw "ws" :WorkspaceRef] :root])))
-    (should (eq (majutsu-template-node-type node) 'Template)))
+    (should (eq (majutsu-template-node-type node) 'String)))
   (let ((node (majutsu-template--rewrite '[:-map [:|c| [:description]]
                                            [:method [:raw "self" :Commit] :parents]])))
     (should (equal (majutsu-template-node-type node) '(:list String)))
@@ -736,9 +772,24 @@
   (let ((meta (majutsu-template--lookup-method 'Operation "workspace_name")))
     (should meta)
     (should (eq (majutsu-template--fn-returns meta) 'String)))
+  (let ((meta (majutsu-template--lookup-method 'Operation "attributes")))
+    (should meta)
+    (should (eq (majutsu-template--fn-returns meta) 'String)))
+  (let ((meta (majutsu-template--lookup-method 'CommitEvolutionEntry "operation")))
+    (should meta)
+    (should (equal (majutsu-template--fn-returns meta) '(:option Operation))))
   (let ((meta (majutsu-template--lookup-method 'Commit "git_head")))
     (should meta)
     (should (eq (majutsu-template--fn-returns meta) 'Boolean)))
+  (let ((meta (majutsu-template--lookup-method 'Commit "format_commit_summary_with_refs")))
+    (should meta)
+    (should (eq (majutsu-template--fn-returns meta) 'Template)))
+  (let ((meta (majutsu-template--lookup-method 'ChangeId "format_short_change_id")))
+    (should meta)
+    (should (eq (majutsu-template--fn-returns meta) 'Template)))
+  (let ((meta (majutsu-template--lookup-method 'CommitId "format_short_commit_id")))
+    (should meta)
+    (should (eq (majutsu-template--fn-returns meta) 'Template)))
   (let ((meta (majutsu-template--lookup-method 'RefSymbol "len")))
     (should meta)
     (should (eq (majutsu-template--fn-owner meta) 'RefSymbol))
@@ -748,7 +799,19 @@
     (should (eq (majutsu-template--fn-returns meta) 'TimestampRange)))
   (let ((meta (majutsu-template--lookup-method 'WorkspaceRef "root")))
     (should meta)
-    (should (eq (majutsu-template--fn-returns meta) 'Template))))
+    (should (eq (majutsu-template--fn-returns meta) 'String)))
+  (let ((meta (majutsu-template--lookup-function-meta 'json)))
+    (should meta)
+    (should (eq (majutsu-template--arg-type
+                 (car (majutsu-template--fn-args meta)))
+                'Serialize))))
+
+(ert-deftest test-majutsu-template-evolog-operation-option-compiles ()
+  "CommitEvolutionEntry.operation should be usable as an optional value."
+  (mt--is (majutsu-template-compile
+           '[:if [:operation] [:operation :id :short] ""]
+           'CommitEvolutionEntry)
+          "if(self.operation(), self.operation().id().short(), \"\")"))
 
 (ert-deftest test-majutsu-template-method-dispatch-kinds ()
   (should (eq (majutsu-template--type-ref-dispatch-kind 'Commit) 'Commit))

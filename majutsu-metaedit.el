@@ -36,7 +36,8 @@
   (unless current-prefix-arg
     (majutsu-read-revset prompt
                          (or initial-input
-                             (majutsu-metaedit--default-revision)))))
+                             (majutsu-metaedit--default-revision))
+                         (majutsu-transient-revset-completion-args))))
 
 (defun majutsu-metaedit-arguments ()
   "Return the current metaedit arguments.
@@ -47,7 +48,7 @@ revision argument is present. Outside the transient, return defaults."
                    (transient-args 'majutsu-metaedit-transient)
                  '()))
          (rev-args (seq-filter (lambda (arg)
-                                 (string-prefix-p "-r=" arg))
+                                 (transient-arg-value "-r=" (list arg)))
                                args)))
     (cond
      ((null rev-args)
@@ -56,9 +57,11 @@ revision argument is present. Outside the transient, return defaults."
       (user-error "Metaedit only supports a single revision"))
      (t args))))
 
-;;;###autoload
-(defun majutsu-metaedit-execute (args)
+;;;###autoload(autoload 'majutsu-metaedit-execute "majutsu-metaedit" nil t)
+(transient-define-suffix majutsu-metaedit-execute (args)
   "Execute jj metaedit with ARGS from the transient."
+  :description "Metaedit"
+  :class 'majutsu-transient-default-action-suffix
   (interactive (list (majutsu-metaedit-arguments)))
   (let ((exit (apply #'majutsu-run-jj "metaedit" args)))
     (when (zerop exit)
@@ -79,37 +82,37 @@ revision argument is present. Outside the transient, return defaults."
 (transient-define-argument majutsu-metaedit:--author ()
   :description "Author"
   :class 'transient-option
-  :shortarg "-a"
+  :key "-a"
   :argument "--author=")
 
 (transient-define-argument majutsu-metaedit:--author-timestamp ()
   :description "Author timestamp"
   :class 'transient-option
-  :shortarg "-t"
+  :key "-t"
   :argument "--author-timestamp=")
 
 (transient-define-argument majutsu-metaedit:--update-change-id ()
   :description "Update change-id"
   :class 'transient-switch
-  :shortarg "-c"
+  :key "-c"
   :argument "--update-change-id")
 
 (transient-define-argument majutsu-metaedit:--update-author ()
   :description "Update author"
   :class 'transient-switch
-  :shortarg "-u"
+  :key "-u"
   :argument "--update-author")
 
 (transient-define-argument majutsu-metaedit:--update-author-timestamp ()
   :description "Update author timestamp"
   :class 'transient-switch
-  :shortarg "-U"
+  :key "-U"
   :argument "--update-author-timestamp")
 
 (transient-define-argument majutsu-metaedit:--force-rewrite ()
   :description "Force rewrite"
   :class 'transient-switch
-  :shortarg "-f"
+  :key "-f"
   :argument "--force-rewrite")
 
 ;;;###autoload
@@ -125,12 +128,13 @@ With prefix ARG, pre-enable --ignore-immutable."
 (transient-define-prefix majutsu-metaedit-transient ()
   "Transient for jj metaedit operations."
   :man-page "jj-metaedit"
+  :class 'majutsu-jj-transient-prefix
+  :jj-command "metaedit"
   :incompatible '(("--update-author" "--author=")
                   ("--update-author-timestamp" "--author-timestamp="))
   :transient-non-suffix t
-  [:description "JJ Metaedit"
-   :class transient-columns
-   ["Selection"
+  :description "JJ Metaedit"
+  [["Selection"
     (majutsu-metaedit:-r)]
    ["Metadata"
     (majutsu-metaedit:--message)
@@ -143,9 +147,7 @@ With prefix ARG, pre-enable --ignore-immutable."
     (majutsu-metaedit:--force-rewrite)
     (majutsu-transient-arg-ignore-immutable)]
    ["Actions"
-    ("m" "Metaedit" majutsu-metaedit-execute)
-    ("RET" "Metaedit" majutsu-metaedit-execute)
-    ("q" "Quit" transient-quit-one)]])
+    ("m" "Metaedit" majutsu-metaedit-execute)]])
 
 ;;; _
 (provide 'majutsu-metaedit)

@@ -7,7 +7,7 @@
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 ;; Version: 0.6.0
-;; Package-Requires: ((emacs "29.1") (transient "0.5.0") (magit "3.3.0"))
+;; Package-Requires: ((emacs "29.1") (compat "31.0.0.1") (transient "0.5.0") (magit "3.3.0") (consult "1.0") (plz "0.9.1"))
 
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -45,10 +45,12 @@ Instead of invoking this alias for `majutsu-log' using
     ("C" "Commit"            majutsu-commit)
     ("m" "Metaedit"          majutsu-metaedit)
     ("d" "Diff"              majutsu-diff)
+    ("v" "Evolution log"     majutsu-evolog)
     ("D" "Diff (dwim)"       majutsu-diff-dwim)
     ("e" "Edit change"       majutsu-edit-changeset)
     ("E" "Ediff"             majutsu-ediff)]
    [("G" "Git"               majutsu-git-transient)
+    ("!" "Run"               majutsu-command)
     ("l" "Log options"       majutsu-log-transient)
     ("o" "New"               majutsu-new)
     ("O" "New (dwim)"        majutsu-new-dwim)
@@ -60,8 +62,9 @@ Instead of invoking this alias for `majutsu-log' using
     ("S" "Split"             majutsu-split)
     ("a" "Absorb"            majutsu-absorb)
     ("y" "Duplicate"         majutsu-duplicate)
-    ("Y" "Duplicate (dwim)"  majutsu-duplicate-dwim)
+    (">" "Sparse"            majutsu-sparse)
     ("Z" "Workspaces"        majutsu-workspace)
+    ("X" "Operations"        majutsu-op-transient)
     ("C-/" "Undo"            majutsu-undo)
     ("C-?" "Redo"            majutsu-redo)]]
   ["Essential commands"
@@ -73,13 +76,22 @@ Instead of invoking this alias for `majutsu-log' using
    [("C-x m"    "Show all key bindings"    describe-mode)]]
   ["Log commands"
    :if-derived majutsu-log-mode
-   [("w" "Copy…"             majutsu-log-copy-transient)]])
+   [("w" "Copy…"             majutsu-log-copy-transient)]]
+  ["Evolution log commands"
+   :if-derived majutsu-evolog-mode
+   [("w" "Copy…"             majutsu-evolog-copy-transient)]]
+  ["Operation log commands"
+   :if-derived majutsu-op-log-mode
+   [("w" "Copy…"             majutsu-op-log-copy-transient)]])
 
 (provide 'majutsu)
 
 (cl-eval-when (load eval)
   (require 'majutsu-template)
   (require 'majutsu-jjdescription)
+  (require 'majutsu-ref)
+  (require 'majutsu-remote)
+  (require 'majutsu-row)
   (require 'majutsu-log)
   (require 'majutsu-diff)
   (require 'majutsu-ediff)
@@ -87,7 +99,9 @@ Instead of invoking this alias for `majutsu-log' using
   (require 'majutsu-tag)
   (require 'majutsu-duplicate)
   (require 'majutsu-edit)
+  (require 'majutsu-diffedit)
   (require 'majutsu-git)
+  (require 'majutsu-command)
   (require 'majutsu-interactive)
   (require 'majutsu-file)
   (require 'majutsu-annotate)
@@ -103,8 +117,10 @@ Instead of invoking this alias for `majutsu-log' using
   (require 'majutsu-metaedit)
   (require 'majutsu-new)
   (require 'majutsu-op)
+  (require 'majutsu-evolog)
   (require 'majutsu-workspace)
-  (require 'majutsu-conflict))
+  (require 'majutsu-conflict)
+  (require 'majutsu-gerrit))
 
 (with-eval-after-load 'evil
   (require 'majutsu-evil nil t))

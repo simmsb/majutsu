@@ -10,8 +10,11 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'seq)
 (require 'majutsu-conflict)
 (require 'majutsu-evil)
+(require 'majutsu-evolog)
+(require 'majutsu-op)
 
 (ert-deftest majutsu-evil-test-before-map-side-bindings ()
   "Before map should route digits to the before side."
@@ -34,6 +37,50 @@
                  (setq call (list side before)))))
       (call-interactively command))
     (should (equal call '(4 nil)))))
+
+(ert-deftest majutsu-evil-test-initial-state-includes-op-and-evolog-modes ()
+  "Operation and evolog modes should get the configured Evil initial state."
+  (let (calls)
+    (cl-letf (((symbol-function 'evil-set-initial-state)
+               (lambda (mode state)
+                 (push (list mode state) calls))))
+      (let ((majutsu-evil-initial-state 'normal))
+        (majutsu-evil--set-initial-state)))
+    (should (member '(majutsu-op-log-mode normal) calls))
+    (should (member '(majutsu-op-diff-mode normal) calls))
+    (should (member '(majutsu-evolog-mode normal) calls))
+    (should (member '(majutsu-evolog-diff-mode normal) calls))))
+
+(ert-deftest majutsu-evil-test-op-log-mode-keybindings ()
+  "Operation log mode should receive its existing Evil bindings."
+  (let ((featurep-original (symbol-function 'featurep))
+        calls)
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature &optional subfeature)
+                 (if (eq feature 'evil)
+                     t
+                   (funcall featurep-original feature subfeature))))
+              ((symbol-function 'evil-normalize-keymaps)
+               (lambda (&rest _)))
+              ((symbol-function 'evil-define-key*)
+               (lambda (state keymap &rest bindings)
+                 (push (list state keymap bindings) calls))))
+      (unwind-protect
+          (majutsu-evil--define-mode-keys)
+        (dolist (hook '(majutsu-blob-mode-hook
+                        majutsu-blob-edit-mode-hook
+                        majutsu-conflict-mode-hook
+                        majutsu-annotate-mode-hook))
+          (remove-hook hook #'evil-normalize-keymaps))))
+    (should (seq-some
+             (lambda (call)
+               (and (eq (nth 0 call) 'normal)
+                    (eq (nth 1 call) majutsu-op-log-mode-map)
+                    (equal (nth 2 call)
+                           (list (kbd "d") #'majutsu-op-diff-transient
+                                 (kbd "u") #'majutsu-op-log-restore-at-point
+                                 (kbd "r") #'majutsu-op-log-revert-at-point))))
+             calls))))
 
 (provide 'majutsu-evil-test)
 ;;; majutsu-evil-test.el ends here

@@ -19,6 +19,10 @@
 (require 'majutsu-jj)
 (require 'majutsu-base)
 (require 'majutsu-process)
+(require 'majutsu-selection)
+(require 'majutsu-transient)
+(require 'cl-lib)
+(require 'transient)
 
 ;;; Transient UX integration
 
@@ -46,6 +50,62 @@ are also commonly invoked directly."
           (const :tag "Selected" selected)
           (const :tag "Current" current)
           (const :tag "Never" never)))
+
+(defun majutsu--transient-default-action-set (symbol value)
+  "Set SYMBOL to VALUE after validating it as a key description."
+  (unless (and (stringp value)
+               (> (length value) 0)
+               (condition-case nil
+                   (let ((keys (kbd value)))
+                     (or (stringp keys) (vectorp keys)))
+                 (error nil)))
+    (user-error "Invalid transient key: %S" value))
+  (set-default symbol value))
+
+(defcustom majutsu-transient-default-action "RET"
+  "Key used for default action suffixes in Majutsu transients.
+
+This controls Majutsu transient suffixes that perform the primary action
+for their prefix, such as executing a rebase, squash, split, or upload.
+When such a suffix also has a command-specific key, this key is bound as
+an alias on the same menu row.  Set this to another key description, such
+as \".\", to move the default action key."
+  :group 'majutsu
+  :type 'string
+  :set #'majutsu--transient-default-action-set)
+
+(defclass majutsu-transient-default-action-suffix
+  (majutsu-transient-key-alias-suffix transient-suffix)
+  ((advice* :initform #'majutsu--transient-with-selection-buffer))
+  "Transient suffix with `majutsu-transient-default-action' as default key.")
+
+(cl-defmethod majutsu-transient-key-aliases
+  ((_obj majutsu-transient-default-action-suffix))
+  (append (cl-call-next-method) (list majutsu-transient-default-action)))
+
+(defun majutsu--transient-with-selection-buffer (fn &rest args)
+  "Call FN with ARGS in the active selection session buffer.
+
+Majutsu transients store their originating buffer in `transient-scope'.
+Running default action suffixes in that buffer keeps repository context,
+`default-directory', and buffer-local selection state consistent even if the
+transient UI or another callback changes the current buffer.  If no Majutsu
+  selection session is active, call FN in the current buffer."
+  (let ((scope (transient-scope)))
+    (if (majutsu-selection-session-p scope)
+        (let ((buffer (majutsu-selection-session-buffer scope)))
+          (unless (buffer-live-p buffer)
+            (user-error "Selection buffer is no longer live"))
+          (with-current-buffer buffer
+            (apply fn args)))
+      (apply fn args))))
+
+;; Do not set `key' as a class initform: suffix prototypes are created at
+;; load time, but this option should be read when each transient is shown.
+(cl-defmethod transient--init-suffix-key ((obj majutsu-transient-default-action-suffix))
+  (if (slot-boundp obj 'key)
+      (cl-call-next-method)
+    (oset obj key majutsu-transient-default-action)))
 
 (defun majutsu--transient--majutsu-prefix-p ()
   "Return non-nil when the active transient prefix is a Majutsu command."
@@ -113,13 +173,190 @@ Note: <escape> does not affect the plain Emacs region."
   "Options that most Majutsu users should consider."
   :group 'majutsu)
 
-;;; Shared Transients
+;;; Repository-local transient defaults
 
-(transient-define-argument majutsu-transient-arg-ignore-immutable ()
-  :description "Ignore immutable"
-  :class 'transient-switch
-  :shortarg "-I"
-  :argument "--ignore-immutable")
+(defun majutsu-repository-config-id-file (&optional root)
+  "Return jj's repo config-id file below workspace ROOT."
+  (when-let* ((root (or root (majutsu--buffer-root) (majutsu-toplevel))))
+    (expand-file-name ".jj/repo/config-id" root)))
+
+(defun majutsu-repository-config-id (&optional create)
+  "Return jj's secure repo config id for the current repository.
+
+When CREATE is non-nil, ask jj to create the repo config id first if it
+does not exist yet."
+  (when-let* ((file (majutsu-repository-config-id-file)))
+    (when (and create (not (file-readable-p file)))
+      (majutsu-jj-string "config" "path" "--repo"))
+    (when (file-readable-p file)
+      (with-temp-buffer
+        (insert-file-contents file)
+        (string-trim (buffer-string))))))
+
+(defun majutsu-transient-global-default-key (namespace mode)
+  "Return NAMESPACE/MODE's global transient defaults key."
+  (intern (format "%s:%s" namespace mode)))
+
+(defun majutsu-transient-repository-default-key (namespace mode &optional config-id)
+  "Return NAMESPACE/MODE's repository-local transient defaults key."
+  (when-let* ((config-id (or config-id (majutsu-repository-config-id))))
+    (intern (format "%s:%s:repo:%s" namespace mode config-id))))
+
+(defun majutsu-transient--repository-current-property (namespace)
+  "Return the property used for NAMESPACE's repo-local session values."
+  (intern (format "%s-current-repository-values" namespace)))
+
+(defun majutsu-transient-repository-current-entry (namespace mode &optional config-id)
+  "Return NAMESPACE/MODE's repo-local session entry for CONFIG-ID."
+  (when-let* ((config-id (or config-id (majutsu-repository-config-id))))
+    (assoc config-id
+           (get mode (majutsu-transient--repository-current-property namespace)))))
+
+(defun majutsu-transient-repository-current-value (namespace mode &optional config-id)
+  "Return NAMESPACE/MODE's repo-local session value for CONFIG-ID."
+  (cdr (majutsu-transient-repository-current-entry namespace mode config-id)))
+
+(defun majutsu-transient-put-repository-current-value
+    (namespace mode value &optional config-id)
+  "Set NAMESPACE/MODE's repo-local session VALUE for CONFIG-ID."
+  (let* ((config-id (or config-id
+                        (majutsu-repository-config-id t)
+                        (user-error "No jj repository config id available")))
+         (prop (majutsu-transient--repository-current-property namespace))
+         (values (get mode prop))
+         (entry (assoc config-id values)))
+    (if entry
+        (setcdr entry value)
+      (put mode prop (cons (cons config-id value) values)))))
+
+(defun majutsu-transient-default-value (namespace mode current-property default-property)
+  "Return NAMESPACE/MODE's default value.
+
+Precedence is repository-local session value, repository-local saved value,
+global session value, global saved value, and finally DEFAULT-PROPERTY on MODE."
+  (let* ((repo-key (majutsu-transient-repository-default-key namespace mode))
+         (repo-current (majutsu-transient-repository-current-entry namespace mode))
+         (repo-saved (and repo-key (assq repo-key transient-values)))
+         (global-saved (assq (majutsu-transient-global-default-key namespace mode)
+                             transient-values)))
+    (cond
+     (repo-current (cdr repo-current))
+     (repo-saved (cdr repo-saved))
+     ((plist-member (symbol-plist mode) current-property)
+      (get mode current-property))
+     (global-saved (cdr global-saved))
+     (t
+      (get mode default-property)))))
+
+(defun majutsu-transient-save-repository-value (namespace mode value)
+  "Persist VALUE as NAMESPACE/MODE's repository-local transient default."
+  (let* ((config-id (or (majutsu-repository-config-id t)
+                        (user-error "No jj repository config id available")))
+         (key (majutsu-transient-repository-default-key namespace mode config-id)))
+    (majutsu-transient-put-repository-current-value namespace mode value config-id)
+    (setf (alist-get key transient-values) value)
+    (transient-save-values)))
+
+(defun majutsu-filesets-split-transient-value (value)
+  "Return (ARGS FILESETS) from transient VALUE.
+ARGS contains ordinary option arguments.  FILESETS contains the values
+from `transient-files' groups, without the -- separator."
+  (let (args filesets)
+    (dolist (arg value)
+      (if (and (consp arg) (equal (car arg) "--"))
+          (setq filesets (append filesets (cdr arg)))
+        (push arg args)))
+    (list (nreverse args) filesets)))
+
+(defun majutsu-filesets-build-transient-value (args filesets)
+  "Return transient value for ARGS and FILESETS."
+  (if filesets
+      `(("--" ,@filesets) ,@args)
+    args))
+
+(defun majutsu-jj-append-filesets (args filesets)
+  "Return jj ARGS followed by -- and FILESETS."
+  (if filesets
+      (append args (cons "--" filesets))
+    args))
+
+(defclass majutsu-repository-transient-prefix (majutsu-jj-transient-prefix)
+  ((repo-namespace :initarg :repo-namespace :initform nil)
+   (repo-key :initarg :repo-key :initform nil)
+   (repo-filter :initarg :repo-filter :initform nil))
+  "Transient prefix whose plain argument list has repository-local defaults.")
+
+(defun majutsu-repository-transient--namespace (obj)
+  "Return OBJ's repository-default namespace."
+  (or (oref obj repo-namespace) (oref obj command)))
+
+(defun majutsu-repository-transient--key (obj)
+  "Return OBJ's repository-default key."
+  (or (oref obj repo-key) (oref obj command)))
+
+(defun majutsu-repository-transient--args (obj)
+  "Return OBJ's current arguments for default storage."
+  (let ((args (transient-args (oref obj command))))
+    (if-let* ((filter (oref obj repo-filter)))
+        (funcall filter args)
+      args)))
+
+(cl-defmethod transient-init-value ((obj majutsu-repository-transient-prefix))
+  (let ((key (majutsu-repository-transient--key obj)))
+    (oset obj value
+          (majutsu-transient-default-value
+           (majutsu-repository-transient--namespace obj)
+           key
+           (intern (format "%s-current-arguments" key))
+           (intern (format "%s-default-arguments" key))))))
+
+(cl-defmethod transient-set-value ((obj majutsu-repository-transient-prefix))
+  (let* ((obj (oref obj prototype))
+         (namespace (majutsu-repository-transient--namespace obj))
+         (key (majutsu-repository-transient--key obj))
+         (args (majutsu-repository-transient--args obj)))
+    (if-let* ((config-id (majutsu-repository-config-id)))
+        (majutsu-transient-put-repository-current-value
+         namespace key args config-id)
+      (put key (intern (format "%s-current-arguments" key)) args))
+    (transient--history-push obj)))
+
+(cl-defmethod transient-save-value ((obj majutsu-repository-transient-prefix))
+  (let* ((obj (oref obj prototype))
+         (namespace (majutsu-repository-transient--namespace obj))
+         (key (majutsu-repository-transient--key obj))
+         (args (majutsu-repository-transient--args obj)))
+    (put key (intern (format "%s-current-arguments" key)) args)
+    (setf (alist-get (majutsu-transient-global-default-key namespace key)
+                     transient-values)
+          args)
+    (transient-save-values)
+    (transient--history-push obj)))
+
+(cl-defgeneric majutsu-transient--save-repository-defaults (obj)
+  "Save OBJ's current transient value as repository-local defaults.")
+
+(cl-defmethod majutsu-transient--save-repository-defaults ((_obj transient-prefix))
+  (user-error "This transient does not support repository-local defaults"))
+
+(cl-defmethod majutsu-transient--save-repository-defaults
+  ((obj majutsu-repository-transient-prefix))
+  (let* ((obj (oref obj prototype))
+         (namespace (majutsu-repository-transient--namespace obj))
+         (key (majutsu-repository-transient--key obj))
+         (args (majutsu-repository-transient--args obj)))
+    (majutsu-transient-save-repository-value namespace key args)
+    (transient--history-push obj)
+    (message "Saved %s arguments as repository defaults" key)))
+
+(transient-define-suffix majutsu-transient-save-repository-defaults ()
+  "Save current transient arguments as defaults for this jj repository."
+  :transient t
+  :advice* #'majutsu--transient-with-selection-buffer
+  (interactive)
+  (if (and transient--prefix (eieio-object-p transient--prefix))
+      (majutsu-transient--save-repository-defaults transient--prefix)
+    (user-error "Not in a transient")))
 
 (defgroup majutsu-modes nil
   "Modes used or provided by Majutsu."

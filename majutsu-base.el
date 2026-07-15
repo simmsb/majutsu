@@ -25,6 +25,7 @@
 (require 'subr-x)
 (require 'eieio)
 (require 'magit-section)
+(require 'majutsu-completion)
 
 (declare-function majutsu-save-window-configuration "majutsu-mode" ())
 
@@ -81,8 +82,12 @@ which in turn uses the function specified here."
   '((const undo)
     (const redo)
     (const abandon)
+    (const bookmark-delete)
+    (const tag-delete)
+    (const git-remote-remove)
     (const rebase)
-    (const workspace-forget))
+    (const workspace-forget)
+    (const workspace-trash))
   "Actions that may require confirmation.")
 
 (defcustom majutsu-no-confirm nil
@@ -110,6 +115,12 @@ for a class of actions that would normally ask for confirmation."
             :documentation "Selection overlay used by transient UIs.")
    (keymap :initform 'majutsu-commit-section-map)))
 
+(defclass majutsu-bookmark-section (magit-section)
+  ((keymap :initform 'majutsu-bookmark-section-map)))
+
+(defclass majutsu-tag-section (magit-section)
+  ((keymap :initform 'majutsu-tag-section-map)))
+
 (defclass majutsu-diff-section (magit-section)
   ((keymap :initform 'majutsu-diff-section-map))
   :abstract t)
@@ -123,9 +134,7 @@ for a class of actions that would normally ask for confirmation."
 (defclass majutsu-hunk-section (majutsu-diff-section)
   ((keymap :initform 'majutsu-hunk-section-map)
    (fontified :initform nil)
-   (combined :initarg :combined :initform nil)
    (from-range :initarg :from-range :initform nil)
-   (from-ranges :initarg :from-ranges :initform nil)
    (to-range :initarg :to-range :initform nil)
    (about :initarg :about :initform nil)
    (painted :initform nil)
@@ -133,9 +142,16 @@ for a class of actions that would normally ask for confirmation."
    (heading-highlight-face :initform 'magit-diff-hunk-heading-highlight)
    (heading-selection-face :initform 'magit-diff-hunk-heading-selection)))
 
-(setf (alist-get 'jj-commit magit--section-type-alist) 'majutsu-commit-section)
-(setf (alist-get 'jj-file   magit--section-type-alist) 'majutsu-file-section)
-(setf (alist-get 'jj-hunk   magit--section-type-alist) 'majutsu-hunk-section)
+(defclass majutsu-git-remote-section (magit-section)
+  ((keymap :initform 'majutsu-git-remote-section-map)))
+
+(setf (alist-get 'jj-commit   magit--section-type-alist) 'majutsu-commit-section)
+(setf (alist-get 'jj-bookmark magit--section-type-alist) 'majutsu-bookmark-section)
+(setf (alist-get 'jj-tag      magit--section-type-alist) 'majutsu-tag-section)
+(setf (alist-get 'jj-file     magit--section-type-alist) 'majutsu-file-section)
+(setf (alist-get 'jj-hunk     magit--section-type-alist) 'majutsu-hunk-section)
+
+(setf (alist-get 'jj-git-remote magit--section-type-alist) 'majutsu-git-remote-section)
 
 ;; Workspace sections (`jj workspace list`)
 
@@ -145,6 +161,41 @@ for a class of actions that would normally ask for confirmation."
 (setf (alist-get 'jj-workspace magit--section-type-alist) 'majutsu-workspace-section)
 
 ;;; Utilities
+
+(defun majutsu--split-fields (value separator &optional max-fields)
+  "Split VALUE at one-character SEPARATOR, preserving empty fields.
+When MAX-FIELDS is non-nil, split at most MAX-FIELDS fields and leave the
+remaining text in the last field.  Text properties are preserved."
+  (when (stringp value)
+    (let ((start 0)
+          (len (length value))
+          (sep (if (characterp separator) separator (aref separator 0)))
+          out)
+      (catch 'done
+        (dotimes (idx len)
+          (when (and max-fields
+                     (>= (length out) (1- max-fields)))
+            (throw 'done nil))
+          (when (eq (aref value idx) sep)
+            (push (substring value start idx) out)
+            (setq start (1+ idx)))))
+      (push (substring value start len) out)
+      (nreverse out))))
+
+(defun majutsu--field-string (value)
+  "Return VALUE as a plain machine-field string."
+  (substring-no-properties (or value "")))
+
+(defun majutsu--field-bool-p (value)
+  "Return non-nil when machine-field VALUE is true."
+  (equal (majutsu--field-string value) "t"))
+
+(defun majutsu--append-unique (items item &optional testfn)
+  "Return ITEMS with ITEM appended unless already present.
+TESTFN defaults to `equal'."
+  (if (cl-member item items :test (or testfn #'equal))
+      items
+    (append items (list item))))
 
 (defun majutsu--ensure-flag (args flag &optional position)
   "Return ARGS ensuring FLAG is present once.
@@ -185,40 +236,89 @@ end with a question mark and space."
    ((and action (memq action majutsu-no-confirm)) t)
    (t (majutsu-y-or-n-p prompt action))))
 
-;;; Completing Read
-
-(defun majutsu--make-completion-table (candidates &optional category)
-  "Wrap CANDIDATES in a completion table.
-When CATEGORY is non-nil, set it in metadata to control UI icons/styling."
-  (let ((metadata `(metadata (display-sort-function . identity)
-                    ,@(and category `((category . ,category))))))
-    (lambda (string pred action)
-      (if (eq action 'metadata)
-          metadata
-        (complete-with-action action candidates string pred)))))
+;;; Selection readers
 
 (defun majutsu-completing-read (prompt collection &optional predicate require-match
                                        initial-input hist def category)
   "Read a choice with completion, preserving CATEGORY metadata.
 Like `completing-read' but uses `format-prompt' and supports CATEGORY
-for completion UI styling (icons, grouping)."
-  (let ((table (if category
-                   (majutsu--make-completion-table collection category)
-                 collection)))
-    (completing-read (format-prompt prompt def)
-                     table predicate require-match
-                     initial-input hist def)))
+for completion UI styling (icons, grouping).  COLLECTION may contain
+plain strings or (CANDIDATE . ANNOTATION) items.
+
+When REQUIRE-MATCH is nil, empty input returns nil.  When REQUIRE-MATCH
+is `any', require non-empty input without requiring a candidate match."
+  (let* ((completion-extra-properties
+          (if (listp collection)
+              (majutsu-completion-items-properties collection category)
+            (majutsu-completion-properties category)))
+         (value (completing-read (format-prompt prompt def)
+                                 collection predicate
+                                 (if (eq require-match 'any) nil require-match)
+                                 initial-input hist def)))
+    (if (equal value "")
+        (if require-match
+            (user-error "Nothing selected")
+          nil)
+      value)))
+
+(defun majutsu-completing-read-payload
+    (prompt payload &optional predicate require-match initial-input hist def category context directory)
+  "Read one value from structured completion PAYLOAD.
+PAYLOAD may provide :category and richer completion metadata.  CONTEXT and
+DIRECTORY are accepted for API compatibility within Majutsu and are ignored.
+REQUIRE-MATCH follows `majutsu-completing-read'."
+  (ignore context directory)
+  (let* ((completion-extra-properties
+          (majutsu-completion-payload-properties payload category))
+         (collection (plist-get payload :candidates))
+         (value (completing-read (format-prompt prompt def)
+                                 collection predicate
+                                 (if (eq require-match 'any) nil require-match)
+                                 initial-input hist def)))
+    (if (equal value "")
+        (if require-match
+            (user-error "Nothing selected")
+          nil)
+      value)))
 
 (defun majutsu-completing-read-multiple (prompt collection &optional predicate require-match
                                                 initial-input hist def category)
   "Read multiple choices with completion, preserving CATEGORY metadata.
-Like `completing-read-multiple' but uses `format-prompt' and supports CATEGORY."
-  (let ((table (if category
-                   (majutsu--make-completion-table collection category)
-                 collection)))
-    (completing-read-multiple (format-prompt prompt def)
-                              table predicate require-match
-                              initial-input hist def)))
+Like `completing-read-multiple' but uses `format-prompt' and supports
+CATEGORY.  COLLECTION may contain plain strings or
+(CANDIDATE . ANNOTATION) items.
+
+When REQUIRE-MATCH is `any', require at least one non-empty input without
+requiring a candidate match."
+  (let* ((completion-extra-properties
+          (if (listp collection)
+              (majutsu-completion-items-properties collection category)
+            (majutsu-completion-properties category)))
+         (values (completing-read-multiple (format-prompt prompt def)
+                                           collection predicate
+                                           (if (eq require-match 'any) nil require-match)
+                                           initial-input hist def)))
+    (when (and (eq require-match 'any) (null values))
+      (user-error "Nothing selected"))
+    values))
+
+(defun majutsu-completing-read-multiple-payload
+    (prompt payload &optional predicate require-match initial-input hist def category context directory)
+  "Read multiple values from structured completion PAYLOAD.
+PAYLOAD may provide :category and richer completion metadata.  CONTEXT and
+DIRECTORY are accepted for API compatibility within Majutsu and are ignored.
+REQUIRE-MATCH follows `majutsu-completing-read-multiple'."
+  (ignore context directory)
+  (let* ((completion-extra-properties
+          (majutsu-completion-payload-properties payload category))
+         (collection (plist-get payload :candidates))
+         (values (completing-read-multiple (format-prompt prompt def)
+                                           collection predicate
+                                           (if (eq require-match 'any) nil require-match)
+                                           initial-input hist def)))
+    (when (and (eq require-match 'any) (null values))
+      (user-error "Nothing selected"))
+    values))
 
 (defun majutsu-read-string (prompt &optional initial-input history default-value)
   "Read a string from the minibuffer, prompting with PROMPT.
@@ -236,10 +336,10 @@ DEFAULT-VALUE if non-nil, otherwise signals an error."
   "Display BUFFER the way this has traditionally been done."
   (display-buffer
    buffer (if (and (derived-mode-p 'majutsu-mode)
-                   (not (memq (with-current-buffer buffer major-mode)
-                              '(majutsu-process-mode
-                                majutsu-diff-mode
-                                majutsu-log-mode))))
+                   (not (with-current-buffer buffer
+                          (derived-mode-p 'majutsu-process-mode
+                                          'majutsu-diff-mode
+                                          'majutsu-log-mode))))
               '(display-buffer-same-window)
             nil)))
 
@@ -326,12 +426,13 @@ window to the full height of the frame, deleting other windows in
 that column as necessary.  However, display BUFFER in another
 window if BUFFER's mode derives from `majutsu-process-mode', or if
 BUFFER derives from `majutsu-diff-mode' while the current buffer
-derives from `majutsu-log-mode'."
+is a log, operation-log, or evolution-log buffer."
   (display-buffer
    buffer
    (cond ((and (or (bound-and-true-p majutsu-jjdescription-mode)
                    (derived-mode-p 'majutsu-log-mode
-                                   'majutsu-op-log-mode))
+                                   'majutsu-op-log-mode
+                                   'majutsu-evolog-mode))
                (with-current-buffer buffer
                  (derived-mode-p 'majutsu-diff-mode)))
           nil)
@@ -422,26 +523,6 @@ of the selected frame."
   "Signal a user error unless the current buffer derives from MODE."
   (unless (derived-mode-p mode)
     (user-error "Command is only valid in %s buffers" mode)))
-
-;;; Change at Point
-
-(defvar majutsu-buffer-blob-revision)
-
-(defun majutsu-revision-at-point ()
-  "Return the change-id at point.
-This checks multiple sources in order:
-1. Section value (jj-commit section)
-2. Blob buffer revision
-3. Diff buffer revision"
-  (or (magit-section-value-if 'jj-commit)
-      (and (bound-and-true-p majutsu-buffer-blob-revision)
-           majutsu-buffer-blob-revision)
-      (and (derived-mode-p 'majutsu-diff-mode)
-           (bound-and-true-p majutsu-buffer-diff-range)
-           (let ((range majutsu-buffer-diff-range))
-             (or (and (equal (car range) "-r") (cadr range))
-                 (when-let* ((arg (seq-find (lambda (item) (string-prefix-p "--revisions=" item)) range)))
-                   (substring arg (length "--revisions="))))))))
 
 ;;; _
 (provide 'majutsu-base)

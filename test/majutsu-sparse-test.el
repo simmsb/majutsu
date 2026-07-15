@@ -70,6 +70,20 @@
                      (sort (copy-sequence '("src" "lib" "dir/sub" "."))
                            #'string<))))))
 
+(ert-deftest majutsu-sparse-read-patterns/uses-history-and-category ()
+  "Sparse pattern reader should expose path-like completion metadata."
+  (let (seen-history seen-category)
+    (cl-letf (((symbol-function 'completing-read-multiple)
+               (lambda (_prompt collection _predicate _require-match _initial history _default)
+                 (setq seen-history history
+                       seen-category (plist-get completion-extra-properties :category))
+                 (should (equal collection '("src" "lib")))
+                 '("src"))))
+      (should (equal (majutsu-sparse--read-patterns "Sparse" '("src" "lib"))
+                     '("src")))
+      (should (eq seen-history 'majutsu-sparse-pattern-history))
+      (should (eq seen-category 'majutsu-file)))))
+
 (provide 'majutsu-sparse-test)
 
 ;;; majutsu-sparse-test.el ends here

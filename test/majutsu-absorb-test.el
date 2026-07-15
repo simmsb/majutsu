@@ -17,18 +17,16 @@
   (with-temp-buffer
     (majutsu-diff-mode)
     (setq-local majutsu-buffer-diff-range '("--revisions=abc123"))
-    (let ((transient--original-buffer (current-buffer)))
-      (should (equal (majutsu-absorb--default-args)
-                     '("--from=abc123"))))))
+    (should (equal (majutsu-absorb--default-args)
+                   '("--from=abc123")))))
 
 (ert-deftest majutsu-absorb-default-args-from-diff-from ()
   "Keep --from from diff range when available."
   (with-temp-buffer
     (majutsu-diff-mode)
     (setq-local majutsu-buffer-diff-range '("--from=main" "--to=@"))
-    (let ((transient--original-buffer (current-buffer)))
-      (should (equal (majutsu-absorb--default-args)
-                     '("--from=main"))))))
+    (should (equal (majutsu-absorb--default-args)
+                   '("--from=main")))))
 
 (ert-deftest majutsu-absorb-arguments-use-transient-args ()
   "Use current transient args when absorb transient is active."
@@ -59,6 +57,20 @@
       (majutsu-absorb-execute '("--from=@" "--into=mutable()"))
       (should (equal called
                      '("absorb" "--from=@" "--into=mutable()"))))))
+
+(ert-deftest majutsu-absorb-execute-places-structured-filesets-after-options ()
+  "Execute absorb with transient filesets after option arguments."
+  (let (called)
+    (cl-letf (((symbol-function 'majutsu-run-jj)
+               (lambda (&rest args)
+                 (setq called args)
+                 0))
+              ((symbol-function 'message)
+               (lambda (&rest _) nil)))
+      (majutsu-absorb-execute '(("--" "src/a.el") "--from=@" "--into=mutable()"))
+      (should (equal called
+                     '("absorb" "--from=@" "--into=mutable()"
+                       "--" "src/a.el"))))))
 
 (provide 'majutsu-absorb-test)
 ;;; majutsu-absorb-test.el ends here

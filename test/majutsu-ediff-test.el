@@ -69,14 +69,10 @@
 (ert-deftest majutsu-ediff-test-edit-range-default-fallback ()
   "When no args/context are available, diffedit range defaults to @-..@."
   (with-temp-buffer
-    (let ((range (majutsu-edit--edit-range nil)))
+    (let ((range (majutsu-diffedit--range nil)))
       (should (equal (car range) "@-"))
       (should (equal (cdr range) "@")))))
 
-(ert-deftest majutsu-ediff-test-build-diffedit-args-with-file ()
-  "Diffedit args should include a fileset path when file is selected."
-  (should (equal (majutsu-edit--build-diffedit-args "foo" "bar" "src/x.el")
-                 '("--from" "foo" "--to" "bar" "--" "src/x.el"))))
 
 (ert-deftest majutsu-ediff-test-editor-command-config ()
   "Editor command config should use explicit command words."
@@ -99,11 +95,6 @@
                 process-environment)))
     (should (equal (majutsu-jj--editor-command-from-env)
                    '("emacsclient" "--socket-name=/tmp/editor.sock")))))
-
-(ert-deftest majutsu-ediff-test-diffedit-editor-target ()
-  "Diffedit target should point into right side temp tree."
-  (should (equal (majutsu-edit--diffedit-editor-target "src/one.el")
-                 "$right/src/one.el")))
 
 (ert-deftest majutsu-ediff-test-merge-editor-config ()
   "Merge editor config should use Majutsu control wrapper."
@@ -278,36 +269,42 @@
                    "--" "f.txt"))))
 
 (ert-deftest majutsu-ediff-test-conflict-side-count ()
-  "Conflict side count should be parsed from `jj resolve --list` output."
-  (cl-letf (((symbol-function 'majutsu-jj-lines)
-             (lambda (&rest _)
-               '("f.txt    4-sided conflict")))
-            ((symbol-function 'majutsu-file--root)
-             (lambda () default-directory)))
-    (should (= 4 (majutsu-ediff--conflict-side-count "@" "f.txt")))))
+  "Conflict side count should come from structured file-list data."
+  (let (seen-rev seen-filesets)
+    (cl-letf (((symbol-function 'majutsu-jj-conflicted-files)
+               (lambda (rev filesets)
+                 (setq seen-rev rev
+                       seen-filesets filesets)
+                 '((:path "f.txt" :sides 4))))
+              ((symbol-function 'majutsu-file--root)
+               (lambda () default-directory)))
+      (should (= 4 (majutsu-ediff--conflict-side-count "@" "f.txt")))
+      (should (equal seen-rev "@"))
+      (should (equal seen-filesets "file:\"f.txt\"")))))
 
-(ert-deftest majutsu-ediff-test-list-conflicted-files/preserves-spaces ()
-  "Conflicted file parsing should preserve spaces inside paths."
-  (cl-letf (((symbol-function 'majutsu-jj-lines)
-             (lambda (&rest _)
-               '("dir with spaces/file name.txt    2-sided conflict"
-                 "other.txt    3-sided conflict including 1 deletion")))
-            ((symbol-function 'majutsu-file--root)
-             (lambda () default-directory)))
-    (should (equal (majutsu-ediff--list-conflicted-files "@")
-                   '("dir with spaces/file name.txt"
-                     "other.txt")))))
-
-(ert-deftest majutsu-ediff-test-conflict-side-count/handles-spaces-and-details ()
-  "Conflict side parsing should ignore padding and trailing conflict details."
-  (cl-letf (((symbol-function 'majutsu-jj-lines)
-             (lambda (&rest _)
-               '("dir with spaces/file name.txt    3-sided conflict including 1 deletion and a directory")))
-            ((symbol-function 'majutsu-file--root)
-             (lambda () default-directory)))
-    (should (= 3 (majutsu-ediff--conflict-side-count
-                  "@"
-                  "dir with spaces/file name.txt")))))
+(ert-deftest majutsu-ediff-test-read-conflicted-file/annotates-side-count ()
+  "Conflicted-file completion should preserve paths and annotate side counts."
+  (let (seen-collection seen-history seen-category)
+    (cl-letf (((symbol-function 'majutsu-jj-conflicted-files)
+               (lambda (&optional _rev _filesets)
+                 '((:path "dir with spaces/file name.txt" :sides 2)
+                   (:path "other.txt" :sides 3))))
+              ((symbol-function 'majutsu-file--root)
+               (lambda () default-directory))
+              ((symbol-function 'majutsu-completing-read)
+               (lambda (_prompt collection _predicate _require-match
+                        _initial history _default category)
+                 (setq seen-collection collection
+                       seen-history history
+                       seen-category category)
+                 "dir with spaces/file name.txt")))
+      (should (equal (majutsu-ediff--read-conflicted-file "@")
+                     "dir with spaces/file name.txt"))
+      (should (equal seen-collection
+                     '(("dir with spaces/file name.txt" . "2-sided conflict")
+                       ("other.txt" . "3-sided conflict"))))
+      (should (eq seen-history 'majutsu-file-path-history))
+      (should (eq seen-category 'majutsu-file)))))
 
 (ert-deftest majutsu-ediff-test-directory-common-files ()
   "Directory common file discovery should ignore JJ-INSTRUCTIONS."
@@ -381,13 +378,11 @@
       (should (equal called-right "/ssh:demo:/tmp/right/foo.txt"))
       (should entered-recursive))))
 
-(ert-deftest majutsu-ediff-test-run-diffedit/passes-file-hint-to-config ()
-  "Run-diffedit should pass resolved FILE to diff-editor config builder."
+(ert-deftest majutsu-ediff-test-diffedit-config-uses-file-hint ()
+  "Ediff diffedit config should receive the normalized file hint."
   (let (seen-file)
     (cl-letf (((symbol-function 'majutsu--toplevel-safe)
                (lambda (&optional _dir) "/tmp/repo/"))
-              ((symbol-function 'majutsu-edit--replace-diffedit-file-arg)
-               (lambda (args _file) args))
               ((symbol-function 'majutsu-ediff--diff-editor-config)
                (lambda (&optional file)
                  (setq seen-file file)
@@ -395,8 +390,9 @@
               ((symbol-function 'majutsu-run-jj-async)
                (lambda (&rest _args) nil)))
       (let ((default-directory "/tmp/repo/"))
-        (majutsu-ediff--run-diffedit '("--from" "@-" "--to" "@" "--" "src/main.el")
-                                     "src/main.el"))
+        (majutsu-diffedit-run '("--from" "@-" "--to" "@")
+                              "src/main.el"
+                              #'majutsu-ediff--diff-editor-config))
       (should (equal seen-file "src/main.el")))))
 
 (ert-deftest majutsu-ediff-test-diffedit-file-installs-local-quit-hooks ()
@@ -708,9 +704,8 @@ This mirrors with-editor's kill guard so cleanup cannot abort quit hooks."
 (ert-deftest majutsu-ediff-test-resolve-file-dwim-uses-commit-revision ()
   "Resolve DWIM should query conflicted files at commit section revision."
   (let (asked-rev)
-    (cl-letf (((symbol-function 'magit-section-value-if)
-               (lambda (type)
-                 (when (eq type 'jj-commit) "abc123")))
+    (cl-letf (((symbol-function 'majutsu-revision-at-point)
+               (lambda () "abc123"))
               ((symbol-function 'majutsu-ediff--read-conflicted-file)
                (lambda (&optional rev)
                  (setq asked-rev rev)
@@ -810,53 +805,83 @@ This mirrors with-editor's kill guard so cleanup cannot abort quit hooks."
                (lambda (&optional _file) "conflicted.txt"))
               ((symbol-function 'majutsu-ediff--conflict-side-count)
                (lambda (_rev _file) 4))
-              ((symbol-function 'majutsu-edit--run-diffedit)
+              ((symbol-function 'majutsu-diffedit-run-with-editor)
                (lambda (args file)
                  (setq captured (list args file)))))
       (majutsu-ediff-resolve)
       (should (equal captured
-                     '(("-r" "rev-at-point" "--" "conflicted.txt") "conflicted.txt"))))))
+                     '(("-r" "rev-at-point") "conflicted.txt"))))))
 
 (ert-deftest majutsu-ediff-test-edit-prompts-file-and-runs-single-file ()
   "Diffedit should prompt for file when none at point."
   (let (captured)
     (with-temp-buffer
-      (cl-letf (((symbol-function 'majutsu-edit--file-at-point)
+      (cl-letf (((symbol-function 'majutsu-file-at-point)
                  (lambda () nil))
                 ((symbol-function 'majutsu-jj-read-diff-file)
                  (lambda (from to)
                    (should (equal from "@-"))
                    (should (equal to "@"))
                    "docs/majutsu.org"))
-                ((symbol-function 'majutsu-ediff--run-diffedit)
-                 (lambda (args file)
-                   (setq captured (list args file)))))
+                ((symbol-function 'majutsu-diffedit-run)
+                 (lambda (args file diff-editor)
+                   (setq captured (list args file diff-editor)))))
         (majutsu-ediff-edit nil)
         (should (equal captured
-                       '(("--from" "@-" "--to" "@" "--" "docs/majutsu.org")
-                         "docs/majutsu.org")))))))
+                       (list '("--from" "@-" "--to" "@")
+                             "docs/majutsu.org"
+                             #'majutsu-ediff--diff-editor-config)))))))
 
 (ert-deftest majutsu-ediff-test-edit-uses-file-at-point ()
   "Diffedit should use file at point and skip file prompt."
   (let (captured)
     (with-temp-buffer
-      (cl-letf (((symbol-function 'majutsu-edit--file-at-point)
+      (cl-letf (((symbol-function 'majutsu-file-at-point)
                  (lambda () "src/one.el"))
                 ((symbol-function 'majutsu-jj-read-diff-file)
                  (lambda (&rest _)
                    (ert-fail "should not prompt when file at point exists")))
-                ((symbol-function 'majutsu-ediff--run-diffedit)
-                 (lambda (args file)
-                   (setq captured (list args file)))))
+                ((symbol-function 'majutsu-diffedit-run)
+                 (lambda (args file diff-editor)
+                   (setq captured (list args file diff-editor)))))
         (majutsu-ediff-edit '("--from=main" "--to=@"))
         (should (equal captured
-                       '(("--from" "main" "--to" "@" "--" "src/one.el")
-                         "src/one.el")))))))
+                       (list '("--from" "main" "--to" "@")
+                             "src/one.el"
+                             #'majutsu-ediff--diff-editor-config)))))))
+
+(ert-deftest majutsu-ediff-test-edit-translates-revisions-for-diffedit ()
+  "Ediff diffedit should pass `jj diffedit' revision syntax."
+  (let (captured)
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'majutsu-file-at-point)
+                 (lambda () "src/one.el"))
+                ((symbol-function 'majutsu-jj-read-diff-file)
+                 (lambda (&rest _)
+                   (ert-fail "should not prompt when file at point exists")))
+                ((symbol-function 'majutsu-diffedit-run)
+                 (lambda (args file diff-editor)
+                   (setq captured (list args file diff-editor)))))
+        (majutsu-ediff-edit '("--revisions=abc"))
+        (should (equal captured
+                       (list '("-r" "abc")
+                             "src/one.el"
+                             #'majutsu-ediff--diff-editor-config)))))))
 
 (ert-deftest majutsu-ediff-test-transient-has-resolve-actions ()
   "Ediff transient should expose both resolve actions."
   (should (transient-get-suffix 'majutsu-ediff "m"))
   (should (transient-get-suffix 'majutsu-ediff "M")))
+
+(ert-deftest majutsu-ediff-selection-actions/use-session-buffer-advice ()
+  "Point-sensitive Ediff actions should run in the selection source buffer."
+  (dolist (key '("e" "E" "m" "M"))
+    (let* ((suffix (transient-get-suffix 'majutsu-ediff key))
+           (command (plist-get (cdr suffix) :command))
+           (prototype (get command 'transient--suffix)))
+      (should suffix)
+      (should (eq (oref prototype advice*)
+                  #'majutsu--transient-with-selection-buffer)))))
 
 (provide 'majutsu-ediff-test)
 ;;; majutsu-ediff-test.el ends here

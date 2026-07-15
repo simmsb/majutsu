@@ -21,9 +21,15 @@
 (require 'seq)
 (require 'subr-x)
 
-(declare-function majutsu-marginalia-prewarm-candidate-data
-                  "majutsu-marginalia"
-                  (category payload &optional revset directory))
+(declare-function majutsu-tag-at-point "majutsu-jj" ())
+(declare-function majutsu-edit-changeset "majutsu-edit" (&optional arg))
+
+;;; Section Keymaps
+
+(defvar-keymap majutsu-tag-section-map
+  :doc "Keymap for `jj-tag' sections."
+  "<remap> <majutsu-visit-thing>" #'majutsu-edit-changeset
+  "<remap> <majutsu-delete-thing>" #'majutsu-tag-delete)
 
 (defvar-local majutsu-tag--list-all-remotes nil
   "Non-nil when the tag list includes remote tags.")
@@ -35,32 +41,19 @@ SCOPE controls what to return:
 
 - nil or `local': local tag names (e.g. \"v1.0\")
 - t or `remote': remote tag refs (e.g. \"v1.0@git\")"
-  (let* ((scope (pcase scope
-                  ((or 'nil 'local) 'local)
-                  ((or 't 'remote) 'remote)
-                  (_ (user-error "Unknown tag name scope: %S" scope))))
-         (template (pcase scope
-                     ('local
-                      "if(!remote && present, name ++ \"\\n\", \"\")")
-                     ('remote
-                      "if(remote && present, name ++ \"@\" ++ remote ++ \"\\n\", \"\")")))
-         (args (append '("tag" "list" "--quiet")
-                       (and (eq scope 'remote) '("--all-remotes"))
-                       (list "-T" template))))
-    (delete-dups (majutsu-jj-lines args))))
+  (majutsu-ref-names 'tag scope))
+
+(defconst majutsu-tag--completion-field-separator
+  majutsu-ref--completion-field-separator
+  "Separator inserted between tag completion fields.")
+
+(defconst majutsu-tag--completion-template
+  majutsu-ref--completion-template
+  "Template used to collect tag completion metadata.")
 
 (defun majutsu-tag-candidate-data (&optional directory)
-  "Return completion payload for local tags in DIRECTORY.
-The payload follows `(:candidates LIST :annotations HASH-TABLE)'."
-  (let* ((default-directory (or directory default-directory))
-         (tags (condition-case nil
-                   (majutsu--get-tag-names 'local)
-                 (error nil)))
-         (annotations (make-hash-table :test #'equal)))
-    (dolist (tag tags)
-      (puthash tag "local tag" annotations))
-    (list :candidates tags
-          :annotations annotations)))
+  "Return completion payload for local tags in DIRECTORY."
+  (majutsu-ref-candidate-data 'tag nil directory))
 
 (defun majutsu-tag-parse-list-output (output)
   "Parse `jj tag list` OUTPUT into grouped entries.
@@ -82,17 +75,34 @@ Return a list of plists with keys:
       (push (list :name (car current) :lines (nreverse (cdr current))) entries))
     (nreverse entries)))
 
+(defvar majutsu-tag-name-history nil
+  "Minibuffer history for exact tag-name input.")
+
+(defvar majutsu-tag-pattern-history nil
+  "Minibuffer history for tag name-pattern input.")
+
+(defun majutsu-tag--read-candidates (prompt history &optional require-match default)
+  "Read tag candidates with PROMPT using HISTORY.
+If REQUIRE-MATCH is non-nil, require existing local tags.
+DEFAULT is preselected when non-nil."
+  (let ((default (or default (majutsu-tag-at-point)))
+        (payload (majutsu-tag-candidate-data)))
+    (majutsu-ref-read-multiple 'tag prompt payload history
+                               default (or require-match 'any)
+                               default-directory)))
+
+(defun majutsu-tag--read-exact-names (prompt &optional require-match)
+  "Read exact tag names with PROMPT.
+If REQUIRE-MATCH is non-nil, require existing local tag names."
+  (majutsu-tag--read-candidates prompt 'majutsu-tag-name-history require-match))
+
+(defun majutsu-tag--read-patterns (prompt)
+  "Read tag name patterns with PROMPT."
+  (majutsu-tag--read-candidates prompt 'majutsu-tag-pattern-history nil))
+
 (defun majutsu-tag--read-names (prompt)
-  "Read tag names with PROMPT.
-Allows entering both existing and new tag names."
-  (let* ((payload (majutsu-tag-candidate-data))
-         (candidates (plist-get payload :candidates)))
-    (when (fboundp 'majutsu-marginalia-prewarm-candidate-data)
-      (majutsu-marginalia-prewarm-candidate-data
-       'majutsu-tag payload nil default-directory))
-    (seq-filter (lambda (name) (not (string-empty-p name)))
-                (majutsu-completing-read-multiple
-                 prompt candidates nil nil nil nil nil 'majutsu-tag))))
+  "Compatibility wrapper around `majutsu-tag--read-patterns'."
+  (majutsu-tag--read-patterns prompt))
 
 (defun majutsu-tag--list-args ()
   "Return arguments for `jj tag list`."
@@ -147,26 +157,31 @@ With prefix ALL-REMOTES, include remote tags."
 When ALLOW-MOVE is non-nil, pass `--allow-move'."
   (interactive
    (let* ((default-revision (or (magit-section-value-if 'jj-commit) "@"))
-          (names (majutsu-tag--read-names "Set tag(s)"))
-          (revision (majutsu-read-string "Target revision" nil nil default-revision))
+          (names (majutsu-tag--read-exact-names "Set tag(s)"))
+          (revision (majutsu-read-revset "Target revision" default-revision))
           (allow-move current-prefix-arg))
      (list names revision allow-move)))
   (when names
-    (let ((args (append '("tag" "set")
-                        (and allow-move '("--allow-move"))
-                        (list "-r" revision)
-                        names)))
-      (when (zerop (apply #'majutsu-run-jj args))
-        (message "Set tag(s) at %s: %s" revision (string-join names ", "))))))
+    (when (zerop (majutsu-run-jj "tag" "set"
+                                 (and allow-move '("--allow-move"))
+                                 "-r" revision
+                                 names))
+      (message "Set tag(s) at %s: %s" revision (string-join names ", ")))))
 
 ;;;###autoload
 (defun majutsu-tag-delete (names)
   "Delete tag NAMES.
 NAMES are passed as jj string patterns."
   (interactive
-   (list (majutsu-tag--read-names "Delete tag(s)/pattern(s)")))
+   (let ((names (majutsu-tag--read-patterns "Delete tag(s)/pattern(s)")))
+     (when names
+       (unless (majutsu-confirm
+                'tag-delete
+                (format "Delete tag(s) %s? " (string-join names ", ")))
+         (user-error "Delete canceled")))
+     (list names)))
   (when names
-    (when (zerop (apply #'majutsu-run-jj (append '("tag" "delete") names)))
+    (when (zerop (majutsu-run-jj "tag" "delete" names))
       (message "Deleted tag(s): %s" (string-join names ", ")))))
 
 ;;;###autoload
@@ -174,16 +189,9 @@ NAMES are passed as jj string patterns."
   "Move existing tag NAMES to REVISION.
 This is a convenience wrapper around `jj tag set --allow-move'."
   (interactive
-   (let* ((payload (majutsu-tag-candidate-data))
-          (existing (plist-get payload :candidates))
-          (default-revision (or (magit-section-value-if 'jj-commit) "@"))
-          (_ (when (fboundp 'majutsu-marginalia-prewarm-candidate-data)
-               (majutsu-marginalia-prewarm-candidate-data
-                'majutsu-tag payload nil default-directory)))
-          (names (seq-filter (lambda (name) (not (string-empty-p name)))
-                             (majutsu-completing-read-multiple
-                              "Move tag(s)" existing nil t nil nil nil 'majutsu-tag)))
-          (revision (majutsu-read-string "Target revision" nil nil default-revision)))
+   (let* ((default-revision (or (magit-section-value-if 'jj-commit) "@"))
+          (names (majutsu-tag--read-exact-names "Move tag(s)" t))
+          (revision (majutsu-read-revset "Target revision" default-revision)))
      (list names revision)))
   (majutsu-tag-set names revision t))
 
@@ -192,18 +200,14 @@ This is a convenience wrapper around `jj tag set --allow-move'."
   "Internal transient for jj tag operations."
   :transient-non-suffix t
   ["Tag Operations"
-   [
-    ("l" "List tags" majutsu-tag-list
+   [("l" "List tags" majutsu-tag-list
      :description "Show tag list")]
-   [
-    ("s" "Set tag(s)" majutsu-tag-set
+   [("s" "Set tag(s)" majutsu-tag-set
      :description "Create/update tag(s)")
     ("m" "Move tag(s)" majutsu-tag-move
      :description "Move existing tags")]
-   [
-    ("d" "Delete tag(s)" majutsu-tag-delete
-     :description "Delete tag(s)")]
-   [("q" "Quit" transient-quit-one)]])
+   [("d" "Delete tag(s)" majutsu-tag-delete
+     :description "Delete tag(s)")]])
 
 ;;; _
 (provide 'majutsu-tag)

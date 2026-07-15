@@ -21,9 +21,6 @@
 (defclass majutsu-restore-option (majutsu-selection-option)
   ())
 
-(defclass majutsu-restore--toggle-option (majutsu-selection-toggle-option)
-  ((if-not :initform #'majutsu-interactive-selection-available-p)))
-
 ;;; Abandon
 
 ;;;###autoload
@@ -46,12 +43,12 @@
 
 (defun majutsu-restore--default-args ()
   "Return default args from diff buffer context."
-  (with-current-buffer (majutsu-interactive--selection-buffer)
-    (when (derived-mode-p 'majutsu-diff-mode)
-      (mapcar (##if (string-prefix-p "--revisions=" %)
-                    (concat "--changes-in=" (substring % 12))
-                    %)
-              majutsu-buffer-diff-range))))
+  (when (derived-mode-p 'majutsu-diff-mode)
+    (mapcar (lambda (arg)
+              (if-let* ((rev (transient-arg-value "--revisions=" (list arg))))
+                  (concat "--changes-in=" rev)
+                arg))
+            majutsu-buffer-diff-range)))
 
 ;;;###autoload
 (defun majutsu-restore-dwim ()
@@ -65,23 +62,27 @@ In diff buffer on a file section, restore only that file."
       (when (yes-or-no-p "Discard all working copy changes? ")
         (majutsu-run-jj "restore")))))
 
-(defun majutsu-restore-execute (args)
+;;;###autoload(autoload 'majutsu-restore-execute "majutsu-restore" nil t)
+(transient-define-suffix majutsu-restore-execute (args)
   "Execute jj restore with ARGS from the transient."
+  :description "Execute restore"
+  :class 'majutsu-transient-default-action-suffix
   (interactive (list (transient-args 'majutsu-restore)))
-  (let* ((selection-buf (majutsu-interactive--selection-buffer))
-         (patch (majutsu-interactive-build-patch-if-selected selection-buf t t))
-         (args (if patch
-                   (seq-remove (lambda (arg)
-                                 (or (string= arg "--interactive")
-                                     (string-prefix-p "--tool=" arg)))
-                               args)
-                 args)))
+  (pcase-let* ((`(,args ,filesets) (majutsu-filesets-split-transient-value args))
+               (patch (majutsu-interactive-build-patch-if-selected nil t t))
+               (args (if patch
+                         (seq-remove (lambda (arg)
+                                       (or (string= arg "--interactive")
+                                           (transient-arg-value "--tool=" (list arg))))
+                                     args)
+                       args)))
     (if patch
         (progn
-          (majutsu-interactive-run-with-patch "restore" args patch)
-          (with-current-buffer selection-buf
-            (majutsu-interactive-clear)))
-      (let ((exit (apply #'majutsu-run-jj "restore" args)))
+          (majutsu-interactive-run-with-patch "restore" args filesets patch)
+          (majutsu-interactive-clear))
+      (let ((exit (apply #'majutsu-run-jj
+                         "restore"
+                         (majutsu-jj-append-filesets args filesets))))
         (when (zerop exit)
           (message "Restored successfully"))))))
 
@@ -92,45 +93,33 @@ In diff buffer on a file section, restore only that file."
   :class 'majutsu-restore-option
   :selection-label "[FROM]"
   :selection-face '(:background "dark orange" :foreground "black")
-  :key "-f"
+  :selection-toggle-key "f"
+  :selection-toggle-if-not #'majutsu-interactive-selection-available-p
+  :shortarg "-f"
   :argument "--from="
-  :reader #'majutsu-diff--transient-read-revset)
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-restore:--to ()
   :description "To"
   :class 'majutsu-restore-option
   :selection-label "[TO]"
   :selection-face '(:background "dark cyan" :foreground "white")
-  :key "-t"
+  :selection-toggle-key "t"
+  :selection-toggle-if-not #'majutsu-interactive-selection-available-p
+  :shortarg "-t"
   :argument "--to="
-  :reader #'majutsu-diff--transient-read-revset)
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-restore:--changes-in ()
   :description "Changes in"
   :class 'majutsu-restore-option
   :selection-label "[CHANGES-IN]"
   :selection-face '(:background "dark magenta" :foreground "white")
-  :key "-c"
+  :selection-toggle-key "c"
+  :selection-toggle-if-not #'majutsu-interactive-selection-available-p
+  :shortarg "-c"
   :argument "--changes-in="
-  :reader #'majutsu-diff--transient-read-revset)
-
-(transient-define-argument majutsu-restore:from ()
-  :description "From (toggle at point)"
-  :class 'majutsu-restore--toggle-option
-  :key "f"
-  :argument "--from=")
-
-(transient-define-argument majutsu-restore:to ()
-  :description "To (toggle at point)"
-  :class 'majutsu-restore--toggle-option
-  :key "t"
-  :argument "--to=")
-
-(transient-define-argument majutsu-restore:changes-in ()
-  :description "Changes-in (toggle at point)"
-  :class 'majutsu-restore--toggle-option
-  :key "c"
-  :argument "--changes-in=")
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-restore:-- ()
   :description "Limit to files"
@@ -147,18 +136,16 @@ In diff buffer on a file section, restore only that file."
 (transient-define-prefix majutsu-restore ()
   "Transient for jj restore operations."
   :man-page "jj-restore"
+  :description "JJ Restore"
+  :class 'majutsu-jj-transient-prefix
+  :jj-command "restore"
   :incompatible '(("--from=" "--changes-in=")
                   ("--to=" "--changes-in="))
   :transient-non-suffix t
-  [
-   :description "JJ Restore"
-   ["Selection"
+  [["Selection"
     (majutsu-restore:--from)
     (majutsu-restore:--to)
     (majutsu-restore:--changes-in)
-    (majutsu-restore:from)
-    (majutsu-restore:to)
-    (majutsu-restore:changes-in)
     ("x" "Clear selections" majutsu-selection-clear :transient t)]
    ["Patch Selection" :if majutsu-interactive-selection-available-p
     (majutsu-interactive:select-hunk)
@@ -168,12 +155,11 @@ In diff buffer on a file section, restore only that file."
    ["Paths" :if-not majutsu-interactive-selection-available-p
     (majutsu-restore:--)]
    ["Options"
-    ("-i" "Interactive" "--interactive")
+    ("-i" "Interactive" ("-i" "--interactive"))
     ("-d" "Restore descendants" "--restore-descendants")
     (majutsu-transient-arg-ignore-immutable)]
    ["Actions"
-    ("r" "Restore" majutsu-restore-execute)
-    ("q" "Quit" transient-quit-one)]]
+    ("r" "Execute restore" majutsu-restore-execute)]]
   (interactive)
   (let* ((file (majutsu-file-at-point))
          (files (cond
@@ -181,9 +167,7 @@ In diff buffer on a file section, restore only that file."
                  ((and (derived-mode-p 'majutsu-diff-mode) majutsu-buffer-diff-filesets)
                   majutsu-buffer-diff-filesets)))
          (default-args (majutsu-restore--default-args))
-         (value (if files
-                    (append default-args (list (cons "--" files)))
-                  default-args)))
+         (value (majutsu-filesets-build-transient-value default-args files)))
     (transient-setup
      'majutsu-restore nil nil
      :scope (majutsu-selection-session-begin)

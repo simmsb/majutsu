@@ -29,11 +29,15 @@
 (require 'majutsu-process)
 (require 'majutsu-config)
 (require 'majutsu-selection)
+(require 'majutsu-template)
+(require 'json)
 (require 'magit-diff)      ; for faces/font-lock keywords
 (require 'diff-mode)
 (require 'smerge-mode)
 
+(declare-function majutsu-read-revset "majutsu-jj" (prompt &optional default completion-args))
 (declare-function majutsu-find-file "majutsu-file" (revset path))
+(declare-function majutsu-find-file-noselect "majutsu-file" (rev file &optional revert))
 (declare-function majutsu-read-files "majutsu-file" (prompt initial-input history &optional list-fn))
 (declare-function majutsu-color-words-line-info-at-point "majutsu-color-words" ())
 (declare-function majutsu-color-words-side-at-point "majutsu-color-words" (&optional pos))
@@ -48,7 +52,9 @@
 ;;;; Diff Mode
 
 (defcustom majutsu-diff-sections-hook
-  (list #'majutsu-insert-diff
+  (list #'majutsu-insert-diff-revision-headers
+        #'majutsu-insert-diff-revision-message
+        #'majutsu-insert-diff
         ;; #'majutsu-insert-xref-buttons
         )
   "Hook run to insert sections into a `majutsu-diff-mode' buffer."
@@ -70,17 +76,27 @@
 
 (put 'majutsu-diff-refine-hunk 'permanent-local t)
 
+(defcustom majutsu-diff-fontify-hunk nil
+  "Whether to apply syntax highlighting to diff hunks.
+
+`nil'  Never fontify hunks.
+`all'  Fontify all hunks immediately.
+`t'    Fontify each hunk once it becomes the current section and keep the
+       fontification when another section is selected.  This variant exists
+       for performance reasons.
+
+This is experimental and can be slow because fontification is synchronous."
+  :group 'majutsu
+  :type '(choice (const :tag "No syntax highlighting" nil)
+          (const :tag "Immediately highlight all hunks" all)
+          (const :tag "Highlight currently selected hunk" t)))
+
+(put 'majutsu-diff-fontify-hunk 'permanent-local t)
+
 (defcustom majutsu-diff-refine-ignore-whitespace smerge-refine-ignore-whitespace
   "Whether to ignore whitespace while refining hunks."
   :group 'majutsu
   :type 'boolean)
-
-(defcustom majutsu-diff-refine-max-chars 4000
-  "Skip word refinement when a hunk spans more than this many characters.
-Set to nil to always refine."
-  :group 'majutsu
-  :type '(choice (const :tag "No limit" nil)
-          (integer :tag "Max characters")))
 
 (defcustom majutsu-diff-paint-whitespace t
   "Whether to highlight whitespace issues inside diff hunks."
@@ -191,6 +207,12 @@ These are the only arguments that are remembered per diff buffer.")
 (defvar-local majutsu-diff-backend 'git
   "Backend used to render the current diff buffer.")
 
+(defvar-local majutsu-diff--revision-metadata-cache nil
+  "Cached revision metadata for the current diff arguments.
+The value is (KEY . METADATA).  A nil METADATA value is cached too, so
+zero-match, multi-match, and failed queries are not repeated by section
+inserters during the same refresh.")
+
 (defun majutsu-diff--backend-from-args (args)
   "Return diff backend inferred from ARGS."
   (if (member "--color-words" args)
@@ -206,11 +228,6 @@ Return the resulting backend symbol."
   (when (eq majutsu-diff-backend 'color-words)
     (require 'majutsu-color-words))
   majutsu-diff-backend)
-
-(defun majutsu-diff--backend-uses-ansi-p (backend)
-  "Return non-nil when BACKEND should be ANSI-processed by process layer.
-Color-words keeps raw debug output for marker parsing and applies ANSI later."
-  (not (eq backend 'color-words)))
 
 (defun majutsu-diff--set-left-margin (width)
   "Set left margin WIDTH for the current buffer's windows."
@@ -275,37 +292,18 @@ This intentionally keeps only jj diff \"Diff Formatting Options\"."
             (push arg out))))))
     (nreverse out)))
 
-(defconst majutsu-diff--range-arg-prefixes
-  '("--revisions=" "--from=" "--to=")
-  "Prefixes for arguments that restrict the diff range.")
-
-(defun majutsu-diff--range-arg-p (arg)
-  "Return non-nil if ARG is a `jj diff' range argument."
-  (and (stringp arg)
-       (seq-some (lambda (prefix) (string-prefix-p prefix arg))
-                 majutsu-diff--range-arg-prefixes)))
-
 (defun majutsu-diff--extract-range-args (args)
   "Return the subset of ARGS that restrict `jj diff' range."
-  (seq-filter #'majutsu-diff--range-arg-p args))
-
-(defun majutsu-diff--transient-original-buffer ()
-  (and (buffer-live-p transient--original-buffer)
-       transient--original-buffer))
-
-(defun majutsu-diff--transient-default-revset ()
-  (with-current-buffer (or (majutsu-diff--transient-original-buffer)
-                           (current-buffer))
-    (or (magit-section-value-if 'jj-commit) "@")))
-
-(defun majutsu-diff--transient-read-revset (prompt initial-input _history)
-  (unless current-prefix-arg
-    (majutsu-read-revset prompt (or initial-input (majutsu-diff--transient-default-revset)))))
+  (seq-filter (lambda (arg)
+                (or (transient-arg-value "--revisions=" (list arg))
+                    (transient-arg-value "--from=" (list arg))
+                    (transient-arg-value "--to=" (list arg))))
+              args))
 
 ;;; Arguments
 ;;;; Prefix Classes
 
-(defclass majutsu-diff-prefix (transient-prefix)
+(defclass majutsu-diff-prefix (majutsu-jj-transient-prefix)
   ((history-key :initform 'majutsu-diff)
    (major-mode :initform 'majutsu-diff-mode)))
 
@@ -317,9 +315,9 @@ This intentionally keeps only jj diff \"Diff Formatting Options\"."
   (pcase-let ((`(,args ,range ,filesets)
                (majutsu-diff--get-value (oref obj major-mode) 'prefix)))
     (oset obj value
-          (if filesets
-              `(("--" ,@filesets) ,@range ,@args)
-            (append range args)))))
+          (majutsu-filesets-build-transient-value
+           (append range args)
+           filesets))))
 
 (cl-defmethod transient-prefix-value ((obj majutsu-diff-prefix))
   "Return (ARGS RANGE FILESETS) for the Majutsu diff transient.
@@ -327,32 +325,36 @@ This intentionally keeps only jj diff \"Diff Formatting Options\"."
 ARGS are remembered diff formatting arguments.  RANGE is a list of jj
 diff range arguments derived from `-r' or `--from/--to'.  FILESETS is a
 list of filesets (path filters)."
-  (let* ((raw (cl-call-next-method obj))
-         (args (majutsu-diff--remembered-args raw))
-         (range (majutsu-diff--extract-range-args raw))
-         (filesets (cdr (assoc "--" raw))))
+  (pcase-let* ((`(,raw ,filesets)
+                (majutsu-filesets-split-transient-value
+                 (cl-call-next-method obj)))
+               (args (majutsu-diff--remembered-args raw))
+               (range (majutsu-diff--extract-range-args raw)))
     (list args range filesets)))
 
 (cl-defmethod transient-set-value ((obj majutsu-diff-prefix))
   (let* ((obj (oref obj prototype))
-         (mode (or (oref obj major-mode) major-mode))
-         (args (car (transient-args (oref obj command)))))
-    (put mode 'majutsu-diff-current-arguments args)
-    (transient--history-push obj)
-    (when (eq major-mode mode)
-      (majutsu-diff--set-buffer-args args))))
+         (mode (or (oref obj major-mode) major-mode)))
+    (pcase-let ((`(,args ,range ,filesets) (transient-args (oref obj command))))
+      (majutsu-diff--set-value mode args range filesets)
+      (transient--history-push obj))))
 
 (cl-defmethod transient-save-value ((obj majutsu-diff-prefix))
   (let* ((obj (oref obj prototype))
-         (mode (or (oref obj major-mode) major-mode))
-         (key (intern (format "majutsu-diff:%s" mode)))
-         (args (car (transient-args (oref obj command)))))
-    (put mode 'majutsu-diff-current-arguments args)
-    (setf (alist-get key transient-values) args)
-    (transient-save-values)
-    (transient--history-push obj)
-    (when (eq major-mode mode)
-      (majutsu-diff--set-buffer-args args))))
+         (mode (or (oref obj major-mode) major-mode)))
+    (pcase-let ((`(,args ,range ,filesets) (transient-args (oref obj command))))
+      (majutsu-diff--set-value mode args range filesets t)
+      (transient--history-push obj))))
+
+(cl-defmethod majutsu-transient--save-repository-defaults ((obj majutsu-diff-prefix))
+  (let* ((obj (oref obj prototype))
+         (mode (or (oref obj major-mode) major-mode)))
+    (pcase-let ((`(,args ,range ,filesets) (transient-args (oref obj command))))
+      (majutsu-transient-save-repository-value 'majutsu-diff mode args)
+      (when (eq major-mode mode)
+        (majutsu-diff--set-value mode args range filesets))
+      (transient--history-push obj)
+      (message "Saved diff arguments as repository defaults"))))
 
 ;;;; Argument Access
 
@@ -378,25 +380,43 @@ list of filesets (path filters)."
                       (when-let* ((buf (majutsu--get-mode-buffer
                                         mode (eq use-buffer-args 'selected))))
                         (buffer-local-value 'majutsu-buffer-diff-args buf))))
-                ((plist-member (symbol-plist mode) 'majutsu-diff-current-arguments)
-                 (get mode 'majutsu-diff-current-arguments))
-                ((when-let* ((elt (assq (intern (format "majutsu-diff:%s" mode))
-                                        transient-values)))
-                   (cdr elt)))
                 (t
-                 (get mode 'majutsu-diff-default-arguments))))
+                 (majutsu-transient-default-value
+                  'majutsu-diff mode
+                  'majutsu-diff-current-arguments
+                  'majutsu-diff-default-arguments))))
          (range (and use-current majutsu-buffer-diff-range))
          (filesets (and use-current majutsu-buffer-diff-filesets)))
     (list args range filesets)))
 
-;; FIXME: 不应该存在
-(defun majutsu-diff--set-buffer-args (args &optional _filesets _refresh)
+(defun majutsu-diff--set-value (mode args range filesets &optional save)
+  "Set current diff values for MODE.
+
+When SAVE is non-nil, also persist ARGS using `transient-values'."
+  (setq args (or (majutsu-diff--remembered-args args)
+                 (get mode 'majutsu-diff-default-arguments)))
+  (if-let* ((config-id (majutsu-repository-config-id)))
+      (majutsu-transient-put-repository-current-value
+       'majutsu-diff mode args config-id)
+    (put mode 'majutsu-diff-current-arguments args))
+  (when save
+    (setf (alist-get (majutsu-transient-global-default-key 'majutsu-diff mode)
+                     transient-values)
+          args)
+    (transient-save-values))
+  (when (eq major-mode mode)
+    (setq-local majutsu-buffer-diff-args args)
+    (setq-local majutsu-buffer-diff-range range)
+    (setq-local majutsu-buffer-diff-filesets filesets)
+    (majutsu-diff--sync-backend majutsu-buffer-diff-args))
+  nil)
+
+(defun majutsu-diff--set-buffer-args (args)
   "Set current buffer's remembered diff formatting ARGS."
-  (setq-local majutsu-buffer-diff-args
-              (or (majutsu-diff--remembered-args args)
-                  (get 'majutsu-diff-mode 'majutsu-diff-default-arguments)))
-  (majutsu-diff--sync-backend majutsu-buffer-diff-args)
-  (put 'majutsu-diff-mode 'majutsu-diff-current-arguments majutsu-buffer-diff-args))
+  (majutsu-diff--set-value 'majutsu-diff-mode
+                           args
+                           majutsu-buffer-diff-range
+                           majutsu-buffer-diff-filesets))
 
 (defun majutsu-diff-arguments (&optional mode)
   "Return the current diff arguments.
@@ -420,15 +440,272 @@ The returned value is a (ARGS RANGE FILESETS) triple."
           "\\(?: +\\(\\+*\\)\\(-*\\)\\)?$") ; add/del graph (optional)
   "Regexp matching `jj diff --stat` entries, modeled after Magit's statline.")
 
-(defun majutsu-diff--collect-diff-files ()
-  "Return a list of file paths from \"diff --git\" headers in the buffer.
-The list is in the same order as the diff headers appear."
+(defconst majutsu-diff--file-metadata-template
+  (majutsu-template-compile
+   ["[" [:json [:status]]
+    "," [:json [:source :path]]
+    "," [:json [:target :path]] "]\n"]
+   'TreeDiffEntry)
+  "Template for unambiguous machine-readable diff entry metadata.")
+
+(defvar majutsu-diff--active-file-metadata nil
+  "Structured file metadata matching the Git diff currently being washed.")
+
+(defvar majutsu-diff--file-metadata-queue nil
+  "Remaining structured entries while Git file sections are being washed.")
+
+(defvar-local majutsu-diff--file-metadata-by-section nil
+  "Hash table mapping Git-format patch sections to structured metadata.")
+
+(defun majutsu-diff--parse-file-metadata-line (line)
+  "Parse one JSON diff metadata LINE into a plist, or return nil."
+  (condition-case nil
+      (pcase (json-parse-string line
+                                :array-type 'list
+                                :null-object nil
+                                :false-object nil)
+        (`(,status ,source ,target)
+         (when (and (stringp status)
+                    (stringp source)
+                    (stringp target))
+           (list :status status
+                 :source source
+                 :target target))))
+    (error nil)))
+
+(defun majutsu-diff--parse-file-metadata-output (output)
+  "Parse newline-delimited JSON diff metadata OUTPUT.
+Ignore malformed records."
+  (delq nil
+        (mapcar #'majutsu-diff--parse-file-metadata-line
+                (split-string (or output "") "\n" t))))
+
+(defun majutsu-diff--query-file-metadata (range filesets)
+  "Return structured metadata for diff RANGE and FILESETS, or nil on failure.
+The caller must already have snapshotted the main diff; this query uses
+`--ignore-working-copy' to read that same state."
+  (let ((args (majutsu-jj-append-filesets
+               (append (list "--ignore-working-copy"
+                             "diff" "-T" majutsu-diff--file-metadata-template)
+                       range)
+               filesets)))
+    (condition-case nil
+        (majutsu--with-no-color
+          (with-temp-buffer
+            (when (zerop (apply #'majutsu-jj-insert args))
+              (majutsu-diff--parse-file-metadata-output (buffer-string)))))
+      (error nil))))
+
+(defun majutsu-diff--raw-git-file-headers ()
+  "Return raw Git file header blocks in the current narrowed buffer."
   (save-excursion
     (goto-char (point-min))
-    (let (files)
-      (while (re-search-forward "^diff --git a/\\(.*\\) b/\\(.*\\)$" nil t)
-        (push (match-string-no-properties 2) files))
-      (nreverse files))))
+    (let (headers)
+      (while (re-search-forward "^diff --git " nil t)
+        (let ((beg (match-beginning 0)))
+          (forward-line 1)
+          (let ((end (or (save-excursion
+                           (when (re-search-forward
+                                  "^\\(?:diff --git \\|@@ \\)" nil t)
+                             (match-beginning 0)))
+                         (point-max))))
+            (push (buffer-substring-no-properties beg end) headers)
+            (goto-char end))))
+      (nreverse headers))))
+
+(defun majutsu-diff--set-section-path (section path)
+  "Set real file SECTION and its hunk identities to exact PATH."
+  (oset section value path)
+  (dolist (child (oref section children))
+    (when (magit-section-match 'jj-hunk child)
+      (let ((value (oref child value)))
+        (when (consp value)
+          (oset child value (cons path (cdr value))))))))
+
+(defun majutsu-diff--read-git-quoted-token (token)
+  "Decode one C-quoted Git path at the start of TOKEN.
+Return (VALUE . END), where END is the first position after the closing quote,
+or nil for malformed input."
+  (when (string-prefix-p "\"" token)
+    (catch 'done
+      (let ((index 1)
+            bytes)
+        (cl-labels
+            ((push-char
+              (char)
+              (dolist (byte (string-to-list
+                             (encode-coding-string (string char) 'utf-8 t)))
+                (push byte bytes))))
+          (while (< index (length token))
+            (let ((char (aref token index)))
+              (setq index (1+ index))
+              (cond
+               ((= char ?\")
+                (let ((raw (apply #'unibyte-string (nreverse bytes))))
+                  (throw 'done
+                         (cons (decode-coding-string raw 'utf-8 t) index))))
+               ((/= char ?\\)
+                (push-char char))
+               ((>= index (length token))
+                (throw 'done nil))
+               (t
+                (let ((escaped (aref token index)))
+                  (cond
+                   ((and (>= escaped ?0) (<= escaped ?7))
+                    (let ((start index)
+                          (count 0))
+                      (while (and (< index (length token))
+                                  (< count 3)
+                                  (>= (aref token index) ?0)
+                                  (<= (aref token index) ?7))
+                        (setq index (1+ index)
+                              count (1+ count)))
+                      (let ((byte (string-to-number
+                                   (substring token start index) 8)))
+                        (when (> byte 255)
+                          (throw 'done nil))
+                        (push byte bytes))))
+                   (t
+                    (setq index (1+ index))
+                    (let ((byte (cdr (assq escaped
+                                           '((?a . 7) (?b . 8) (?t . 9)
+                                             (?n . 10) (?v . 11) (?f . 12)
+                                             (?r . 13) (?\" . 34) (?\\ . 92))))))
+                      (unless byte
+                        (throw 'done nil))
+                      (push byte bytes))))))))))
+        nil))))
+
+(defun majutsu-diff--git-quoted-token-value (token)
+  "Decode a complete quoted Git path TOKEN, or return nil."
+  (pcase (majutsu-diff--read-git-quoted-token token)
+    (`(,value . ,end)
+     (and (= end (length token)) value))))
+
+(defun majutsu-diff--git-token-matches-p (token expected)
+  "Return non-nil when Git path TOKEN represents EXPECTED."
+  (or (equal token expected)
+      (equal (majutsu-diff--git-quoted-token-value token) expected)))
+
+(defun majutsu-diff--git-header-paths-match-p (header entry)
+  "Return non-nil when Git diff HEADER paths match structured ENTRY.
+ENTRY remains the source of truth; this only rejects a stale or reordered
+metadata result."
+  (let* ((header (or header ""))
+         (left (concat "a/" (plist-get entry :source)))
+         (right (concat "b/" (plist-get entry :target)))
+         (raw (concat left " " right)))
+    (or (string-prefix-p (concat "diff --git " raw "\n") header)
+        (when-let* ((line (car (split-string header "\n")))
+                    ((string-prefix-p "diff --git " line)))
+          (let ((payload (string-remove-prefix "diff --git " line)))
+            (or (equal payload raw)
+          ;; If the left token is raw, its exact structured value tells us
+          ;; where the otherwise ambiguous separator must be.
+                (and (string-prefix-p (concat left " ") payload)
+                     (majutsu-diff--git-token-matches-p
+                      (substring payload (1+ (length left))) right))
+          ;; A quoted left token is self-delimiting; decode it and validate the
+          ;; complete remaining token independently.
+                (and (string-prefix-p "\"" payload)
+                     (pcase (majutsu-diff--read-git-quoted-token payload)
+                       (`(,value . ,end)
+                        (and (equal value left)
+                             (< end (length payload))
+                             (= (aref payload end) ?\s)
+                             (majutsu-diff--git-token-matches-p
+                              (substring payload (1+ end)) right)))))))))))
+
+(defun majutsu-diff--git-header-status-match-p (header status)
+  "Return non-nil when extended Git HEADER agrees with structured STATUS."
+  (let ((added (or (string-match-p "^new file mode " header)
+                   (string-match-p "^--- /dev/null$" header)))
+        (removed (or (string-match-p "^deleted file mode " header)
+                     (string-match-p "^+++ /dev/null$" header)))
+        (renamed (and (string-match-p "^rename from " header)
+                      (string-match-p "^rename to " header)))
+        (copied (and (string-match-p "^copy from " header)
+                     (string-match-p "^copy to " header))))
+    (pcase status
+      ("added" added)
+      ("removed" removed)
+      ("renamed" renamed)
+      ("copied" copied)
+      ("modified" (not (or added removed renamed copied)))
+      (_ nil))))
+
+(defun majutsu-diff--file-metadata-matches-section-p (entry section)
+  "Return non-nil when structured ENTRY is consistent with file SECTION."
+  (let ((header (oref section header)))
+    (and (majutsu-diff--git-header-paths-match-p header entry)
+         (majutsu-diff--git-header-status-match-p
+         header (plist-get entry :status)))))
+
+(defun majutsu-diff--raw-file-metadata-consistent-p (metadata)
+  "Return non-nil when ordered METADATA agrees with the raw Git file headers.
+The check covers file count, order, paths, and operation status."
+  (let ((headers (majutsu-diff--raw-git-file-headers)))
+    (and metadata
+         (= (length headers) (length metadata))
+         (cl-every
+          #'identity
+          (cl-mapcar
+           (lambda (entry header)
+             (and (majutsu-diff--git-header-paths-match-p header entry)
+                  (majutsu-diff--git-header-status-match-p
+                   header (plist-get entry :status))))
+           metadata headers)))))
+
+(defun majutsu-diff--attach-file-metadata (metadata)
+  "Attach ordered structured METADATA to washed file sections.
+Fail closed unless section count, order, paths, and operation statuses all
+agree with the structured metadata."
+  (setq majutsu-diff--file-metadata-by-section (make-hash-table :test #'eq))
+  (let ((root (or (bound-and-true-p magit-insert-section--current)
+                  magit-root-section))
+        real-files stat-files)
+    (when root
+      (magit-map-sections
+       (lambda (section)
+         (when (magit-section-match 'jj-file section)
+           (if (oref section header)
+               (push section real-files)
+             (push section stat-files))))
+       root))
+    (setq real-files (nreverse real-files)
+          stat-files (nreverse stat-files))
+    (when (and metadata
+               (= (length real-files) (length metadata))
+               (cl-every #'identity
+                         (cl-mapcar #'majutsu-diff--file-metadata-matches-section-p
+                                    metadata real-files)))
+      (cl-mapc
+       (lambda (section entry)
+         (majutsu-diff--set-section-path section (plist-get entry :target))
+         (puthash section entry majutsu-diff--file-metadata-by-section))
+       real-files metadata)
+      (when (= (length stat-files) (length metadata))
+        (cl-mapc (lambda (section entry)
+                   (oset section value (plist-get entry :target)))
+                 stat-files metadata)))))
+
+(defun majutsu-diff-file-metadata (section)
+  "Return structured metadata attached to file SECTION, or nil."
+  (and majutsu-diff--file-metadata-by-section
+       (gethash section majutsu-diff--file-metadata-by-section)))
+
+(defun majutsu-diff--collect-diff-files ()
+  "Return file paths in the order they appear in the current diff.
+Prefer active structured metadata; otherwise fall back to simple
+unquoted `diff --git' headers."
+  (or (mapcar (lambda (entry) (plist-get entry :target))
+              majutsu-diff--active-file-metadata)
+      (save-excursion
+        (goto-char (point-min))
+        (let (files)
+          (while (re-search-forward "^diff --git a/\\(.*\\) b/\\(.*\\)$" nil t)
+            (push (match-string-no-properties 2) files))
+          (nreverse files)))))
 
 (defun majutsu-jump-to-diffstat-or-diff (&optional expand)
   "Jump to the diffstat or diff.
@@ -510,17 +787,314 @@ ARGS are the diff arguments used to produce DIFF-OUTPUT."
       (goto-char (point-min))
       (majutsu-diff-wash-diffs args))))
 
+(defconst majutsu-diff--revision-metadata-field-count 11
+  "Number of tokens emitted in each revision metadata record.")
+
+(defconst majutsu-diff--revision-metadata-separator (string 0)
+  "NUL separator between encoded revision metadata tokens.")
+
+(defconst majutsu-diff--revision-metadata-template
+  (majutsu-template-compile
+   `[:concat
+     [:join ,majutsu-diff--revision-metadata-separator
+            [:label "change_id" [:json [:change_id]]]
+            [:label "local_bookmarks map join name"
+                    [:json [:local_bookmarks :map [:|ref| [:name]]]]]
+            [:label "remote_bookmarks map join name remote"
+                    [:concat
+                     "["
+                     [:remote_bookmarks
+                      :map [:|ref|
+                            [:concat "[" [:json [:name]] "," [:json [:remote]] "]"]]
+                      :join ","]
+                     "]"]]
+            [:label "commit_id" [:json [:commit_id]]]
+            [:label "author name" [:json [:author :name]]]
+            [:label "author email" [:json [:author :email]]]
+            [:label "author timestamp format"
+                    [:json [:author :timestamp :format "%a %b %e %T %Y %z"]]]
+            [:label "committer name" [:json [:committer :name]]]
+            [:label "committer email" [:json [:committer :email]]]
+            [:label "committer timestamp format"
+                    [:json [:committer :timestamp :format "%a %b %e %T %Y %z"]]]
+            [:label "description" [:json [:description]]]]
+     ,majutsu-diff--revision-metadata-separator]
+   'Commit)
+  "Template for labelled, unambiguous revision metadata tokens.")
+
+(defun majutsu-diff--range-option (long &optional short)
+  "Return LONG (or SHORT) option value from the current diff range.
+Both `--option=VALUE' and the two-argument `--option VALUE' forms are
+accepted.  Return the symbol `missing' when the option is absent, and an
+empty string when it is present without a value."
+  (let ((args majutsu-buffer-diff-range)
+        (value 'missing))
+    (while (and args (eq value 'missing))
+      (let ((arg (pop args)))
+        (cond
+         ((or (equal arg long) (and short (equal arg short)))
+          (setq value (if (and args (stringp (car args)))
+                          (pop args)
+                        "")))
+         ((and (stringp arg)
+               (string-prefix-p (concat long "=") arg))
+          (setq value (substring arg (1+ (length long))))))))
+    value))
+
+(defun majutsu-diff--metadata-revision ()
+  "Return the revision eligible for display metadata, or nil.
+Metadata is only appropriate for a single-revision change diff: the
+project default (working-copy revision `@') or an explicit `-r' /
+`--revisions' revset.  Explicit `--from' or `--to' ranges never qualify;
+the metadata query later rejects revsets resolving to zero or many changes."
+  (let ((from (majutsu-diff--range-option "--from"))
+        (to (majutsu-diff--range-option "--to"))
+        (revisions (majutsu-diff--range-option "--revisions" "-r")))
+    (cond
+     ((or (not (eq from 'missing)) (not (eq to 'missing))) nil)
+     ((null majutsu-buffer-diff-range) "@")
+     ((and (stringp revisions) (not (string-empty-p revisions))) revisions)
+     (t nil))))
+
+(defun majutsu-diff--presentation-properties (value)
+  "Return face properties at the beginning of string VALUE."
+  (when (and (stringp value) (not (string-empty-p value)))
+    (let ((face (get-text-property 0 'face value))
+          (font-lock-face (get-text-property 0 'font-lock-face value)))
+      (append (and face (list 'face face))
+              (and font-lock-face (list 'font-lock-face font-lock-face))))))
+
+(defun majutsu-diff--apply-presentation-properties (value properties)
+  "Apply PROPERTIES recursively to strings in JSON VALUE."
+  (cond
+   ((stringp value)
+    (when (and properties (not (string-empty-p value)))
+      (add-text-properties 0 (length value) properties value))
+    value)
+   ((vectorp value)
+    (dotimes (index (length value))
+      (aset value index
+            (majutsu-diff--apply-presentation-properties
+             (aref value index) properties)))
+    value)
+   (t value)))
+
+(defun majutsu-diff--decode-metadata-token (token)
+  "Decode one labelled JSON TOKEN and transfer its presentation properties."
+  (let ((properties (majutsu-diff--presentation-properties token))
+        (decoded (json-parse-string (substring-no-properties token)
+                                    :array-type 'array
+                                    :null-object :null)))
+    (majutsu-diff--apply-presentation-properties decoded properties)))
+
+(defun majutsu-diff--parse-revision-metadata (output)
+  "Parse one NUL-framed revision metadata record from OUTPUT.
+Return a plist, or nil for malformed output and revsets resolving to zero
+or multiple changes.  Each field is JSON, so NUL, terminal escapes, and other
+control characters remain data while externally applied jj labels survive as
+Emacs presentation properties."
+  (condition-case nil
+      (let* ((ansi-color-apply-face-function
+              #'ansi-color-apply-text-property-face)
+             (colored (ansi-color-apply (or output "")))
+             (tokens (majutsu--split-fields
+                      colored majutsu-diff--revision-metadata-separator)))
+        (when (and (= (length tokens)
+                      (1+ majutsu-diff--revision-metadata-field-count))
+                   (string-empty-p (car (last tokens))))
+          (let ((record
+                 (vconcat
+                  (mapcar #'majutsu-diff--decode-metadata-token
+                          (butlast tokens)))))
+            (pcase-let ((`[,change-id ,local ,remote ,commit-id
+                           ,author-name ,author-email ,author-date
+                           ,committer-name ,committer-email ,committer-date
+                           ,description]
+                         record))
+              (when (and (seq-every-p
+                          #'stringp
+                          (list change-id commit-id
+                                author-name author-email author-date
+                                committer-name committer-email committer-date
+                                description))
+                         (vectorp local)
+                         (seq-every-p #'stringp local)
+                         (vectorp remote)
+                         (seq-every-p
+                          (lambda (pair)
+                            (and (vectorp pair)
+                                 (= (length pair) 2)
+                                 (stringp (aref pair 0))
+                                 (stringp (aref pair 1))))
+                          remote))
+                (list :change-id change-id
+                      :local-bookmarks (append local nil)
+                      :remote-bookmarks
+                      (mapcar (lambda (pair) (append pair nil)) remote)
+                      :commit-id commit-id
+                      :author-name author-name
+                      :author-email author-email
+                      :author-date author-date
+                      :committer-name committer-name
+                      :committer-email committer-email
+                      :committer-date committer-date
+                      :description description))))))
+    (error nil)))
+
+(defun majutsu-diff--query-revision-metadata (rev)
+  "Query all display metadata for REV with one `jj log' invocation.
+Return nil if the command fails or REV does not resolve to exactly one
+change."
+  (let ((majutsu-jj-global-arguments
+         (cons "--color=always"
+               (seq-remove (lambda (arg) (string-prefix-p "--color" arg))
+                           majutsu-jj-global-arguments))))
+    (condition-case nil
+        (with-temp-buffer
+          (when (zerop (majutsu-jj-insert
+                        "log" "--no-graph" "--limit" "2"
+                        "-r" rev "-T"
+                        majutsu-diff--revision-metadata-template))
+            (majutsu-diff--parse-revision-metadata (buffer-string))))
+      (error nil))))
+
+(defun majutsu-diff--revision-metadata ()
+  "Return cached metadata for the current single-revision diff.
+The cache key includes formatting arguments, range arguments, and the
+selected revision.  Consequently changing any diff argument or revision
+invalidates the cache while the two metadata section inserters share one
+query."
+  (let* ((rev (majutsu-diff--metadata-revision))
+         (key (list (copy-sequence majutsu-buffer-diff-args)
+                    (copy-sequence majutsu-buffer-diff-range)
+                    rev)))
+    (if (and majutsu-diff--revision-metadata-cache
+             (equal key (car majutsu-diff--revision-metadata-cache)))
+        (cdr majutsu-diff--revision-metadata-cache)
+      (let ((metadata (and rev (majutsu-diff--query-revision-metadata rev))))
+        (setq majutsu-diff--revision-metadata-cache (cons key metadata))
+        metadata))))
+
+(defun majutsu-diff--propertize-ref (ref face)
+  "Return REF propertized like a Magit ref label using FACE."
+  (let* ((properties (majutsu-diff--presentation-properties ref))
+         (display
+          (apply #'concat
+                 (mapcar
+                  (lambda (char)
+                    (pcase char
+                      (?\\ "\\\\")
+                      (?\n "\\n")
+                      (?\r "\\r")
+                      (?\t "\\t")
+                      ((pred (lambda (value)
+                               (or (< value 32) (= value 127))))
+                       (format "\\x%02X" char))
+                      (_ (char-to-string char))))
+                  (string-to-list ref)))))
+    (when (not (string-empty-p display))
+      (add-text-properties
+       0 (length display)
+       (append (or properties (list 'font-lock-face face))
+               (list 'help-echo (substring-no-properties ref)))
+       display))
+    display))
+
+(defun majutsu-diff--with-fallback-face (value face)
+  "Return VALUE with FACE unless it already has presentation properties."
+  (if (or (not (stringp value))
+          (string-empty-p value)
+          (majutsu-diff--presentation-properties value))
+      value
+    (propertize value 'font-lock-face face)))
+
+(defun majutsu-diff--format-refs (fields)
+  "Return Magit-style local and remote ref labels from FIELDS.
+The synthetic `git' remote used by jj's Git backend is omitted."
+  (string-join
+   (delete-dups
+    (append
+     (mapcar (lambda (ref)
+               (majutsu-diff--propertize-ref ref 'magit-branch-local))
+             (plist-get fields :local-bookmarks))
+     (delq nil
+           (mapcar
+            (lambda (ref)
+              (pcase-let ((`(,name ,remote) ref))
+                (unless (string= remote "git")
+                  (majutsu-diff--propertize-ref
+                   (format "%s/%s" remote name)
+                   'magit-branch-remote))))
+            (plist-get fields :remote-bookmarks)))))
+   " "))
+
+(defun majutsu-insert-diff-revision-headers ()
+  "Insert collapsible revision headers for a single-change diff."
+  (when-let* ((fields (majutsu-diff--revision-metadata)))
+    (magit-insert-section (commit-headers)
+      (let ((refs (majutsu-diff--format-refs fields)))
+        (magit-insert-heading
+          (unless (string-empty-p refs) (concat refs " "))
+          (majutsu-diff--with-fallback-face
+           (plist-get fields :commit-id) 'magit-hash)))
+      (insert "Author:     " (plist-get fields :author-name)
+              " <" (plist-get fields :author-email) ">\n"
+              "AuthorDate: " (plist-get fields :author-date) "\n"
+              "Commit:     " (plist-get fields :committer-name)
+              " <" (plist-get fields :committer-email) ">\n"
+              "CommitDate: " (plist-get fields :committer-date) "\n\n"))))
+
+(defun majutsu-insert-diff-revision-message ()
+  "Insert a collapsible revision message for a single-change diff."
+  (when-let* ((fields (majutsu-diff--revision-metadata)))
+    (let ((message (plist-get fields :description)))
+      (magit-insert-section
+          (commit-message nil nil
+            :heading-highlight-face 'magit-diff-revision-summary-highlight)
+        (if (string-empty-p message)
+            (progn
+              (magit-insert-heading "(no description)")
+              (insert "\n"))
+          (save-excursion
+            (insert message)
+            (unless (bolp) (insert "\n")))
+          (magit--add-face-text-property
+           (point) (progn (forward-line) (point))
+           'magit-diff-revision-summary t)
+          (magit-insert-heading)
+          (goto-char (point-max)))
+        (insert "\n")))))
+
 (defun majutsu-insert-diff ()
   "Insert a diff section and wash it."
-  (let* ((args (append (list "diff")
-                       majutsu-buffer-diff-args
-                       majutsu-buffer-diff-range
-                       majutsu-buffer-diff-filesets))
+  (let* ((args (majutsu-jj-append-filesets
+                (append (list "diff")
+                        majutsu-buffer-diff-args
+                        majutsu-buffer-diff-range)
+                majutsu-buffer-diff-filesets))
          (backend (majutsu-diff--sync-backend args))
          (washer (majutsu-diff--backend-washer backend)))
     (magit-insert-section (diff-root)
       (magit-insert-heading (format "jj %s" (string-join args " ")))
-      (majutsu-jj-wash washer 'wash-anyway args))))
+      (majutsu-jj-wash
+          (lambda (wash-args)
+            ;; The Git command has already snapshotted the working copy.
+            ;; Query the same range without snapshotting again, then
+            ;; attach exact paths/statuses only if the ordered raw headers and
+            ;; operation kinds agree.
+            (let* ((metadata (and (eq backend 'git)
+                                  (majutsu-diff--query-file-metadata
+                                   majutsu-buffer-diff-range
+                                   majutsu-buffer-diff-filesets)))
+                   (matching-git-metadata
+                    (and (majutsu-diff--raw-file-metadata-consistent-p metadata)
+                         metadata))
+                   (majutsu-diff--active-file-metadata matching-git-metadata)
+                   (majutsu-diff--file-metadata-queue
+                    (copy-sequence matching-git-metadata)))
+              (funcall washer wash-args)
+              (majutsu-diff--attach-file-metadata metadata)))
+        'wash-anyway args))))
 
 ;;; Diff wash
 
@@ -591,15 +1165,25 @@ Assumes point is at the start of the diff output."
   (when (looking-at "^diff --git ")
     (while (and (not (eobp))
                 (looking-at "^diff --git "))
-      (majutsu-diff-wash-file))
+      (let ((before (point)))
+        (majutsu-diff-wash-file)
+        ;; A malformed or future Git header must never trap refresh in a
+        ;; non-advancing parser loop.
+        (when (= before (point))
+          (forward-line 1))))
     (unless (bolp) (insert "\n"))))
 
 (defun majutsu-diff-wash-file ()
   "Parse a single file section at point and wrap it in Magit sections."
-  (when (looking-at "^diff --git a/\\(.*\\) b/\\(.*\\)$")
-    (let* ((file-a (match-string-no-properties 1))
-           (file-b (match-string-no-properties 2))
-           (file (or file-b file-a))
+  (when (looking-at "^diff --git ")
+    (let* ((diff-line (buffer-substring-no-properties
+                       (line-beginning-position) (line-end-position)))
+           (metadata (pop majutsu-diff--file-metadata-queue))
+           (fallback
+            (if (string-match "^diff --git a/\\(.*\\) b/\\(.*\\)$" diff-line)
+                (or (match-string 2 diff-line) (match-string 1 diff-line))
+              (string-remove-prefix "diff --git " diff-line)))
+           (file (or (plist-get metadata :target) fallback))
            (headers nil)
            (diff-header (buffer-substring-no-properties
                          (line-beginning-position)
@@ -615,11 +1199,12 @@ Assumes point is at the start of the diff output."
                                                    (1+ (line-end-position))))
               headers)
         (majutsu-diff--delete-line))
+      (setq headers (nreverse headers))
       (magit-insert-section
           (jj-file file nil
-                   :header (concat diff-header (string-join (nreverse headers) "")))
+                   :header (concat diff-header (string-join headers "")))
         (magit-insert-heading
-          (propertize (majutsu-diff--file-heading file (nreverse headers))
+          (propertize (majutsu-diff--file-heading file headers)
                       'font-lock-face 'magit-diff-file-heading))
         ;; Hunk bodies remain in the buffer; just wrap them.
         (while (and (not (eobp)) (looking-at "^@@ "))
@@ -633,9 +1218,7 @@ Assumes point is at the start of the diff output."
                                                  (line-end-position)))
          (ranges nil)
          (about nil)
-         (combined nil)
          (from-range nil)
-         (from-ranges nil)
          (to-range nil))
     (when (string-match "^@\\{2,\\} \\(.+?\\) @\\{2,\\}\\(?: \\(.*\\)\\)?$" header)
       (setq about (match-string 2 header))
@@ -646,18 +1229,15 @@ Assumes point is at the start of the diff output."
                                    (append nums (list 1))
                                  nums)))
                            (split-string (match-string 1 header))))
-      (setq combined (= (length ranges) 3))
-      (setq from-ranges (and combined (butlast ranges)))
-      (setq from-range (if combined (car from-ranges) (car ranges)))
-      (setq to-range (car (last ranges))))
+      (when (= (length ranges) 2)
+        (setq from-range (car ranges))
+        (setq to-range (cadr ranges))))
     ;; Remove original header and insert a propertized one.
     (majutsu-diff--delete-line)
     ;; Use (file . from-range) as unique hunk identity to avoid collisions.
     (magit-insert-section
         (jj-hunk (cons file from-range) nil
-                 :combined combined
                  :from-range from-range
-                 :from-ranges from-ranges
                  :to-range to-range
                  :about about)
       (magit-insert-heading
@@ -694,42 +1274,104 @@ Assumes point is at the start of the diff output."
   "Return a formatted heading string for FILE using parsed LINES."
   (format "%-11s %s" (majutsu--diff-file-status lines) file))
 
+;;; Syntax highlighting
+
+(defun majutsu-diff--update-hunk-syntax (&optional section)
+  "Apply syntax highlighting overlays to hunk SECTION.
+When SECTION is nil, walk all hunk sections."
+  (if section
+      (when (and (not (oref section hidden))
+                 (not (oref section fontified))
+                 (fboundp 'diff-syntax-fontify-props)
+                 (fboundp 'diff-hunk-text)
+                 (not (eq majutsu-diff-backend 'color-words)))
+        (oset section fontified t)
+        (save-excursion
+          (goto-char (oref section content))
+          (let* ((file (magit-section-parent-value section))
+                 (revs (majutsu-diff--revisions))
+                 (old (majutsu-diff--get-hunk-syntax section (car revs) file t))
+                 (new (majutsu-diff--get-hunk-syntax
+                       section
+                       (if (majutsu-diff--visit-workspace-p) nil (cdr revs))
+                       file nil)))
+            (while (< (point) (oref section end))
+              (pcase-dolist (`(,beg ,end ,face)
+                             (pcase (char-after)
+                               (?- (pop old))
+                               (?+ (pop new))
+                               (?\s (pop old)
+                                    (pop new))))
+                (let ((ov (make-overlay (+ (point) 1 beg)
+                                        (+ (point) 1 end)
+                                        nil t)))
+                  (overlay-put ov 'evaporate t)
+                  (overlay-put ov 'face face)
+                  (overlay-put ov 'majutsu-diff-syntax t)))
+              (forward-line 1)))))
+    (cl-labels ((walk (node)
+                  (if (magit-section-match 'jj-hunk node)
+                      (majutsu-diff--update-hunk-syntax node)
+                    (dolist (child (oref node children))
+                      (walk child)))))
+      (walk magit-root-section))))
+
+(defun majutsu-diff--get-hunk-syntax (section rev file from)
+  "Return syntax fontification props for SECTION side REV FILE.
+When FROM is non-nil, fontify the old side; otherwise fontify the new side."
+  (with-demoted-errors "Error getting hunk syntax highlighting: %S"
+    (let ((args (majutsu-diff--get-hunk-text section from)))
+      (when (and args (not (listp (car (cadr args)))))
+        (require 'majutsu-file)
+        (with-current-buffer (majutsu-find-file-noselect rev file)
+          (save-excursion
+            (apply #'diff-syntax-fontify-props nil args)))))))
+
+(defun majutsu-diff--get-hunk-text (section from)
+  "Return text and line range for SECTION side.
+When FROM is non-nil, return removed/context text; otherwise return
+added/context text."
+  (let* ((range (if from (oref section from-range) (oref section to-range)))
+         (line (car range))
+         (lines (cadr range)))
+    (when range
+      (list (string-trim-right
+             (diff-hunk-text (buffer-substring-no-properties
+                              (oref section start) (oref section end))
+                             (not from) nil))
+            (list line lines)))))
+
 ;;; Refinement
 
 (defun majutsu-diff--update-hunk-refinement (&optional section allow-remove)
   "Apply or remove word-level refinement overlays.
 When SECTION is nil, walk all hunk sections."
   (if section
-      (unless (oref section hidden)
-        (pcase (list majutsu-diff-refine-hunk
-                     (oref section refined)
-                     (eq section (magit-current-section)))
-          ((or `(all nil ,_) '(t nil t))
-           (oset section refined t)
-           (if (eq majutsu-diff-backend 'color-words)
-               (majutsu-diff--color-words-refine-hunk section)
-             (save-excursion
-               (goto-char (oref section start))
-               ;; `diff-refine-hunk' cannot handle combined hunks.
-               (unless (looking-at "@@@")
-                 (let ((len (- (oref section end) (oref section start))))
-                   (if (and majutsu-diff-refine-max-chars
-                            (> len majutsu-diff-refine-max-chars))
-                       (progn
-                         (oset section refined nil)
-                         (remove-overlays (oref section start)
-                                          (oref section end)
-                                          'diff-mode 'fine))
-                     (let ((smerge-refine-ignore-whitespace
-                            majutsu-diff-refine-ignore-whitespace)
-                           (write-region-inhibit-fsync t))
-                       (diff-refine-hunk))))))))
-          ((and (guard allow-remove)
-                (or `(nil t ,_) '(t t nil)))
-           (oset section refined nil)
-           (remove-overlays (oref section start)
-                            (oref section end)
-                            'diff-mode 'fine))))
+      (let ((current (eq section (magit-current-section))))
+        (if (and allow-remove
+                 (or (null majutsu-diff-refine-hunk)
+                     (and (eq majutsu-diff-refine-hunk t)
+                          (oref section refined)
+                          (not current))))
+            (progn
+              (oset section refined nil)
+              (remove-overlays (oref section start)
+                               (oref section end)
+                               'diff-mode 'fine))
+          (unless (oref section hidden)
+            (pcase (list majutsu-diff-refine-hunk
+                         (oref section refined)
+                         current)
+              ((or `(all nil ,_) '(t nil t))
+               (oset section refined t)
+               (if (eq majutsu-diff-backend 'color-words)
+                   (majutsu-diff--color-words-refine-hunk section)
+                 (save-excursion
+                   (goto-char (oref section start))
+                   (let ((smerge-refine-ignore-whitespace
+                          majutsu-diff-refine-ignore-whitespace)
+                         (write-region-inhibit-fsync t))
+                     (diff-refine-hunk)))))))))
     (cl-labels ((walk (node)
                   (if (magit-section-match 'jj-hunk node)
                       (majutsu-diff--update-hunk-refinement node t)
@@ -966,6 +1608,8 @@ side, non-underlined colored = shared context within a change."
   ;; For both backends, delegate to the unified refinement handler.
   ;; Color-words uses `majutsu-diff--color-words-refine-hunk' internally;
   ;; the git backend uses `diff-refine-hunk'.
+  (when (eq majutsu-diff-fontify-hunk t)
+    (majutsu-diff--update-hunk-syntax section))
   (when (eq majutsu-diff-refine-hunk t)
     (majutsu-diff--update-hunk-refinement section)))
 
@@ -1080,12 +1724,6 @@ through while the background changes to indicate focus."
   (when-let* ((file (majutsu-file-at-point)))
     (find-file (expand-file-name file default-directory))))
 
-(defun majutsu-diff--range-value (range prefix)
-  "Return the value in RANGE for argument starting with PREFIX."
-  (when range
-    (when-let* ((arg (seq-find (lambda (item) (string-prefix-p prefix item)) range)))
-      (substring arg (length prefix)))))
-
 (defun majutsu-diff--on-removed-line-p ()
   "Return non-nil if point is on a removed diff line."
   (if-let* ((info (majutsu-diff--color-words-line-info)))
@@ -1108,9 +1746,9 @@ INFO is the plist from `majutsu-color-words-line-info-at-point'."
   "Return (FROM-REV . TO-REV) for the current diff buffer.
 FROM-REV is the old/left side, TO-REV is the new/right side."
   (let* ((range majutsu-buffer-diff-range)
-         (from (majutsu-diff--range-value range "--from="))
-         (to (majutsu-diff--range-value range "--to="))
-         (revisions (majutsu-diff--range-value range "--revisions=")))
+         (from (transient-arg-value "--from=" range))
+         (to (transient-arg-value "--to=" range))
+         (revisions (transient-arg-value "--revisions=" range)))
     (cond
      ;; -r REV: diff of a single revision's changes
      ((and range (equal (car range) "-r") (cadr range))
@@ -1175,8 +1813,8 @@ If on a removed line, return the from-rev; otherwise return the to-rev."
   "Return non-nil if the current diff should visit the workspace file.
 This is true when diffing the working copy (@) on the new/right side."
   (let* ((range majutsu-buffer-diff-range)
-         (to (majutsu-diff--range-value range "--to="))
-         (revisions (majutsu-diff--range-value range "--revisions=")))
+         (to (transient-arg-value "--to=" range))
+         (revisions (transient-arg-value "--revisions=" range)))
     (cond
      ;; Explicit --to=@ means we're looking at working copy changes
      ((equal to "@") t)
@@ -1311,10 +1949,21 @@ With prefix STYLE, cycle between `all' and `t'."
                 (not majutsu-diff-refine-hunk)))
   (majutsu-diff--update-hunk-refinement))
 
+(defun majutsu-diff-toggle-fontify-hunk (&optional style)
+  "Toggle syntax highlighting within hunks.
+With prefix STYLE, cycle between `all' and `t'."
+  (interactive "P")
+  (setq-local majutsu-diff-fontify-hunk
+              (if style
+                  (if (eq majutsu-diff-fontify-hunk 'all) t 'all)
+                (not majutsu-diff-fontify-hunk)))
+  (majutsu-diff--update-hunk-syntax))
+
 (defvar-keymap majutsu-diff-mode-map
   :doc "Keymap for `majutsu-diff-mode'."
   :parent majutsu-mode-map
   "t" #'majutsu-diff-toggle-refine-hunk
+  "T" #'majutsu-diff-toggle-fontify-hunk
   "+" #'majutsu-diff-more-context
   "-" #'majutsu-diff-less-context
   "0" #'majutsu-diff-default-context
@@ -1324,11 +1973,13 @@ With prefix STYLE, cycle between `all' and `t'."
   "Major mode for viewing jj diffs."
   :group 'majutsu
   (setq-local line-number-mode nil)
-  ;; Use diff-mode's keywords as a fallback, but primarily rely on
-  ;; `font-lock-face' properties applied during the washing process.
-  ;; We set this to enable JIT Lock, which renders our `font-lock-face' properties.
-  (setq-local font-lock-defaults '(diff-font-lock-keywords t))
-  (setq-local font-lock-multiline t))
+  ;; Majutsu owns refinement state.  Otherwise `diff-font-lock-keywords'
+  ;; consults the independent `diff-refine' option and recreates fine overlays
+  ;; even when `majutsu-diff-refine-hunk' is nil.
+  ;; `magit-section-mode' disables syntactic font locking.  The diff washer
+  ;; attaches faces to actual hunk lines as text properties, so revision
+  ;; messages cannot be mistaken for patches.
+  (setq-local diff-refine nil))
 
 (cl-defmethod majutsu-buffer-value (&context (major-mode majutsu-diff-mode))
   (list majutsu-buffer-diff-args
@@ -1339,38 +1990,41 @@ With prefix STYLE, cycle between `all' and `t'."
   "Refresh the current diff buffer."
   (interactive)
   (when majutsu-buffer-diff-args
+    ;; Metadata is refreshed once per buffer refresh, then shared by the
+    ;; header and message inserters through the argument-keyed cache.
+    (setq majutsu-diff--revision-metadata-cache nil)
     (let* ((backend (majutsu-diff--sync-backend))
            (majutsu-jj-global-arguments
             (cons (if (eq backend 'color-words) "--color=debug" "--color=never")
                   (seq-remove (lambda (arg) (string-prefix-p "--color" arg))
                               majutsu-jj-global-arguments)))
-           (majutsu-process-apply-ansi-colors
-            (majutsu-diff--backend-uses-ansi-p backend)))
-      (if (eq backend 'color-words)
-          (progn
-            ;; No diff-mode keywords — ANSI faces via `font-lock-face'
-            ;; provide all coloring.  Font-lock must stay enabled so the
-            ;; display engine honours `font-lock-face' text properties.
-            (setq-local font-lock-defaults '(nil t))
-            (font-lock-mode 1))
-        (setq-local font-lock-defaults '(diff-font-lock-keywords t))
-        (font-lock-mode 1))
+           ;; Diff buffers are used as patch source by interactive commands.
+           ;; For the regular git backend we force `--color=never', so applying
+           ;; `ansi-color' here is unnecessary and corrupts file contents that
+           ;; contain literal ANSI escape sequences.  Color-words handles its
+           ;; own ANSI/debug output in its washer.
+           (majutsu-process-apply-ansi-colors nil))
+      ;; Refresh JIT Lock so it renders the faces attached by the washer.
+      (font-lock-mode 1)
       (unless (eq backend 'color-words)
         (majutsu-diff--set-left-margin 0))
       (magit-insert-section (diffbuf)
         (magit-run-section-hook 'majutsu-diff-sections-hook))
+      (when (eq majutsu-diff-fontify-hunk 'all)
+        (majutsu-diff--update-hunk-syntax))
       (when (eq majutsu-diff-refine-hunk 'all)
         (majutsu-diff--update-hunk-refinement)))))
 
-;;;###autoload
-(defun majutsu-diff-dwim (&optional args range filesets)
+;;;###autoload(autoload 'majutsu-diff-dwim "majutsu-diff" nil t)
+(transient-define-suffix majutsu-diff-dwim (&optional args range filesets)
   "Show changes for the thing at point."
+  :advice* #'majutsu--transient-with-selection-buffer
   (interactive (majutsu-diff-arguments))
   (let* ((rev (pcase (majutsu-diff--dwim)
-                (`(commit . ,rev) rev)
+                (`(,_ . ,rev) rev)
                 (_ "@")))
          (range (or range
-                    (list (concat "--revisions=" (substring-no-properties rev))))))
+                    (list (concat "--revisions=" rev)))))
     (majutsu-diff-setup-buffer args range filesets)))
 
 ;;;###autoload
@@ -1386,9 +2040,9 @@ REVSET is passed to jj diff using `--revisions='."
 ;; TODO: implement more DWIM cases
 (defun majutsu-diff--dwim ()
   "Return information for performing DWIM diff."
-  (if-let* ((rev (magit-section-value-if 'jj-commit)))
-      (cons 'commit rev)
-    nil))
+  (when-let* ((rev (or (majutsu-thing-at-point 'jj-revision t)
+                       (majutsu-revision-at-point))))
+    (cons 'revision rev)))
 
 (defun majutsu-diff-setup-buffer (args range filesets &optional locked)
   "Display a diff buffer configured by ARGS, RANGE and FILESETS."
@@ -1410,20 +2064,17 @@ REVSET is passed to jj diff using `--revisions='."
   "Internal transient for jj diff."
   :man-page "jj-diff"
   :class 'majutsu-diff-prefix
+  :jj-command "diff"
   :incompatible '(("--revisions=" "--from=")
                   ("--revisions=" "--to=")
                   ("--stat" "--summary")
                   ("--git" "--color-words"))
   :transient-non-suffix t
-  [:description "JJ Diff"
-   :class transient-columns
-   ["Selection"
+  :description "JJ Diff"
+  [["Selection"
     (majutsu-diff:-r)
     (majutsu-diff:--from)
     (majutsu-diff:--to)
-    (majutsu-diff:revisions)
-    (majutsu-diff:from)
-    (majutsu-diff:to)
     ("c" "Clear selections" majutsu-selection-clear :transient t)]
    ["Paths"
     (majutsu-diff:--)]
@@ -1437,9 +2088,9 @@ REVSET is passed to jj diff using `--revisions='."
     (majutsu-diff:-b)]
    ["Actions"
     ("d" "Execute" majutsu-diff-dwim)
-    ("s" "Save as default" majutsu-diff-save-arguments :transient t)
-    ("g" "Refresh" majutsu-refresh :transient t)
-    ("q" "Quit" transient-quit-one)]]
+    ("s" "Save as default" majutsu-diff-save-arguments)
+    ("W" "Save as repo default" majutsu-transient-save-repository-defaults)
+    ("g" "Refresh" majutsu-diff-refresh)]]
   (interactive)
   (transient-setup
    'majutsu-diff nil nil
@@ -1468,7 +2119,7 @@ REVSET is passed to jj diff using `--revisions='."
 (transient-define-argument majutsu-diff:--summary ()
   :description "Show summary"
   :class 'transient-switch
-  :key "-s"
+  :shortarg "-s"
   :argument "--summary")
 
 (transient-define-argument majutsu-diff:--context ()
@@ -1493,17 +2144,12 @@ REVSET is passed to jj diff using `--revisions='."
   :selection-label "[REVS]"
   :selection-face '(:background "goldenrod" :foreground "black")
   :locate-fn (##majutsu-selection-find-section % 'jj-commit)
-  :key "-r"
+  :selection-toggle-key "r"
+  :shortarg "-r"
   :argument "--revisions="
   :multi-value 'repeat
-  :prompt "Revisions: ")
-
-(transient-define-argument majutsu-diff:revisions ()
-  :description "Revisions (toggle at point)"
-  :class 'majutsu-selection-toggle-option
-  :key "r"
-  :argument "--revisions="
-  :multi-value 'repeat)
+  :prompt "Revisions"
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-diff:--from ()
   :description "From"
@@ -1511,9 +2157,10 @@ REVSET is passed to jj diff using `--revisions='."
   :selection-label "[FROM]"
   :selection-face '(:background "dark orange" :foreground "black")
   :locate-fn (##majutsu-selection-find-section % 'jj-commit)
-  :key "-f"
+  :selection-toggle-key "f"
+  :shortarg "-f"
   :argument "--from="
-  :reader #'majutsu-diff--transient-read-revset)
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-diff:--to ()
   :description "To"
@@ -1521,60 +2168,50 @@ REVSET is passed to jj diff using `--revisions='."
   :selection-label "[TO]"
   :selection-face '(:background "dark cyan" :foreground "white")
   :locate-fn (##majutsu-selection-find-section % 'jj-commit)
-  :key "-t"
+  :selection-toggle-key "t"
+  :shortarg "-t"
   :argument "--to="
-  :reader #'majutsu-diff--transient-read-revset)
-
-(transient-define-argument majutsu-diff:from ()
-  :description "From (toggle at point)"
-  :class 'majutsu-selection-toggle-option
-  :key "f"
-  :argument "--from=")
-
-(transient-define-argument majutsu-diff:to ()
-  :description "To (toggle at point)"
-  :class 'majutsu-selection-toggle-option
-  :locate-fn (##majutsu-selection-find-section % 'jj-commit)
-  :key "t"
-  :argument "--to=")
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-diff:-b ()
   :description "Ignore changes in amount of whitespace"
   :class 'transient-switch
-  :key "-b"
+  :shortarg "-b"
   :argument "--ignore-space-change")
 
 (transient-define-argument majutsu-diff:-w ()
   :description "Ignore whitespace"
   :class 'transient-switch
-  :key "-w"
+  :shortarg "-w"
   :argument "--ignore-all-space")
 
-(defun majutsu-diff-save-arguments ()
-  "Save current transient arguments as defaults."
+(transient-define-suffix majutsu-diff-save-arguments ()
+  "Save current transient arguments as global defaults."
+  :transient t
   (interactive)
-  (unless (object-of-class-p transient--prefix 'majutsu-diff-prefix)
+  (unless (and transient--prefix
+               (object-of-class-p transient--prefix 'majutsu-diff-prefix))
     (user-error "Not in a Majutsu diff transient"))
   (transient-save-value transient--prefix)
-  (message "Saved diff arguments as defaults"))
+  (message "Saved diff arguments as global defaults"))
 
-(defun majutsu-diff-refresh ()
+(transient-define-suffix majutsu-diff-refresh ()
   "Refresh diff buffer with current transient arguments."
+  :transient t
+  :advice* #'majutsu--transient-with-selection-buffer
   (interactive)
-  (pcase-let* ((`(,args ,range ,_filesets)
+  (pcase-let* ((`(,args ,range ,filesets)
                 (transient-args 'majutsu-diff)))
     (cond
      ((eq major-mode 'majutsu-diff-mode)
-      (majutsu-diff--set-buffer-args args)
-      (setq-local majutsu-buffer-diff-range range)
+      (majutsu-diff--set-value major-mode args range filesets)
       (majutsu-diff-refresh-buffer))
      ((and (memq majutsu-prefix-use-buffer-arguments '(always selected))
            (when-let* ((buf (majutsu--get-mode-buffer
                              'majutsu-diff-mode
                              (eq majutsu-prefix-use-buffer-arguments 'selected))))
              (with-current-buffer buf
-               (majutsu-diff--set-buffer-args args)
-               (setq-local majutsu-buffer-diff-range range)
+               (majutsu-diff--set-value major-mode args range filesets)
                (majutsu-diff-refresh-buffer))
              t)))
      (t

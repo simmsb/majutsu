@@ -22,9 +22,6 @@
 (defclass majutsu-duplicate-option (majutsu-selection-option)
   ())
 
-(defclass majutsu-duplicate--toggle-option (majutsu-selection-toggle-option)
-  ())
-
 ;;; Duplicate
 
 (defun majutsu-duplicate-arguments ()
@@ -34,22 +31,22 @@ Otherwise, if no -r is set, add -r from point (or region values, or @)."
   (let ((args (if (eq transient-current-command 'majutsu-duplicate)
                   (transient-args 'majutsu-duplicate)
                 '())))
-    (unless (cl-some (lambda (arg) (string-prefix-p "-r" arg)) args)
+    (unless (transient-arg-value "-r=" args)
       (let ((revsets (or (magit-region-values nil t)
                          (and (magit-section-value-if 'jj-commit)
                               (list (magit-section-value-if 'jj-commit)))
                          (list "@"))))
         (dolist (rev revsets)
-          (push (concat "-r" rev) args))))
+          (push (concat "-r=" rev) args))))
     args))
 
-;;;###autoload
-(defun majutsu-duplicate-dwim ()
-  "Duplicate the changeset at point.
-With prefix ARG, open the duplicate transient."
-  (interactive)
-  (let ((args  (majutsu-duplicate-arguments)))
-    (majutsu-run-jj "duplicate" args)))
+;;;###autoload(autoload 'majutsu-duplicate-execute "majutsu-duplicate" nil t)
+(transient-define-suffix majutsu-duplicate-execute (args)
+  "Execute jj duplicate with ARGS from the transient."
+  :description "Duplicate changes"
+  :class 'majutsu-transient-default-action-suffix
+  (interactive (list (majutsu-duplicate-arguments)))
+  (apply #'majutsu-run-jj "duplicate" args))
 
 ;;; Duplicate Transient
 (transient-define-argument majutsu-duplicate:-r ()
@@ -57,92 +54,63 @@ With prefix ARG, open the duplicate transient."
   :class 'majutsu-duplicate-option
   :selection-label "[SRC]"
   :selection-face '(:background "goldenrod" :foreground "black")
-  :key "-r"
-  :argument "-r"
+  :selection-toggle-key "r"
+  :shortarg "-r"
+  :argument "-r="
   :multi-value 'repeat
-  :reader #'majutsu-diff--transient-read-revset)
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-duplicate:--onto ()
   :description "Onto"
   :class 'majutsu-duplicate-option
   :selection-label "[ONTO]"
   :selection-face '(:background "dark green" :foreground "white")
-  :key "-o"
+  :selection-toggle-key "o"
+  :shortarg "-o"
   :argument "--onto="
   :multi-value 'repeat
-  :reader #'majutsu-diff--transient-read-revset)
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-duplicate:--after ()
   :description "After"
   :class 'majutsu-duplicate-option
   :selection-label "[AFTER]"
   :selection-face '(:background "dark blue" :foreground "white")
-  :key "-A"
+  :selection-toggle-key "a"
+  :shortarg "-A"
   :argument "--insert-after="
   :multi-value 'repeat
-  :reader #'majutsu-diff--transient-read-revset)
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-duplicate:--before ()
   :description "Before"
   :class 'majutsu-duplicate-option
   :selection-label "[BEFORE]"
   :selection-face '(:background "dark magenta" :foreground "white")
-  :key "-B"
+  :selection-toggle-key "b"
+  :shortarg "-B"
   :argument "--insert-before="
   :multi-value 'repeat
-  :reader #'majutsu-diff--transient-read-revset)
-
-(transient-define-argument majutsu-duplicate:source ()
-  :description "Source (toggle at point)"
-  :class 'majutsu-duplicate--toggle-option
-  :key "r"
-  :argument "-r"
-  :multi-value 'repeat)
-
-(transient-define-argument majutsu-duplicate:onto ()
-  :description "Onto (toggle at point)"
-  :class 'majutsu-duplicate--toggle-option
-  :key "o"
-  :argument "--onto="
-  :multi-value 'repeat)
-
-(transient-define-argument majutsu-duplicate:after ()
-  :description "After (toggle at point)"
-  :class 'majutsu-duplicate--toggle-option
-  :key "a"
-  :argument "--insert-after="
-  :multi-value 'repeat)
-
-(transient-define-argument majutsu-duplicate:before ()
-  :description "Before (toggle at point)"
-  :class 'majutsu-duplicate--toggle-option
-  :key "b"
-  :argument "--insert-before="
-  :multi-value 'repeat)
+  :reader #'majutsu-transient-read-revset)
 
 ;;;###autoload(autoload 'majutsu-duplicate "majutsu-duplicate" nil t)
 (transient-define-prefix majutsu-duplicate ()
   "Internal transient for jj duplicate."
   :man-page "jj-duplicate"
+  :class 'majutsu-jj-transient-prefix
+  :jj-command "duplicate"
   :transient-non-suffix t
-  [:description "JJ Duplicate"
-   :class transient-columns
-   ["Sources"
+  :description "JJ Duplicate"
+  [["Sources"
     (majutsu-duplicate:-r)
-    (majutsu-duplicate:source)
     ("c" "Clear selections" majutsu-selection-clear
      :transient t)]
    ["Placement"
     (majutsu-duplicate:--onto)
     (majutsu-duplicate:--after)
-    (majutsu-duplicate:--before)
-    (majutsu-duplicate:onto)
-    (majutsu-duplicate:after)
-    (majutsu-duplicate:before)]
+    (majutsu-duplicate:--before)]
    ["Actions"
-    ("y" "Duplicate changes" majutsu-duplicate-dwim)
-    ("RET" "Duplicate changes" majutsu-duplicate-dwim)
-    ("q" "Quit" transient-quit-one)]]
+    ("y" "Duplicate changes" majutsu-duplicate-execute)]]
   (interactive)
   (transient-setup
    'majutsu-duplicate nil nil

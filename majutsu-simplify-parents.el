@@ -21,36 +21,25 @@
 (defclass majutsu-simplify-parents-option (majutsu-selection-option)
   ())
 
-(defclass majutsu-simplify-parents--toggle-option (majutsu-selection-toggle-option)
-  ())
+(defun majutsu-simplify-parents--dwim-args ()
+  "Return DWIM target args for simplify-parents execution."
+  (mapcar (lambda (rev) (concat "--revision=" rev))
+          (or (magit-region-values 'jj-commit t)
+              (when-let* ((rev (or (majutsu-thing-at-point 'jj-revision t)
+                                   (majutsu-revision-at-point))))
+                (list rev))
+              '("@"))))
 
-(defun majutsu-simplify-parents--default-args ()
-  "Return default arguments for `jj simplify-parents'."
-  (let* ((point-rev (magit-section-value-if 'jj-commit))
-         (revsets (or (magit-region-values 'jj-commit t)
-                      (and point-rev (list point-rev))
-                      '("@"))))
-    (mapcar (lambda (rev)
-              (concat "--revisions=" rev))
-            revsets)))
-
-(defun majutsu-simplify-parents-arguments ()
-  "Return current simplify-parents arguments.
-If no targets are provided, default to region/point/@ as --revisions."
-  (let ((args (if (eq transient-current-command 'majutsu-simplify-parents-transient)
-                  (transient-args 'majutsu-simplify-parents-transient)
-                '())))
-    (if (seq-some (lambda (arg)
-                    (or (string-prefix-p "--source=" arg)
-                        (string-prefix-p "--revisions=" arg)))
-                  args)
-        args
-      (append args (majutsu-simplify-parents--default-args)))))
-
-(defun majutsu-simplify-parents-execute (args)
+(transient-define-suffix majutsu-simplify-parents-execute (args)
   "Execute jj simplify-parents with ARGS from transient."
-  (interactive (list (majutsu-simplify-parents-arguments)))
-  (let ((exit (apply #'majutsu-run-jj "simplify-parents" args)))
+  :description "Simplify"
+  :class 'majutsu-transient-default-action-suffix
+  (interactive (list (transient-args 'majutsu-simplify-parents-transient)))
+  (let* ((args (if (or (transient-arg-value "--source=" args)
+                       (transient-arg-value "--revision=" args))
+                   args
+                 (append args (majutsu-simplify-parents--dwim-args))))
+         (exit (apply #'majutsu-run-jj "simplify-parents" args)))
     (when (zerop exit)
       (message "Simplify parents completed"))))
 
@@ -59,65 +48,47 @@ If no targets are provided, default to region/point/@ as --revisions."
   :class 'majutsu-simplify-parents-option
   :selection-label "[SRC]"
   :selection-face '(:background "goldenrod" :foreground "black")
-  :key "-s"
+  :selection-toggle-key "s"
+  :shortarg "-s"
   :argument "--source="
   :multi-value 'repeat
-  :reader #'majutsu-diff--transient-read-revset)
+  :reader #'majutsu-transient-read-revset)
 
-(transient-define-argument majutsu-simplify-parents:--revisions ()
-  :description "Revisions"
+(transient-define-argument majutsu-simplify-parents:--revision ()
+  :description "Revision"
   :class 'majutsu-simplify-parents-option
-  :selection-label "[REVS]"
+  :selection-label "[REV]"
   :selection-face '(:background "dark orange" :foreground "black")
-  :key "-r"
-  :argument "--revisions="
+  :selection-toggle-key "r"
+  :shortarg "-r"
+  :argument "--revision="
   :multi-value 'repeat
-  :reader #'majutsu-diff--transient-read-revset)
-
-(transient-define-argument majutsu-simplify-parents:source ()
-  :description "Source (toggle at point)"
-  :class 'majutsu-simplify-parents--toggle-option
-  :key "s"
-  :argument "--source="
-  :multi-value 'repeat)
-
-(transient-define-argument majutsu-simplify-parents:revisions ()
-  :description "Revisions (toggle at point)"
-  :class 'majutsu-simplify-parents--toggle-option
-  :key "r"
-  :argument "--revisions="
-  :multi-value 'repeat)
+  :reader #'majutsu-transient-read-revset)
 
 ;;;###autoload
-(defun majutsu-simplify-parents (&optional arg)
-  "Open the simplify-parents transient.
-With prefix ARG, pre-enable --ignore-immutable."
-  (interactive "P")
+(defun majutsu-simplify-parents ()
+  "Open the simplify-parents transient."
+  (interactive)
   (transient-setup
    'majutsu-simplify-parents-transient nil nil
-   :scope (majutsu-selection-session-begin)
-   :value (append (majutsu-simplify-parents--default-args)
-                  (when arg '("--ignore-immutable")))))
+   :scope (majutsu-selection-session-begin)))
 
 (transient-define-prefix majutsu-simplify-parents-transient ()
   "Transient for jj simplify-parents operations."
   :man-page "jj-simplify-parents"
+  :class 'majutsu-jj-transient-prefix
+  :jj-command "simplify-parents"
   :transient-non-suffix t
-  [:description "JJ Simplify Parents"
-   :class transient-columns
-   ["Selection"
+  :description "JJ Simplify Parents"
+  [["Selection"
     (majutsu-simplify-parents:--source)
-    (majutsu-simplify-parents:--revisions)
-    (majutsu-simplify-parents:source)
-    (majutsu-simplify-parents:revisions)
+    (majutsu-simplify-parents:--revision)
     ("c" "Clear selections" majutsu-selection-clear
      :transient t)]
    ["Options"
     (majutsu-transient-arg-ignore-immutable)]
    ["Actions"
-    ("P" "Simplify" majutsu-simplify-parents-execute)
-    ("RET" "Simplify" majutsu-simplify-parents-execute)
-    ("q" "Quit" transient-quit-one)]])
+    ("P" "Simplify" majutsu-simplify-parents-execute)]])
 
 ;;; _
 (provide 'majutsu-simplify-parents)

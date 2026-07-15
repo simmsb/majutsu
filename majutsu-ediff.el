@@ -27,7 +27,8 @@
 (require 'magit-section)
 (require 'majutsu-base)
 (require 'majutsu-jj)
-(require 'majutsu-edit)
+(require 'majutsu-core)
+(require 'majutsu-diffedit)
 (require 'majutsu-process)
 (require 'majutsu-file)
 (require 'majutsu-conflict)
@@ -155,37 +156,29 @@ If FILE is non-nil, perform a merge with result written to FILE."
   "Return buffer visiting FILE from REV."
   (majutsu-find-file-noselect rev file))
 
-(defun majutsu-ediff--parse-conflict-line (line)
-  "Parse plain-text `jj resolve --list' LINE.
-Return a plist with `:file' and `:sides', or nil when LINE is not recognized.
-Internal whitespace in file paths is preserved; only the padding before the
-conflict description is stripped."
-  (when (and line
-             (string-match
-              "[ \t]+\\([0-9]+\\)-sided conflict\\(?: including .*\\)?\\(?:\\r\\)?\\'"
-              line))
-    (list :file (string-trim-right (substring line 0 (match-beginning 0)))
-          :sides (string-to-number (match-string 1 line)))))
-
-(defun majutsu-ediff--list-conflicted-files (&optional rev)
-  "Return list of conflicted files at REV (default @)."
-  (let* ((default-directory (majutsu-file--root))
-         (lines (majutsu-jj-lines "resolve" "--list" "-r" (or rev "@"))))
-    (mapcar (lambda (line)
-              (or (plist-get (majutsu-ediff--parse-conflict-line line) :file)
-                  line))
-            lines)))
+(defun majutsu-ediff--conflicted-file-completion-entry (entry)
+  "Return an annotated completion entry for conflicted-file ENTRY."
+  (when-let* ((file (plist-get entry :path)))
+    (cons file
+          (when-let* ((sides (plist-get entry :sides)))
+            (format "%d-sided conflict" sides)))))
 
 (defun majutsu-ediff--read-conflicted-file (&optional rev)
   "Prompt for a conflicted file at REV."
-  (let ((files (majutsu-ediff--list-conflicted-files rev)))
+  (let* ((default-directory (majutsu-file--root))
+         (entries (majutsu-jj-conflicted-files (or rev "@")))
+         (choices (delq nil
+                        (mapcar #'majutsu-ediff--conflicted-file-completion-entry
+                                entries))))
     (cond
-     ((null files)
+     ((null choices)
       (user-error "No conflicts found at revision %s" (or rev "@")))
-     ((= (length files) 1)
-      (car files))
+     ((= (length choices) 1)
+      (caar choices))
      (t
-      (completing-read "Resolve conflicts in: " files nil t)))))
+      (majutsu-completing-read "Resolve conflicts in" choices nil t nil
+                               'majutsu-file-path-history
+                               nil 'majutsu-file)))))
 
 (defun majutsu-ediff--resolve-file-dwim (&optional file)
   "Return conflicted FILE for resolve workflow.
@@ -251,9 +244,10 @@ If FILE is nil, prompt for one."
   "Return the sidedness for FILE conflict at REV.
 When sidedness cannot be parsed, return 0."
   (let* ((default-directory (majutsu-file--root))
-         (line (car (majutsu-jj-lines "resolve" "--list" "-r" rev "--" file))))
-    (or (plist-get (majutsu-ediff--parse-conflict-line line) :sides)
-        0)))
+         (entries (majutsu-jj-conflicted-files
+                   (or rev "@")
+                   (majutsu-jj-fileset-quote file))))
+    (or (plist-get (car entries) :sides) 0)))
 
 (defun majutsu-ediff--build-resolve-args (rev file merge-editor-config)
   "Build `jj resolve' arguments for REV and FILE.
@@ -261,15 +255,15 @@ MERGE-EDITOR-CONFIG is a TOML config string or list of config strings."
   (let ((configs (if (listp merge-editor-config)
                      merge-editor-config
                    (list merge-editor-config))))
-    (append
-     (list "resolve")
-     (apply #'append
-            (mapcar (lambda (config)
-                      (list "--config" config))
-                    configs))
-     (list "-r" (or rev "@"))
-     (when file
-       (list "--" file)))))
+    (majutsu-jj-append-filesets
+     (append
+      (list "resolve")
+      (apply #'append
+             (mapcar (lambda (config)
+                       (list "--config" config))
+                     configs))
+      (list "-r" (or rev "@")))
+     (and file (list file)))))
 
 (defun majutsu-ediff--toml-string-config (key value)
   "Build KEY=VALUE TOML config where VALUE is a basic string."
@@ -447,25 +441,6 @@ Return non-nil when LINE is recognized as a Majutsu Ediff control packet."
       (run-at-time 0 nil #'majutsu-ediff--run-control-packet spec directory))
     t))
 
-(defun majutsu-ediff--run-diffedit (jj-args &optional file)
-  "Run jj diffedit with JJ-ARGS using `majutsu-ediff-diffedit-file'."
-  (setq file (or file (cadr (member "--" jj-args))))
-  (unless file
-    (user-error "Diffedit requires a file target"))
-  (let* ((root (majutsu--toplevel-safe default-directory))
-         (default-directory root)
-         (file (if (file-name-absolute-p file)
-                   (let* ((abs-root (file-name-as-directory (expand-file-name root)))
-                          (abs-file (expand-file-name file)))
-                     (if (string-prefix-p abs-root abs-file)
-                         (file-relative-name abs-file abs-root)
-                       (user-error "Diffedit target outside repository: %s" file)))
-                 file))
-         (jj-args (majutsu-edit--replace-diffedit-file-arg jj-args file)))
-    (let ((diff-editor-cmd (majutsu-ediff--diff-editor-config file)))
-      ;; Use async to avoid blocking Emacs while jj waits for diff completion.
-      (apply #'majutsu-run-jj-async "diffedit" "--config" diff-editor-cmd jj-args))))
-
 (defun majutsu-ediff--cleanup-diffedit-variant-buffers
     (left-file right-file left-existing right-existing)
   "Persist and close diffedit variant buffers created for this session."
@@ -586,55 +561,60 @@ This hook runs in the Ediff control buffer and is intended for `jj resolve'."
      ((= (length files) 1)
       (car files))
      (t
-      (completing-read "Diffedit file: " files nil t)))))
+      (majutsu-completing-read "Diffedit file" files nil t nil
+                               'majutsu-file-path-history
+                               nil 'majutsu-file)))))
 
-;;;###autoload
-(defun majutsu-ediff-dwim ()
+;;;###autoload(autoload 'majutsu-ediff-dwim "majutsu-ediff" nil t)
+(transient-define-suffix majutsu-ediff-dwim ()
   "Context-aware Ediff based on current section."
+  :advice* #'majutsu--transient-with-selection-buffer
   (interactive)
-  (magit-section-case
-    (jj-hunk
-     (save-excursion
-       (goto-char (oref (oref it parent) start))
-       (majutsu-ediff-dwim)))
-    (jj-file
-     (let* ((file (oref it value))
-            (range (majutsu-ediff--current-range)))
-       (majutsu-ediff-compare (car range) (cdr range) file)))
-    (jj-commit
-     (majutsu-ediff-show-revision (substring-no-properties (oref it value))))
-    (t
-     (let* ((range (majutsu-ediff--current-range))
-            (file (majutsu-file-at-point)))
-       (cond
-        ((and (car range) (cdr range))
-         (if file
-             (majutsu-ediff-compare (car range) (cdr range) file)
-           (majutsu-ediff-compare (car range) (cdr range))))
-        ((car range)
-         (majutsu-ediff-show-revision (car range)))
-        (t
-         (majutsu-ediff-show-revision "@")))))))
+  (cl-labels ((dwim ()
+                (magit-section-case
+                  (jj-hunk
+                   (save-excursion
+                     (goto-char (oref (oref it parent) start))
+                     (dwim)))
+                  (jj-file
+                   (let* ((file (oref it value))
+                          (range (majutsu-ediff--current-range)))
+                     (majutsu-ediff-compare (car range) (cdr range) file)))
+                  (jj-commit
+                   (majutsu-ediff-show-revision (oref it value)))
+                  (t
+                   (let* ((range (majutsu-ediff--current-range))
+                          (file (majutsu-file-at-point)))
+                     (cond
+                      ((and (car range) (cdr range))
+                       (if file
+                           (majutsu-ediff-compare (car range) (cdr range) file)
+                         (majutsu-ediff-compare (car range) (cdr range))))
+                      ((car range)
+                       (majutsu-ediff-show-revision (car range)))
+                      (t
+                       (majutsu-ediff-show-revision "@"))))))))
+    (dwim)))
 
-;;;###autoload
-(defun majutsu-ediff-edit (args)
+;;;###autoload(autoload 'majutsu-ediff-edit "majutsu-ediff" nil t)
+(transient-define-suffix majutsu-ediff-edit (args)
   "Edit one changed file with two-sided Ediff via jj diffedit.
 ARGS are transient arguments."
+  :advice* #'majutsu--transient-with-selection-buffer
   (interactive
    (list (when (eq transient-current-command 'majutsu-ediff)
            (transient-args 'majutsu-ediff))))
-  (let* ((range (majutsu-edit--edit-range args))
-         (from (car range))
-         (to (cdr range))
-         (file (majutsu-edit--read-diffedit-file from to))
-         (jj-args (majutsu-edit--build-diffedit-args from to file)))
-    (majutsu-ediff--run-diffedit jj-args file)))
+  (let* ((range (majutsu-diffedit--range args))
+         (file (majutsu-diffedit--read-file (car range) (cdr range)))
+         (jj-args (majutsu-diffedit--command-args args)))
+    (majutsu-diffedit-run jj-args file #'majutsu-ediff--diff-editor-config)))
 
-;;;###autoload
-(defun majutsu-ediff-resolve (&optional file)
+;;;###autoload(autoload 'majutsu-ediff-resolve "majutsu-ediff" nil t)
+(transient-define-suffix majutsu-ediff-resolve (&optional file)
   "Resolve FILE conflicts using `jj resolve' with Emacs as merge editor.
 If FILE is nil, DWIM selects from conflicted files at point revision (commit
 section) or the working copy."
+  :advice* #'majutsu--transient-with-selection-buffer
   (interactive)
   (let* ((rev (or (majutsu-revision-at-point) "@"))
          (file (majutsu-ediff--resolve-file-dwim file))
@@ -642,16 +622,15 @@ section) or the working copy."
     (if (> sides 2)
         (progn
           (message "%s has %d sides; using diffedit fallback" file sides)
-          (majutsu-edit--run-diffedit
-           (majutsu-edit--build-diffedit-args nil rev file)
-           file))
+          (majutsu-diffedit-run-with-editor (list "-r" rev) file))
       (majutsu-ediff--run-resolve rev file))))
 
-;;;###autoload
-(defun majutsu-ediff-resolve-with-conflict ()
+;;;###autoload(autoload 'majutsu-ediff-resolve-with-conflict "majutsu-ediff" nil t)
+(transient-define-suffix majutsu-ediff-resolve-with-conflict ()
   "Resolve conflicts using `majutsu-conflict-mode'.
 When resolving a non-working-copy revision, open the matching blob buffer
 at that revision before enabling conflict mode."
+  :advice* #'majutsu--transient-with-selection-buffer
   (interactive)
   (let* ((rev (or (majutsu-revision-at-point) "@"))
          (file (majutsu-ediff--resolve-file-dwim))
@@ -718,25 +697,19 @@ Called by `jj resolve` merge editor command via emacsclient."
   (when (derived-mode-p 'majutsu-diff-mode)
     majutsu-buffer-diff-range))
 
-(defun majutsu-ediff--transient-read-revset (prompt _initial-input _history)
-  "Read a revset for ediff transient with PROMPT."
-  (majutsu-read-revset prompt))
-
 ;;;###autoload(autoload 'majutsu-ediff "majutsu-ediff" nil t)
 (transient-define-prefix majutsu-ediff ()
   "Show differences using Ediff."
+  :class 'majutsu-jj-transient-prefix
+  :jj-command "diff"
   :incompatible '(("--revisions=" "--from=")
                   ("--revisions=" "--to="))
   :transient-non-suffix t
-  [:description "Ediff"
-   :class transient-columns
-   ["Selection"
+  :description "Ediff"
+  [["Selection"
     (majutsu-ediff:-r)
     (majutsu-ediff:--from)
     (majutsu-ediff:--to)
-    (majutsu-ediff:revisions)
-    (majutsu-ediff:from)
-    (majutsu-ediff:to)
     ("c" "Clear selections" majutsu-selection-clear :transient t)]
    ["Actions"
     ("e" "Ediff (blob)" majutsu-ediff-dwim)
@@ -758,17 +731,12 @@ Called by `jj resolve` merge editor command via emacsclient."
   :selection-label "[REVS]"
   :selection-face '(:background "goldenrod" :foreground "black")
   :locate-fn (##majutsu-selection-find-section % 'jj-commit)
-  :key "-r"
+  :selection-toggle-key "r"
+  :shortarg "-r"
   :argument "--revisions="
   :multi-value 'repeat
-  :prompt "Revisions: ")
-
-(transient-define-argument majutsu-ediff:revisions ()
-  :description "Revisions (toggle at point)"
-  :class 'majutsu-selection-toggle-option
-  :key "r"
-  :argument "--revisions="
-  :multi-value 'repeat)
+  :prompt "Revisions"
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-ediff:--from ()
   :description "From"
@@ -776,9 +744,10 @@ Called by `jj resolve` merge editor command via emacsclient."
   :selection-label "[FROM]"
   :selection-face '(:background "dark orange" :foreground "black")
   :locate-fn (##majutsu-selection-find-section % 'jj-commit)
-  :key "-f"
+  :selection-toggle-key "f"
+  :shortarg "-f"
   :argument "--from="
-  :reader #'majutsu-ediff--transient-read-revset)
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-ediff:--to ()
   :description "To"
@@ -786,21 +755,10 @@ Called by `jj resolve` merge editor command via emacsclient."
   :selection-label "[TO]"
   :selection-face '(:background "dark cyan" :foreground "white")
   :locate-fn (##majutsu-selection-find-section % 'jj-commit)
-  :key "-t"
+  :selection-toggle-key "t"
+  :shortarg "-t"
   :argument "--to="
-  :reader #'majutsu-ediff--transient-read-revset)
-
-(transient-define-argument majutsu-ediff:from ()
-  :description "From (toggle at point)"
-  :class 'majutsu-selection-toggle-option
-  :key "f"
-  :argument "--from=")
-
-(transient-define-argument majutsu-ediff:to ()
-  :description "To (toggle at point)"
-  :class 'majutsu-selection-toggle-option
-  :key "t"
-  :argument "--to=")
+  :reader #'majutsu-transient-read-revset)
 
 ;;; _
 (provide 'majutsu-ediff)

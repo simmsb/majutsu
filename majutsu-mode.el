@@ -66,6 +66,9 @@ afterward."
   "g"   'majutsu-refresh
   "q"   'majutsu-mode-bury-buffer
   "$"   'majutsu-process-buffer
+  "!"   'majutsu-command
+  "Q"   'majutsu-jj-command
+  ":"   'majutsu-jj-command
   "l"   'majutsu-log-transient
   "?"   'majutsu-dispatch
   "c"   'majutsu-describe
@@ -74,16 +77,17 @@ afterward."
   "s"   'majutsu-squash
   "S"   'majutsu-split
   "d"   'majutsu-diff
+  "v"   'majutsu-evolog
   "e"   'majutsu-edit-changeset
   "r"   'majutsu-rebase
   "V"   'majutsu-revert
   "b"   'majutsu-bookmark
-  "y"   'majutsu-duplicate
   "G"   'majutsu-git-transient
+  "X"   'majutsu-op-transient
   "Z"   'majutsu-workspace
   "%"   'majutsu-workspace
   "a"   'majutsu-absorb
-  "k"   'majutsu-abandon
+  "k"   'majutsu-delete-thing
   ">"   'majutsu-sparse
   "C-/" 'majutsu-undo
   "C-?" 'majutsu-redo
@@ -244,6 +248,16 @@ keymaps remap this command to another command that visits the thing at
   (if-let* ((url (thing-at-point 'url t)))
       (browse-url url)
     (user-error "There is no thing at point that could be visited")))
+
+(defun majutsu-delete-thing ()
+  "Delete the thing at point.
+
+This is a placeholder command.  Where applicable, section-specific
+keymaps remap this command to another command that deletes the thing at
+point."
+  (declare (completion ignore))
+  (interactive)
+  (user-error "There is no thing at point that could be deleted"))
 
 ;;; Helpers
 
@@ -548,8 +562,6 @@ when the user has strict .dir-locals.el settings."
 
 (defvar-local majutsu-buffer-log-args nil
   "Remembered log arguments for the current log buffer.")
-(defvar-local majutsu-buffer-log-revsets nil
-  "Revision set argument for the current log buffer.")
 (defvar-local majutsu-buffer-log-filesets nil
   "Filesets filter for the current log buffer.")
 

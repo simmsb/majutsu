@@ -17,7 +17,14 @@
 ;;; Code:
 
 (require 'majutsu)
+(require 'transient)
 
+(declare-function majutsu-op-diff-default-action "majutsu-op" ())
+(declare-function majutsu-op-diff-evolog-at-point "majutsu-op" ())
+(declare-function majutsu-op-diff-transient "majutsu-op" ())
+(declare-function majutsu-op-log-restore-at-point "majutsu-op" ())
+(declare-function majutsu-op-log-revert-at-point "majutsu-op" ())
+(declare-function majutsu-op-transient "majutsu-op" ())
 (declare-function turn-off-evil-snipe-mode "evil-snipe" ())
 (declare-function turn-off-evil-snipe-override-mode "evil-snipe" ())
 (declare-function evil-normalize-keymaps "evil-core" (&optional state))
@@ -51,6 +58,21 @@ When nil, Majutsu leaves Evil's state untouched."
           (const :tag "Replace" replace)
           (symbol :tag "Custom state"))
   :group 'majutsu-evil)
+
+(defconst majutsu-evil--dispatch-keys
+  '(("x" majutsu-abandon)
+    ("L" majutsu-log-transient)
+    ("_" majutsu-revert)
+    ("*" majutsu-workspace)
+    ("u" majutsu-undo)
+    ("C-r" majutsu-redo)
+    ("`" majutsu-process-buffer))
+  "Evil-facing keys shown and accepted by `majutsu-dispatch'.")
+
+(defun majutsu-evil--adjust-dispatch ()
+  "Make `majutsu-dispatch' use Majutsu's Evil-facing keys."
+  (pcase-dolist (`(,key ,command) majutsu-evil--dispatch-keys)
+    (transient-suffix-put 'majutsu-dispatch command :key key)))
 
 (defun majutsu-evil--bind-conflict-side-keys (map before)
   "Bind 1-9 in MAP to conflict side commands.
@@ -108,6 +130,9 @@ If KEYMAP is not yet bound, defer binding until it becomes available."
     (dolist (mode '(majutsu-mode
                     majutsu-log-mode
                     majutsu-op-log-mode
+                    majutsu-op-diff-mode
+                    majutsu-evolog-mode
+                    majutsu-evolog-diff-mode
                     majutsu-diff-mode))
       (evil-set-initial-state mode majutsu-evil-initial-state))))
 
@@ -136,6 +161,8 @@ This mirrors `evil-collection-magit-adjust-section-bindings'."
     (kbd "R") #'majutsu-restore
     (kbd "g r") #'majutsu-refresh
     (kbd "`") #'majutsu-process-buffer
+    (kbd "!") #'majutsu-command
+    (kbd "|") #'majutsu-jj-command
     (kbd "c") #'majutsu-describe
     (kbd "C") #'majutsu-commit
     (kbd "o") #'majutsu-new
@@ -143,7 +170,7 @@ This mirrors `evil-collection-magit-adjust-section-bindings'."
     (kbd "u") #'majutsu-undo
     (kbd "C-r") #'majutsu-redo
     (kbd "a") #'majutsu-absorb
-    (kbd "x") #'majutsu-abandon
+    (kbd "x") #'majutsu-delete-thing
     (kbd "s") #'majutsu-squash
     (kbd "S") #'majutsu-split
     (kbd "L") #'majutsu-log-transient
@@ -153,15 +180,12 @@ This mirrors `evil-collection-magit-adjust-section-bindings'."
     (kbd "V") nil
     (kbd "d") #'majutsu-diff
     (kbd "D") #'majutsu-diff-dwim
+    (kbd "X") #'majutsu-op-transient
     (kbd "*") #'majutsu-workspace
     (kbd "E") #'majutsu-ediff
     (kbd "?") #'majutsu-dispatch
     (kbd ">") #'majutsu-sparse
     (kbd "RET") #'majutsu-visit-thing)
-
-  (majutsu-evil--define-keys 'normal 'majutsu-mode-map
-    (kbd "y") #'majutsu-duplicate
-    (kbd "Y") #'majutsu-duplicate-dwim)
 
   (majutsu-evil--define-keys '(normal visual) 'majutsu-diff-mode-map
     (kbd "+") #'majutsu-diff-more-context
@@ -169,6 +193,24 @@ This mirrors `evil-collection-magit-adjust-section-bindings'."
     (kbd "~") #'majutsu-diff-default-context
     (kbd "g d") #'majutsu-jump-to-diffstat-or-diff
     (kbd "C-<return>") #'majutsu-diff-visit-workspace-file)
+
+  (majutsu-evil--define-keys '(normal visual motion) 'majutsu-evolog-mode-map
+    [remap majutsu-visit-thing] #'majutsu-evolog-diff-at-point)
+
+  (majutsu-evil--define-keys '(normal visual motion)
+      'majutsu-evolog-diff-mode-map
+    (kbd "C-j") #'magit-section-forward
+    (kbd "C-k") #'magit-section-backward
+    (kbd "g j") #'magit-section-forward-sibling
+    (kbd "g k") #'magit-section-backward-sibling
+    (kbd "]") #'magit-section-forward-sibling
+    (kbd "[") #'magit-section-backward-sibling
+    (kbd "g r") #'majutsu-refresh
+    (kbd "`") #'majutsu-process-buffer
+    (kbd "q") #'majutsu-mode-bury-buffer
+    (kbd "t") #'majutsu-diff-toggle-refine-hunk
+    (kbd "RET") #'undefined
+    (kbd "d") #'undefined)
 
   ;; majutsu-blob-mode is a minor mode, need hook + define-keys
   (add-hook 'majutsu-blob-mode-hook #'evil-normalize-keymaps)
@@ -201,6 +243,15 @@ This mirrors `evil-collection-magit-adjust-section-bindings'."
     (kbd "O") #'majutsu-new-dwim
     (kbd "I") #'majutsu-new-with-before
     (kbd "A") #'majutsu-new-with-after)
+
+  (majutsu-evil--define-keys '(normal visual motion) 'majutsu-op-log-mode-map
+    (kbd "d") #'majutsu-op-diff-transient
+    (kbd "u") #'majutsu-op-log-restore-at-point
+    (kbd "r") #'majutsu-op-log-revert-at-point)
+
+  (majutsu-evil--define-keys '(normal visual motion) 'majutsu-op-diff-mode-map
+    [remap majutsu-visit-thing] #'majutsu-op-diff-default-action
+    (kbd "v") #'majutsu-op-diff-evolog-at-point)
 
   ;; majutsu-conflict-mode is a minor mode
   (add-hook 'majutsu-conflict-mode-hook #'evil-normalize-keymaps)
@@ -240,7 +291,8 @@ Safe to call multiple times.  Set
   (interactive)
   (when (and (featurep 'evil) majutsu-evil-enable-integration)
     (majutsu-evil--set-initial-state)
-    (majutsu-evil--define-mode-keys)))
+    (majutsu-evil--define-mode-keys)
+    (majutsu-evil--adjust-dispatch)))
 
 (with-eval-after-load 'evil
   (majutsu-evil-setup))

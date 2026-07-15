@@ -25,9 +25,6 @@
 (defclass majutsu-new-option (majutsu-selection-option)
   ())
 
-(defclass majutsu-new--toggle-option (majutsu-selection-toggle-option)
-  ())
-
 ;;; majutsu-new
 
 ;;;###autoload
@@ -38,7 +35,8 @@ With prefix ARG, open the new transient for interactive selection."
   (interactive "P")
   (if arg
       (call-interactively #'majutsu-new)
-    (let ((parent (majutsu-revision-at-point)))
+    (let ((parent (or (majutsu-thing-at-point 'jj-revision t)
+                      (majutsu-revision-at-point))))
       (majutsu-new--run-command (if parent
                                     (list "new" parent)
                                   (list "new"))))))
@@ -47,7 +45,8 @@ With prefix ARG, open the new transient for interactive selection."
 (defun majutsu-new-with-after ()
   "Create a new changeset with the commit at point as --after."
   (interactive)
-  (if-let* ((after (majutsu-revision-at-point)))
+  (if-let* ((after (or (majutsu-thing-at-point 'jj-revision t)
+                        (majutsu-revision-at-point))))
       (majutsu-new--run-command (list "new" "--insert-after" after))
     (user-error "No revision at point")))
 
@@ -55,7 +54,8 @@ With prefix ARG, open the new transient for interactive selection."
 (defun majutsu-new-with-before ()
   "Create a new changeset with the commit at point as --before."
   (interactive)
-  (if-let* ((before (majutsu-revision-at-point)))
+  (if-let* ((before (or (majutsu-thing-at-point 'jj-revision t)
+                         (majutsu-revision-at-point))))
       (majutsu-new--run-command (list "new" "--insert-before" before))
     (user-error "No revision at point")))
 
@@ -70,7 +70,7 @@ With prefix ARG, open the new transient for interactive selection."
 (transient-define-argument majutsu-new-infix-no-edit ()
   :description "No edit"
   :class 'transient-switch
-  :shortarg "-e"
+  :key "-e"
   :argument "--no-edit")
 
 (transient-define-argument majutsu-new:-r ()
@@ -78,51 +78,33 @@ With prefix ARG, open the new transient for interactive selection."
   :class 'majutsu-new-option
   :selection-label "[PARENT]"
   :selection-face '(:background "dark orange" :foreground "black")
-  :key "-r"
-  :argument "-r"
+  :selection-toggle-key "r"
+  :shortarg "-r"
+  :argument "-r="
   :multi-value 'repeat
-  :reader #'majutsu-diff--transient-read-revset)
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-new:--after ()
   :description "After"
   :class 'majutsu-new-option
   :selection-label "[AFTER]"
   :selection-face '(:background "dark blue" :foreground "white")
-  :key "-A"
+  :selection-toggle-key "a"
+  :shortarg "-A"
   :argument "--insert-after="
   :multi-value 'repeat
-  :reader #'majutsu-diff--transient-read-revset)
+  :reader #'majutsu-transient-read-revset)
 
 (transient-define-argument majutsu-new:--before ()
   :description "Before"
   :class 'majutsu-new-option
   :selection-label "[BEFORE]"
   :selection-face '(:background "dark magenta" :foreground "white")
-  :key "-B"
+  :selection-toggle-key "b"
+  :shortarg "-B"
   :argument "--insert-before="
   :multi-value 'repeat
-  :reader #'majutsu-diff--transient-read-revset)
-
-(transient-define-argument majutsu-new:parent ()
-  :description "Parent (toggle at point)"
-  :class 'majutsu-new--toggle-option
-  :key "r"
-  :argument "-r"
-  :multi-value 'repeat)
-
-(transient-define-argument majutsu-new:after ()
-  :description "After (toggle at point)"
-  :class 'majutsu-new--toggle-option
-  :key "a"
-  :argument "--insert-after="
-  :multi-value 'repeat)
-
-(transient-define-argument majutsu-new:before ()
-  :description "Before (toggle at point)"
-  :class 'majutsu-new--toggle-option
-  :key "b"
-  :argument "--insert-before="
-  :multi-value 'repeat)
+  :reader #'majutsu-transient-read-revset)
 
 (defun majutsu-new--run-command (args)
   "Execute jj new with ARGS and refresh the log on success.
@@ -153,18 +135,18 @@ a jj-commit section, add -r from that section."
   (let ((args (if (eq transient-current-command 'majutsu-new)
                   (transient-args 'majutsu-new)
                 '())))
-    (unless (cl-some (lambda (arg)
-                       (or (string-prefix-p "-r" arg)
-                           (string-prefix-p "--insert-after=" arg)
-                           (string-prefix-p "--insert-before=" arg)))
-                     args)
+    (unless (or (transient-arg-value "-r=" args)
+                (transient-arg-value "--insert-after=" args)
+                (transient-arg-value "--insert-before=" args))
       (when-let* ((rev (magit-section-value-if 'jj-commit)))
-        (push (concat "-r" rev) args)))
+        (push (concat "-r=" rev) args)))
     args))
 
-;;;###autoload
-(defun majutsu-new-execute (args)
+;;;###autoload(autoload 'majutsu-new-execute "majutsu-new" nil t)
+(transient-define-suffix majutsu-new-execute (args)
   "Execute jj new using the current transient selections."
+  :description "Create new change"
+  :class 'majutsu-transient-default-action-suffix
   (interactive (list (majutsu-new-arguments)))
   (majutsu-new--run-command (cons "new" args)))
 
@@ -173,7 +155,7 @@ a jj-commit section, add -r from that section."
 (defun majutsu-new--selection-summary ()
   "Return a list summarizing the current jj new selections."
   (let (parts)
-    (when-let* ((values (majutsu-selection-values "-r")))
+    (when-let* ((values (majutsu-selection-values "-r=")))
       (push (format "Parents: %s"
                     (string-join values ", "))
             parts))
@@ -198,16 +180,15 @@ a jj-commit section, add -r from that section."
 (transient-define-prefix majutsu-new ()
   "Internal transient for jj new operations."
   :man-page "jj-new"
+  :class 'majutsu-jj-transient-prefix
+  :jj-command "new"
   :transient-non-suffix t
-  [:description majutsu-new--description
-   :class transient-columns
+  [:description
+   majutsu-new--description
    ["Selections"
     (majutsu-new:-r)
     (majutsu-new:--after)
     (majutsu-new:--before)
-    (majutsu-new:parent)
-    (majutsu-new:after)
-    (majutsu-new:before)
     ("c" "Clear selections" majutsu-selection-clear
      :transient t)]
    ["Options"
@@ -215,11 +196,7 @@ a jj-commit section, add -r from that section."
     (majutsu-new-infix-no-edit)
     (majutsu-transient-arg-ignore-immutable)]
    ["Actions"
-    ("o" "Create new change" majutsu-new-execute
-     :description "Create new change")
-    ("RET" "Create new change" majutsu-new-execute
-     :description "Create new change")
-    ("q" "Quit" transient-quit-one)]]
+    ("o" "Create new change" majutsu-new-execute)]]
   (interactive)
   (transient-setup
    'majutsu-new nil nil
