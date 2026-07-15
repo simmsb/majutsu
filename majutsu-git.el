@@ -257,7 +257,7 @@ Prompts for SOURCE and optional DEST; uses ARGS."
       (message "Git root: %s (copied)" dir))))
 
 (defun jj--init-bookmarks-at-point (obj)
-  (when-let* ((bookmarks (majutsu-bookmarks-at-point)))
+  (when-let* ((bookmarks (jj--get-closest-parent-bookmark-names)))
     (oset obj value (mapcar (lambda (s) (string-remove-suffix "*" s)) bookmarks))))
 
 (defun majutsu-git-push--read-revset (prompt initial-input history)
