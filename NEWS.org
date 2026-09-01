@@ -5,14 +5,25 @@
 
 ** Breaking changes
 
-- Jujutsu 0.40.0 or later is now required ::
-  Workspace listing relies on template functionality introduced in jj 0.40.0.
+- Jujutsu 0.41.0 or later is now required ::
+  The Gerrit upload transient exposes =--message=, =--edit=, and =--merged=,
+  and the template registry includes =replace()= require jj 0.41.0.
 
 - The Squash transient now uses =--from= for source revisions ::
   The =-r/--revision= shortcut was removed.  Use =-f/--from= instead.
   Diff =--revisions= selections are carried into squash as =--from= sources.
 
 ** Added
+
+- Commit signing transients ::
+  Add selection-aware =jj sign= and =jj unsign= frontends.  Both accept
+  repeatable revision selections; Sign also exposes an explicit signing key
+  with backend-aware completion for GPG, GPGSM, and SSH.
+
+- Whole-file patch selections ::
+  Split, Squash, and Restore can select hunkless changes, including binary
+  files, with ~F~.  Structured jj metadata supplies and verifies the file
+  operations and paths before they are replayed.
 
 - Bug references in logs and description buffers ::
   Majutsu enables ~bug-reference-mode~ there and can derive setup from JJ Git
@@ -40,9 +51,8 @@
   In log buffers, ~[~ jumps to a visible parent and ~]~ jumps to a visible
   child.
 
-- Semantic copy commands for log buffers ::
-  The log copy submenu can copy section values, rendered fields, hidden entry
-  fields, hashes, and visible modules.
+- Semantic copy for structured row buffers ::
+  Log, evolution-log, and operation-log buffers share one copy submenu.
 
 - Description-buffer message helpers ::
   JJ description buffers gain save, history, search, and diff commands.
@@ -63,6 +73,12 @@
   Reviewer, CC, and topic prompts use Majutsu's native Gerrit REST client.
 
 ** Changed
+
+- Metaedit supports visual multi-revision selection ::
+  The Metaedit transient preselects revisions from the region, point, or =@=,
+  and ~r~ can toggle additional point or region revisions with selection
+  overlays.  The old single-revision restriction has been removed to match
+  current jj.
 
 - Direct duplicate ~y~ / ~Y~ bindings were removed ::
   Open ~majutsu-duplicate~ from the dispatcher with ~? y~.  The standalone
@@ -147,6 +163,10 @@
 
 ** Removed
 
+- ~majutsu-diff-refresh~ was removed ::
+  Use ~d~ to execute the transient with the selected arguments, or ~g~ in an
+  existing diff buffer to refresh that buffer.
+
 - ~majutsu-diff-refine-max-chars~ was removed ::
   Explicit diff refinement no longer silently skips hunks over 4000
   characters, matching Magit's behavior.
@@ -168,6 +188,12 @@
 
 ** Fixed
 
+- Diff file completion follows the selected range ::
+  The Diff transient's =--= reader suggests full paths changed by the active
+  =--revisions= or =--from=/=--to= selection instead of listing the complete
+  working-copy tree. Without an explicit selection it uses the active log region
+  or the revision at point.
+
 - Split inherits only single-change diff sources ::
   Split resolves the displayed diff and inherits its change ID only when it
   represents exactly one change.  Ranges and multi-change revsets are not
@@ -188,11 +214,6 @@
   only if it is still the local directory the user confirmed and does not own
   the shared repository store.  All selected targets are checked, and unsafe
   or failed trash moves are reported together.
-
-- File changes without text hunks require matching metadata for Split ::
-  Structured metadata from jj supplies the file operation and paths.  Majutsu
-  verifies it against the displayed Git-format file headers and refuses the
-  selection when the records are missing or inconsistent.
 
 - Concurrent interactive patch operations use separate inputs ::
   Each operation stores its patch file and helper script in a separate

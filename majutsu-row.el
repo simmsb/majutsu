@@ -1279,15 +1279,6 @@ Drops tail text when both heading and tail are present in the copied region."
   (setq-local majutsu-row-entry-index nil)
   (setq-local majutsu-row-section-ident-index nil))
 
-;;; Copy text-property lookup
-
-(defun majutsu-row-text-property-near-point (property &optional pos)
-  "Return PROPERTY near POS, preferring the previous character."
-  (let ((pos (or pos (point))))
-    (or (and (> pos (point-min))
-             (get-text-property (1- pos) property))
-        (get-text-property pos property))))
-
 ;;; Copy entry lookup
 
 (defun majutsu-row-entry-for-id (id)
@@ -1309,7 +1300,7 @@ Drops tail text when both heading and tail are present in the copied region."
 
 (defun majutsu-row-entry-at-point ()
   "Return cached row entry at point, or nil."
-  (or (when-let* ((entry-id (majutsu-row-text-property-near-point
+  (or (when-let* ((entry-id (majutsu-text-property-near-point
                              'majutsu-row-entry-id)))
         (majutsu-row-entry-for-id entry-id))
       (majutsu-row--entry-at-current-section)))
@@ -1363,7 +1354,7 @@ Drops tail text when both heading and tail are present in the copied region."
 
 (defun majutsu-row-read-entry-field (entry compiled &optional prompt)
   "Read one canonical field from ENTRY using COMPILED."
-  (let* ((default-field (majutsu-row-text-property-near-point
+  (let* ((default-field (majutsu-text-property-near-point
                          'majutsu-row-field))
          (field-alist (mapcar (lambda (field)
                                 (cons (symbol-name field) field))
@@ -1413,12 +1404,9 @@ Drops tail text when both heading and tail are present in the copied region."
 
 (defun majutsu-row--column-at-point (compiled)
   "Return compiled row column described by text properties at point."
-  (let ((instance (majutsu-row-text-property-near-point
-                   'majutsu-row-column))
-        (field (majutsu-row-text-property-near-point
-                'majutsu-row-field))
-        (module (majutsu-row-text-property-near-point
-                 'majutsu-row-module)))
+  (let ((instance (majutsu-text-property-near-point 'majutsu-row-column))
+        (field (majutsu-text-property-near-point 'majutsu-row-field))
+        (module (majutsu-text-property-near-point 'majutsu-row-module)))
     (or (and instance
              (majutsu-row-column-by-instance compiled instance))
         (and field module
@@ -1460,7 +1448,7 @@ When the region is active, copy it literally using `copy-region-as-kill'."
    (lambda ()
      (let* ((entry (majutsu-row-current-entry))
             (compiled (majutsu-row-current-compiled))
-            (module (majutsu-row-text-property-near-point
+            (module (majutsu-text-property-near-point
                      'majutsu-row-module))
             (text (majutsu-row--visible-module-text entry compiled module)))
        (unless text
@@ -1493,31 +1481,15 @@ When the region is active, copy it literally using `copy-region-as-kill'."
       (majutsu-row-current-entry no-entry-message)
       field))))
 
-;;;###autoload
-(defun majutsu-row-copy-commit-id ()
-  "Copy the current structured entry's commit hash.
-
-When the region is active, copy it literally using `copy-region-as-kill'."
-  (interactive)
-  (majutsu-row-copy-entry-field-at-point 'commit-id))
-
-;;; Copy transient macro
-
-(defmacro majutsu-row-define-copy-transient (name doc &rest suffixes)
-  "Define NAME as a copy transient with DOC and extra SUFFIXES."
-  `(transient-define-prefix ,name ()
-     ,doc
-     [[("s" "Section value" majutsu-copy-section-value)
-       ("f" "Visible field at point" majutsu-row-copy-field)
-       ("F" "Entry field…" majutsu-row-copy-entry-field)
-       ("m" "Visible module at point" majutsu-row-copy-module)
-       ,@suffixes]]))
+;;; Copy transient
 
 ;;;###autoload(autoload 'majutsu-row-copy-transient "majutsu-row" nil t)
-(majutsu-row-define-copy-transient
- majutsu-row-copy-transient
- "Transient for semantic copy commands in structured row buffers."
- ("h" "Commit hash" majutsu-row-copy-commit-id))
+(transient-define-prefix majutsu-row-copy-transient ()
+  "Transient for semantic copy commands in structured row buffers."
+  [[("s" "Section value" majutsu-copy-section-value)
+    ("f" "Visible field at point" majutsu-row-copy-field)
+    ("F" "Entry field…" majutsu-row-copy-entry-field)
+    ("m" "Visible module at point" majutsu-row-copy-module)]])
 
 (provide 'majutsu-row)
 ;;; majutsu-row.el ends here

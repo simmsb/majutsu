@@ -100,6 +100,10 @@ If REQUIRE-MATCH is non-nil, require existing local tag names."
   "Read tag name patterns with PROMPT."
   (majutsu-tag--read-candidates prompt 'majutsu-tag-pattern-history nil))
 
+(defun majutsu-read-tag-patterns (prompt &optional _initial-input _history)
+  "Read tag name patterns with PROMPT for a transient option."
+  (majutsu-tag--read-patterns prompt))
+
 (defun majutsu-tag--read-names (prompt)
   "Compatibility wrapper around `majutsu-tag--read-patterns'."
   (majutsu-tag--read-patterns prompt))
@@ -158,7 +162,8 @@ When ALLOW-MOVE is non-nil, pass `--allow-move'."
   (interactive
    (let* ((default-revision (or (magit-section-value-if 'jj-commit) "@"))
           (names (majutsu-tag--read-exact-names "Set tag(s)"))
-          (revision (majutsu-read-revset "Target revision" default-revision))
+          (revision (majutsu-read-revset
+                     "Target revision" :default default-revision))
           (allow-move current-prefix-arg))
      (list names revision allow-move)))
   (when names
@@ -191,7 +196,8 @@ This is a convenience wrapper around `jj tag set --allow-move'."
   (interactive
    (let* ((default-revision (or (magit-section-value-if 'jj-commit) "@"))
           (names (majutsu-tag--read-exact-names "Move tag(s)" t))
-          (revision (majutsu-read-revset "Target revision" default-revision)))
+          (revision (majutsu-read-revset
+                     "Target revision" :default default-revision)))
      (list names revision)))
   (majutsu-tag-set names revision t))
 

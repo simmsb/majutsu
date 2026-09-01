@@ -1,4 +1,4 @@
-#+title: Majutsu - Emacs Interface for Jujutsu
+#+html: <p align="center"><a href="https://majutsu.org"><img src="docs/site/public/og.png" alt="Majutsu — Shape history without leaving Emacs" width="720"></a></p>
 
 Majutsu provides a Magit-style interface for [[https://github.com/jj-vcs/jj][Jujutsu (jj)]], offering an
 efficient way to interact with JJ repositories from within Emacs.
@@ -80,7 +80,7 @@ by Forge's Git-oriented renderer are replaced by a placeholder in Majutsu buffer
 * Requirements
 
 - Emacs 29.1+
-- [[https://github.com/jj-vcs/jj][Jujutsu (jj)]] v0.40.0+
+- [[https://github.com/jj-vcs/jj][Jujutsu (jj)]] v0.41.0+
 - [[https://magit.vc/][magit]], [[https://github.com/magit/transient][transient]], [[https://github.com/magit/with-editor][with-editor]]
 
 * Documentation

@@ -47,7 +47,7 @@
 (ert-deftest majutsu-ediff-test-parse-diff-range-to-only ()
   "Test parsing --to only."
   (let ((result (majutsu-jj--parse-diff-range '("--to=bar"))))
-    (should (equal (car result) "@-"))
+    (should (equal (car result) "@"))
     (should (equal (cdr result) "bar"))))
 
 (ert-deftest majutsu-ediff-test-parse-diff-range-nil ()
@@ -293,7 +293,7 @@
                (lambda () default-directory))
               ((symbol-function 'majutsu-completing-read)
                (lambda (_prompt collection _predicate _require-match
-                        _initial history _default category)
+                                _initial history _default category)
                  (setq seen-collection collection
                        seen-history history
                        seen-category category)

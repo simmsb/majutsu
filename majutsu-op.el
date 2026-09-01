@@ -423,28 +423,28 @@ PROMPT, INITIAL-INPUT, and HISTORY follow transient reader conventions."
      :template [:if [:root] "" [:label "user" [:user]]] :face t)
     (:field workspace :module heading
      :template [:if [:root]
-                ""
-                [:label "workspace_name" [:workspace_name]]]
+                   ""
+                 [:label "workspace_name" [:workspace_name]]]
      :face t)
     (:field time-range :module heading
      :template [:if [:root]
-                ""
-                [:concat
-                 [:label "time end ago" [:method [:time :end] :ago]]
-                 [:label "time" ", lasted "]
-                 [:label "time duration" [:method [:time] :duration]]]]
+                   ""
+                 [:concat
+                  [:label "time end ago" [:method [:time :end] :ago]]
+                  [:label "time" ", lasted "]
+                  [:label "time duration" [:method [:time] :duration]]]]
      :face t)
     (:field description :module body
      :template [:if [:root]
-                ""
-                [:label "description first_line"
-                 [:method [:description] :first_line]]]
+                   ""
+                 [:label "description first_line"
+                         [:method [:description] :first_line]]]
      :face t)
     (:field attributes :module body
      :template [:if [:root]
-                ""
-                [:label "attributes"
-                 [:method [:attributes] :replace "\n" "\x1f"]]]
+                   ""
+                 [:label "attributes"
+                         [:method [:attributes] :replace "\n" "\x1f"]]]
      :face t)
     (:field op-id :module metadata :template [:id]
      :face nil :post majutsu-op--row-machine-field)
@@ -452,8 +452,8 @@ PROMPT, INITIAL-INPUT, and HISTORY follow transient reader conventions."
      :face nil :post majutsu-op--row-machine-field)
     (:field kind :module metadata
      :template [:if [:root]
-                "root"
-                [:if [:snapshot] "snapshot" "op"]]
+                   "root"
+                 [:if [:snapshot] "snapshot" "op"]]
      :face nil :post majutsu-op--row-machine-field)
     (:field current :module metadata
      :template [:if [:current_operation] "t" ""]
@@ -612,18 +612,6 @@ switch, and graph switch are allowed."
   (if-let* ((op-id (majutsu-op--operation-at-point)))
       (majutsu-op-revert op-id)
     (user-error "No operation at point")))
-
-;;;###autoload
-(defun majutsu-op-log-copy-operation-id ()
-  "Copy the current operation log entry id."
-  (interactive)
-  (majutsu-row-copy-entry-field-at-point 'op-id "No operation at point"))
-
-;;;###autoload(autoload 'majutsu-op-log-copy-transient "majutsu-op" nil t)
-(majutsu-row-define-copy-transient
- majutsu-op-log-copy-transient
- "Transient for semantic copy commands in `majutsu-op-log-mode'."
- ("o" "Operation id" majutsu-op-log-copy-operation-id))
 
 (defvar-keymap majutsu-op-log-mode-map
   :doc "Keymap for `majutsu-op-log-mode'."

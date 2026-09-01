@@ -32,7 +32,7 @@
 (require 'majutsu-completion)
 (require 'majutsu-template)
 
-(autoload 'majutsu-process-file "majutsu-process" nil nil)
+(autoload 'majutsu-process-jj "majutsu-process" nil nil)
 
 (defvar corfu-margin-formatters)
 
@@ -205,10 +205,7 @@ Each returned item is a string or (CANDIDATE . HELP)."
   (condition-case nil
       (with-temp-buffer
         (let* ((process-environment (cons "COMPLETE=fish" process-environment))
-               (exit (apply #'majutsu-process-file
-                            (majutsu-jj--executable)
-                            nil t nil
-                            (append '("--" "jj") args))))
+               (exit (majutsu-process-jj t "--" "jj" args)))
           (when (zerop exit)
             (delq nil
                   (mapcar #'majutsu-jj--parse-completion-line
@@ -356,100 +353,60 @@ refs (`<workspace>@'), bookmarks, and tags."
   (setq-local completion-at-point-functions
               '(majutsu-jj-revset-completion-at-point)))
 
-(defun majutsu-read-single-revset (prompt &optional default completion-args history initial-input)
-  "Prompt user with PROMPT to read a single revision selector.
+(cl-defun majutsu-read-revision
+    (prompt &key default initial-input history completion-args allow-empty)
+  "Read one revision selector with PROMPT.
 
-Unlike `majutsu-read-revset', this reader is intended for arguments such as
-`--from' and `--to' which accept one revision selector rather than a full
-revset expression.  When COMPLETION-ARGS is non-nil, use jj's native completer
-in that command context.  HISTORY defaults to `majutsu-read-revset-history'.
-INITIAL-INPUT, when non-nil, is inserted into the minibuffer."
-  (let* ((default (or default
-                      (majutsu-thing-at-point 'jj-revision t)
-                      (majutsu-revision-at-point)
-                      "@"))
-         (table (if completion-args
-                    (majutsu-jj--completion-table completion-args
-                                                  'majutsu-revision)
-                  (majutsu-completion-payload-table
-                   (majutsu-jj-revset-candidate-data)
-                   'majutsu-revision))))
-    (let ((value (completing-read (format-prompt prompt default)
-                                  table nil nil initial-input
-                                  (or history 'majutsu-read-revset-history)
-                                  default)))
-      (if (string-empty-p value)
-          (user-error "Need non-empty input")
-        value))))
-
-(defun majutsu-read-optional-single-revset (prompt &optional default initial-input history completion-args)
-  "Prompt user with PROMPT to read an optional single revision selector.
-
-When COMPLETION-ARGS is nil, fallback candidates include workspaces,
-bookmarks, and tags.  When COMPLETION-ARGS is non-nil, use jj's native
-completer in that command context.  Empty input returns nil instead of
-signaling an error.  DEFAULT is shown in `format-prompt' when non-nil,
-and INITIAL-INPUT is inserted into the minibuffer when non-nil.  HISTORY
-defaults to `majutsu-read-revset-history'."
+DEFAULT, INITIAL-INPUT, HISTORY, and COMPLETION-ARGS configure the
+minibuffer consistently with `majutsu-read-revset'.  When ALLOW-EMPTY
+is non-nil, empty input returns nil.  Otherwise DEFAULT falls back to
+the revision at point and then `@'."
+  (setq default
+        (or default
+            (and (not allow-empty)
+                 (or (majutsu-revision-at-point) "@"))))
   (let* ((table (if completion-args
                     (majutsu-jj--completion-table completion-args
                                                   'majutsu-revision)
                   (majutsu-completion-payload-table
                    (majutsu-jj-revset-candidate-data)
                    'majutsu-revision)))
-         (value (completing-read (format-prompt prompt default)
-                                 table nil nil initial-input
-                                 (or history 'majutsu-read-revset-history)
-                                 default)))
-    (unless (string-empty-p value)
-      value)))
+         (value (completing-read
+                 (format-prompt prompt default)
+                 table nil nil initial-input
+                 (or history 'majutsu-read-revset-history)
+                 (and (not allow-empty) default))))
+    (cond
+     ((not (string-empty-p value)) value)
+     (allow-empty nil)
+     ((and default (not (string-empty-p default))) default)
+     (t (user-error "Need non-empty input")))))
 
-(defun majutsu-read-revset (prompt &optional default completion-args)
-  "Prompt user with PROMPT to read a revision set string.
-Free-form revset expressions are allowed.
+(cl-defun majutsu-read-revset
+    (prompt &key default initial-input history completion-args allow-empty)
+  "Read a free-form revset expression with PROMPT.
 
-When COMPLETION-ARGS is nil, fallback candidates include workspaces,
-bookmarks, and tags.  When COMPLETION-ARGS is non-nil, use jj's native
-completer in that command context.  COMPLETION-ARGS are command-line
-arguments before the revset value being read."
-  (let* ((default (or default
-                      (majutsu-thing-at-point 'jj-revision t)
-                      (majutsu-revision-at-point)
-                      "@"))
-         (majutsu-jj--revset-completion-args completion-args))
-    (let ((value (minibuffer-with-setup-hook
-                     #'majutsu-jj--revset-minibuffer-setup
-                   (read-from-minibuffer (format-prompt prompt default)
-                                         nil
-                                         majutsu-read-revset-map
-                                         nil
-                                         'majutsu-read-revset-history
-                                         default))))
-      (cond
-       ((not (string-empty-p value)) value)
-       ((and default (not (string-empty-p default))) default)
-       (t (user-error "Need non-empty input"))))))
-
-(defun majutsu-read-optional-revset (prompt &optional default initial-input history completion-args)
-  "Prompt user with PROMPT to read an optional revset string.
-
-When COMPLETION-ARGS is nil, fallback candidates include workspaces,
-bookmarks, and tags.  When COMPLETION-ARGS is non-nil, use jj's native
-completer in that command context.  Empty input returns nil instead of
-signaling an error.  DEFAULT is shown in `format-prompt' when non-nil,
-and INITIAL-INPUT is inserted into the minibuffer when non-nil.  HISTORY
-defaults to `majutsu-read-revset-history'."
+DEFAULT, INITIAL-INPUT, HISTORY, COMPLETION-ARGS, and ALLOW-EMPTY have
+the same meaning as in `majutsu-read-revision'."
+  (setq default
+        (or default
+            (and (not allow-empty)
+                 (or (majutsu-revision-at-point) "@"))))
   (let ((majutsu-jj--revset-completion-args completion-args))
     (let ((value (minibuffer-with-setup-hook
                      #'majutsu-jj--revset-minibuffer-setup
-                   (read-from-minibuffer (format-prompt prompt default)
-                                         initial-input
-                                         majutsu-read-revset-map
-                                         nil
-                                         (or history 'majutsu-read-revset-history)
-                                         default))))
-      (unless (string-empty-p value)
-        value))))
+                   (read-from-minibuffer
+                    (format-prompt prompt default)
+                    initial-input
+                    majutsu-read-revset-map
+                    nil
+                    (or history 'majutsu-read-revset-history)
+                    (and (not allow-empty) default)))))
+      (cond
+       ((not (string-empty-p value)) value)
+       (allow-empty nil)
+       ((and default (not (string-empty-p default))) default)
+       (t (user-error "Need non-empty input"))))))
 
 (defun majutsu-jj--parse-diff-range (range)
   "Parse RANGE into (from . to) cons.
@@ -470,7 +427,7 @@ RANGE is a list like (\"--revisions=xxx\") or (\"--from=xxx\" \"--to=xxx\")."
        (revisions (cons (concat revisions "-") revisions))
        ((and from to) (cons from to))
        (from (cons from "@"))
-       (to (cons "@-" to))
+       (to (cons "@" to))
        (t (cons "@-" "@"))))))
 
 (defun majutsu-jj-read-diff-file (from to)
@@ -518,44 +475,6 @@ until an accessible directory is found.  Return nil if none is found."
 (defvar majutsu-buffer-blob-revision)
 (defvar majutsu-buffer-diff-range)
 
-(defvar majutsu-bookmark-faces
-  '(majutsu-log-bookmark-face)
-  "Faces used for JJ bookmark identifiers in Majutsu buffers.")
-
-(defvar majutsu-tag-faces
-  '(majutsu-log-tag-face)
-  "Faces used for JJ tag identifiers in Majutsu buffers.")
-
-(defvar majutsu-revision-faces
-  '(majutsu-log-revision-face
-    majutsu-log-change-id-face
-    majutsu-log-commit-id-face
-    majutsu-log-bookmark-face
-    majutsu-log-tag-face)
-  "Faces used for JJ revision identifiers in Majutsu buffers.")
-
-(defun majutsu-thing-at-point (thing &optional no-properties)
-  "Return THING at point.
-This thin wrapper exists so Majutsu can later extend point semantics
-without changing call sites."
-  (thing-at-point thing no-properties))
-
-(defun majutsu--faces-at-point (&optional pos)
-  "Return all faces at POS as a list."
-  (let ((faces (or (get-text-property (or pos (point)) 'font-lock-face)
-                   (get-text-property (or pos (point)) 'face))))
-    (cond
-     ((null faces) nil)
-     ((listp faces) faces)
-     (t (list faces)))))
-
-(defun majutsu--face-at-point-p (faces &optional pos)
-  "Return non-nil when any of FACES appears at POS."
-  (let ((faces (ensure-list faces)))
-    (seq-some (lambda (face)
-                (memq face (majutsu--faces-at-point pos)))
-              faces)))
-
 (defun majutsu--regexp-char-class (chars)
   "Return CHARS escaped for use inside a regexp character class."
   (mapconcat (lambda (ch)
@@ -576,14 +495,6 @@ without changing call sites."
                                         range)))
                (substring arg (length "--revisions=")))))))
 
-(defun majutsu--section-revision-at-point ()
-  "Return the section value at point when it identifies a JJ revision."
-  (magit-section-case
-    (jj-bookmark (oref it value))
-    (jj-tag (oref it value))
-    (jj-commit (oref it value))
-    (jj-evolog-entry (oref it value))))
-
 (defun majutsu--buffer-revision-at-point ()
   "Return the revision implied by the surrounding Majutsu buffer."
   (or (and (bound-and-true-p majutsu-buffer-blob-revision)
@@ -592,11 +503,22 @@ without changing call sites."
 
 (defun majutsu-revision-at-point ()
   "Return the JJ revision at point.
-Prefer semantic section values, then textual JJ revision syntax, then
-buffer-implied revisions such as blob and diff contexts."
-  (or (majutsu--section-revision-at-point)
-      (majutsu-thing-at-point 'jj-revision t)
+Prefer the current semantic revision section, then literal revision
+syntax under point, and finally buffer-implied revisions such as blob
+and diff contexts."
+  (or (magit-section-value-if 'majutsu-revision-section)
+      (magit-thing-at-point 'jj-revision t)
       (majutsu--buffer-revision-at-point)))
+
+(defun majutsu-revisions-at-point ()
+  "Return revision selection targets from the active region or point.
+An active region of sibling `jj-commit' sections returns their section
+values.  Otherwise return `majutsu-revision-at-point' as a singleton
+list.  Returned strings have no text properties."
+  (mapcar #'substring-no-properties
+          (or (magit-region-values 'jj-commit t)
+              (when-let* ((revision (majutsu-revision-at-point)))
+                (list revision)))))
 
 (defun majutsu-jj-revision-p (rev)
   "Return non-nil if REV names an existing JJ revision.
@@ -634,7 +556,9 @@ in the revision identifier (used for recursive refinement)."
              (string (thread-first string
                                    (string-trim-left  "[][()</\"']+")
                                    (string-trim-right "[])>\"'.,;:!]+"))))
-    (let* ((revision-face (majutsu--face-at-point-p majutsu-revision-faces))
+    (let* ((structured-revision
+            (memq (majutsu-text-property-near-point 'majutsu-row-field)
+                  '(change-id commit-id bookmarks tags)))
            (explicit-syntax (majutsu--explicit-jj-revision-syntax-p string)))
       (when (or (string-match-p "\\.\\." string)
                 (string-match-p "/\\." string))
@@ -649,7 +573,7 @@ in the revision identifier (used for recursive refinement)."
         (and (not (string-match-p "\`[[:space:]]*\'" string))
              (or
               (and (string-match-p "^[k-z]+$" string)
-                   (>= (length string) (if revision-face 1 4))
+                   (>= (length string) (if structured-revision 1 4))
                    (majutsu-jj-revision-p string))
               (and (>= (length string) 4)
                    (string-match-p "^[0-9a-fA-F]+$" string)
@@ -657,7 +581,7 @@ in the revision identifier (used for recursive refinement)."
               (string-equal string "@")
               (and explicit-syntax
                    (majutsu-jj-revision-p string))
-              (and revision-face
+              (and structured-revision
                    (majutsu-jj-revision-p string)))
              string)))))
 
@@ -671,14 +595,16 @@ in the revision identifier (used for recursive refinement)."
 (defun majutsu-bookmark-at-point (&optional _bookmark-type)
   "Return the bookmark name at point, or nil when none is found."
   (or (magit-section-value-if 'jj-bookmark)
-      (and (majutsu--face-at-point-p majutsu-bookmark-faces)
-           (majutsu-thing-at-point 'jj-revision t))))
+      (and (eq (majutsu-text-property-near-point 'majutsu-row-field)
+               'bookmarks)
+           (magit-thing-at-point 'jj-revision t))))
 
 (defun majutsu-tag-at-point ()
   "Return the tag name at point, or nil when none is found."
   (or (magit-section-value-if 'jj-tag)
-      (and (majutsu--face-at-point-p majutsu-tag-faces)
-           (majutsu-thing-at-point 'jj-revision t))))
+      (and (eq (majutsu-text-property-near-point 'majutsu-row-field)
+               'tags)
+           (magit-thing-at-point 'jj-revision t))))
 
 ;;; Errors
 
@@ -718,15 +644,14 @@ This runs `jj workspace root' and returns a directory name (with a
 trailing slash) or nil if not inside a JJ workspace."
   (majutsu--with-safe-default-directory directory
     (majutsu--with-no-color
-      (let* ((args (majutsu-process-jj-arguments '("workspace" "root"))))
-        (with-temp-buffer
-          (let ((coding-system-for-read 'utf-8-unix)
-                (coding-system-for-write 'utf-8-unix)
-                (exit (apply #'majutsu-process-file (majutsu-jj--executable) nil t nil args)))
-            (when (zerop exit)
-              (let ((out (string-trim (buffer-string))))
-                (unless (string-empty-p out)
-                  (majutsu-jj-expand-directory-from-jj out default-directory))))))))))
+      (with-temp-buffer
+        (let ((coding-system-for-read 'utf-8-unix)
+              (coding-system-for-write 'utf-8-unix)
+              (exit (majutsu-process-jj t "workspace" "root")))
+          (when (zerop exit)
+            (let ((out (string-trim (buffer-string))))
+              (unless (string-empty-p out)
+                (majutsu-jj-expand-directory-from-jj out default-directory)))))))))
 
 (defun majutsu--toplevel-safe (&optional directory)
   "Return the workspace root for DIRECTORY or signal an error."
@@ -750,8 +675,7 @@ to do the following.
 
 * Flatten ARGS, removing nil arguments.
 * Prepend `majutsu-jj-global-arguments' to ARGS."
-  (setq args (seq-remove #'null (flatten-tree args)))
-  (append (seq-remove #'null majutsu-jj-global-arguments) args))
+  (append majutsu-jj-global-arguments (flatten-tree args)))
 
 (defun majutsu--jj-insert (return-error &rest args)
   "Run jj with ARGS and insert output at point.
@@ -763,14 +687,13 @@ exit code if there is no error output.  When RETURN-ERROR is
 
 This is the low-level worker for `majutsu-jj-insert' and similar
 functions."
-  (setq args (majutsu-process-jj-arguments args))
+  (setq args (flatten-tree args))
   (let* ((start-time (current-time))
          (err-file (and return-error
                         (make-nearby-temp-file "majutsu-jj-err")))
          exit-code)
     (majutsu--debug "Running command: %s %s" (majutsu-jj--executable) (string-join args " "))
-    (setq exit-code (apply #'majutsu-process-file (majutsu-jj--executable) nil
-                           (list t err-file) nil args))
+    (setq exit-code (majutsu-process-jj (list t err-file) args))
     (majutsu--debug "Command completed in %.3f seconds, exit code: %d"
                     (float-time (time-subtract (current-time) start-time))
                     exit-code)
@@ -835,7 +758,7 @@ Empty items are omitted from the result."
 (defun majutsu-jj--parse-conflicted-file-record (record)
   "Parse one conflicted-file machine RECORD into a plist."
   (let* ((fields (majutsu--split-fields
-                   (or record "") majutsu-jj--conflicted-file-field-separator 2))
+                  (or record "") majutsu-jj--conflicted-file-field-separator 2))
          (sides (string-to-number (or (nth 0 fields) "")))
          (path (nth 1 fields)))
     (when (and (stringp path)
@@ -914,12 +837,16 @@ KEEP-ERROR matches `magit--git-wash': nil drops stderr on error,
 and anything else keeps the error text without washing stdout.  Output is
 optionally colorized based on `majutsu-process-apply-ansi-colors'."
   (declare (indent 2))
-  (setq args (majutsu-process-jj-arguments args))
+  (setq args (flatten-tree args))
   (let* ((beg (point))
          (err-file (make-nearby-temp-file "majutsu-jj-err")))
     (unwind-protect
-        (let* ((exit (apply #'majutsu-process-file (majutsu-jj--executable) nil
-                            (list t err-file) nil args))
+        (let* ((exit
+                ;; jj log's structured row protocol is temporarily inserted
+                ;; as raw subprocess output.  Do not let it be redisplayed
+                ;; before the washer replaces it with sections.
+                (let ((inhibit-redisplay t))
+                  (majutsu-process-jj (list t err-file) args)))
                (error-text
                 (when (and keep-error (not (= exit 0)))
                   (let ((text

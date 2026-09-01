@@ -8,7 +8,6 @@
 
 (require 'ert)
 (require 'magit-section)
-(require 'transient)
 (require 'majutsu-row)
 
 (defconst majutsu-row-test--profile
@@ -106,7 +105,7 @@
   "Column declarations should not use compiler-internal :instance."
   (let* ((columns
           '((:field title :module heading :template "Title" :face nil
-                    :instance 0)))
+             :instance 0)))
          (profile (append majutsu-row-test--profile
                           (list :columns-var 'majutsu-row-test--columns)))
          (majutsu-row-test--columns columns))
@@ -433,14 +432,6 @@
                    "id")))
         (majutsu-row-copy-entry-field))
       (should (equal copied "id-1")))))
-
-(ert-deftest majutsu-row-copy-transient-has-copy-actions ()
-  "Shared row copy transient should expose semantic copy actions."
-  (should (transient-get-suffix 'majutsu-row-copy-transient "s"))
-  (should (transient-get-suffix 'majutsu-row-copy-transient "f"))
-  (should (transient-get-suffix 'majutsu-row-copy-transient "F"))
-  (should (transient-get-suffix 'majutsu-row-copy-transient "h"))
-  (should (transient-get-suffix 'majutsu-row-copy-transient "m")))
 
 (provide 'majutsu-row-test)
 

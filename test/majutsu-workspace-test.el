@@ -17,13 +17,14 @@
 
 (require 'ert)
 (require 'majutsu-workspace)
+(require 'majutsu-jj-integration)
 
 (defun majutsu-workspace-test--row (&rest fields)
   "Return one structured workspace row for FIELDS."
   (concat (mapconcat (lambda (entry)
                        (pcase-let ((`(,field ,value) entry))
                          (if (plist-get (majutsu-workspace--field-spec field)
-                                       :json)
+                                        :json)
                              (json-serialize value)
                            value)))
                      (cl-mapcar #'list
@@ -466,6 +467,53 @@
     (should (equal (majutsu-workspace--read-root "feature")
                    "/tmp/feature/"))))
 
+(ert-deftest majutsu-workspace--read-add-destination/uses-name-as-sibling-default ()
+  "Workspace destinations should default to PREFIX_NAME beside the root."
+  (let (seen-args)
+    (cl-letf (((symbol-function 'read-directory-name)
+               (lambda (&rest args)
+                 (setq seen-args args)
+                 "/tmp/majutsu_FEATURE_B")))
+      (should (equal (majutsu-workspace--read-add-destination
+                      "/tmp/majutsu_OLD/" "FEATURE/B")
+                     "/tmp/majutsu_FEATURE_B"))
+      (should (equal seen-args
+                     '("Create workspace at: " "/tmp/" nil nil
+                       "majutsu_FEATURE-B"))))))
+
+(ert-deftest majutsu-workspace-add/interactive-reads-name-before-destination ()
+  "Interactive workspace add should use the name to default the destination."
+  (let (calls seen-args)
+    (cl-letf (((symbol-function 'majutsu--toplevel-safe)
+               (lambda (&optional _directory) "/tmp/majutsu/"))
+              ((symbol-function 'majutsu-workspace--names)
+               (lambda (&optional _directory) nil))
+              ((symbol-function 'majutsu-completing-read)
+               (lambda (prompt &rest _args)
+                 (cond
+                  ((string-prefix-p "Workspace name" prompt)
+                   (push 'name calls)
+                   "FEATURE_B")
+                  ((equal prompt "Sparse patterns") "copy"))))
+              ((symbol-function 'read-directory-name)
+               (lambda (_prompt directory _default _must-match initial)
+                 (push 'destination calls)
+                 (should (equal directory "/tmp/"))
+                 (should (equal initial "majutsu_FEATURE_B"))
+                 "/tmp/majutsu_FEATURE_B"))
+              ((symbol-function 'majutsu-read-revset)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'majutsu-run-jj)
+               (lambda (&rest args)
+                 (setq seen-args args)
+                 0))
+              ((symbol-function 'majutsu-workspace-visit) #'ignore))
+      (call-interactively #'majutsu-workspace-add)
+      (should (equal (nreverse calls) '(name destination)))
+      (should (equal seen-args
+                     '("workspace" "add" "/tmp/majutsu_FEATURE_B"
+                       "--name" "FEATURE_B"))))))
+
 (ert-deftest majutsu-workspace-add/uses-local-destination-for-jj ()
   "Workspace add should pass a local destination path to remote jj.
 The Emacs-facing path remains unchanged for visiting the new workspace."
@@ -797,42 +845,35 @@ The Emacs-facing path remains unchanged for visiting the new workspace."
 
 (ert-deftest majutsu-workspace/integration-control-root-with-minimum-jj ()
   "Exercise NUL-framed root transport against MAJUTSU_TEST_JJ."
-  (let ((jj (getenv "MAJUTSU_TEST_JJ")))
-    (skip-unless (and jj (file-executable-p jj)))
-    (let* ((parent (make-temp-file "majutsu-workspace-integration-" t))
-           (repo (expand-file-name "repo" parent))
-           (odd-root (concat (expand-file-name "line\nbreak" parent)
-                             (string 30)
-                             "tail"
-                             (string 27) "[31mRED" (string 27) "[0m")))
-      (unwind-protect
-          (progn
-            (should (zerop (call-process jj nil nil nil "git" "init" repo)))
-            (let ((default-directory (file-name-as-directory repo))
-                  (majutsu-jj-executable jj))
-              (should (zerop (call-process jj nil nil nil
-                                           "workspace" "add" odd-root
-                                           "--name" "odd")))
-              (let ((entry (cl-find "odd" (majutsu-workspace-list-entries)
-                                    :key (lambda (item)
-                                           (plist-get item :name))
-                                    :test #'equal)))
-                (should entry)
-                (should (equal (plist-get entry :root)
-                               (file-name-as-directory odd-root))))
-              (should (equal (majutsu-workspace--root-for-name "odd")
-                             (file-name-as-directory odd-root)))
-              ;; A root() error includes the unresolved path verbatim.  Its
-              ;; newline and record-separator characters must not corrupt the
-              ;; surrounding NUL-framed workspace records.
-              (delete-directory odd-root t)
-              (let ((entry (cl-find "odd" (majutsu-workspace-list-entries)
-                                    :key (lambda (item)
-                                           (plist-get item :name))
-                                    :test #'equal)))
-                (should entry)
-                (should-not (plist-get entry :root)))))
-        (delete-directory parent t)))))
+  (majutsu-jj-integration-with-repo repo
+    (let ((odd-root (concat (expand-file-name "line\nbreak"
+                                              (file-name-directory
+                                               (directory-file-name repo)))
+                            (string 30)
+                            "tail"
+                            (string 27) "[31mRED" (string 27) "[0m")))
+      (majutsu-jj-integration-call repo
+                                   "workspace" "add" odd-root
+                                   "--name" "odd")
+      (let ((entry (cl-find "odd" (majutsu-workspace-list-entries)
+                            :key (lambda (item)
+                                   (plist-get item :name))
+                            :test #'equal)))
+        (should entry)
+        (should (equal (plist-get entry :root)
+                       (file-name-as-directory odd-root))))
+      (should (equal (majutsu-workspace--root-for-name "odd")
+                     (file-name-as-directory odd-root)))
+      ;; A root() error includes the unresolved path verbatim.  Its newline
+      ;; and record-separator characters must not corrupt the surrounding
+      ;; NUL-framed workspace records.
+      (delete-directory odd-root t)
+      (let ((entry (cl-find "odd" (majutsu-workspace-list-entries)
+                            :key (lambda (item)
+                                   (plist-get item :name))
+                            :test #'equal)))
+        (should entry)
+        (should-not (plist-get entry :root))))))
 
 (provide 'majutsu-workspace-test)
 ;;; majutsu-workspace-test.el ends here

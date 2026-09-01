@@ -262,14 +262,22 @@ Prompts for SOURCE and optional DEST; uses ARGS."
 
 (defun majutsu-git-push--read-revset (prompt initial-input history)
   "Read revset for `jj git push --revision='."
-  (when-let* ((value (majutsu-read-optional-revset
-                      prompt nil initial-input history '("git" "push" "-r"))))
+  (when-let* ((value (majutsu-read-revset
+                      prompt
+                      :allow-empty t
+                      :initial-input initial-input
+                      :history history
+                      :completion-args '("git" "push" "-r"))))
     (split-string value crm-separator t)))
 
 (defun majutsu-git-push--read-change (prompt initial-input history)
   "Read change id for `jj git push --change='."
-  (majutsu-read-optional-single-revset
-   prompt nil initial-input history '("git" "push" "-c")))
+  (majutsu-read-revision
+   prompt
+   :allow-empty t
+   :initial-input initial-input
+   :history history
+   :completion-args '("git" "push" "-c")))
 
 (transient-define-argument majutsu-git-push:--revision ()
   :description "Revisions"
@@ -344,6 +352,14 @@ Prompts for SOURCE and optional DEST; uses ARGS."
   :multi-value 'repeat
   :reader #'majutsu-read-bookmark-patterns
   :init-value #'jj--init-bookmarks-at-point)
+
+(transient-define-argument majutsu-git:--tag ()
+  :description "Tag"
+  :class 'transient-option
+  :key "-T"
+  :argument "--tag="
+  :multi-value 'repeat
+  :reader #'majutsu-read-tag-patterns)
 
 (transient-define-argument majutsu-git-remote-add:--push-url ()
   :description "Push URL"
@@ -424,7 +440,8 @@ Prompts for SOURCE and optional DEST; uses ARGS."
   [["Arguments"
     (majutsu-git-push:--remote)
     (majutsu-git:--bookmark)
-    ("-a" "All bookmarks" "--all")
+    (majutsu-git:--tag)
+    ("-a" "All bookmarks and tags" "--all")
     ("-t" "Tracked only" "--tracked")
     ("-D" "Deleted" "--deleted")
     ("-E" "Allow empty desc" "--allow-empty-description")
@@ -448,6 +465,7 @@ Prompts for SOURCE and optional DEST; uses ARGS."
   [["Arguments"
     (majutsu-git-fetch:--remote)
     (majutsu-git:--branch)
+    (majutsu-git:--tag)
     ("-t" "Tracked only" "--tracked")
     ("-A" "All remotes" "--all-remotes")]
    [("f" "Fetch" majutsu-git-fetch)

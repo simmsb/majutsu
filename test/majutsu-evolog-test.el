@@ -175,14 +175,6 @@
       (should (equal (magit-section-value-if 'jj-evolog-entry)
                      "commit-full")))))
 
-(ert-deftest majutsu-evolog-copy-transient-has-copy-actions ()
-  "Evolog copy transient should expose shared row copy actions."
-  (should (transient-get-suffix 'majutsu-evolog-copy-transient "s"))
-  (should (transient-get-suffix 'majutsu-evolog-copy-transient "f"))
-  (should (transient-get-suffix 'majutsu-evolog-copy-transient "F"))
-  (should (transient-get-suffix 'majutsu-evolog-copy-transient "h"))
-  (should (transient-get-suffix 'majutsu-evolog-copy-transient "m")))
-
 (ert-deftest majutsu-evolog-transient/has-safe-list-options ()
   (let ((limit (get 'majutsu-evolog:--limit 'transient--suffix)))
     (should limit)
@@ -275,13 +267,13 @@
                                (oref file children))))
           (should (cl-typep file 'majutsu-evolog-file-section))
           (should (cl-typep hunk 'majutsu-evolog-hunk-section))))
-    (should-not seen-keep)
-    (should-not seen-ansi)
-    (should (member "--color=never" seen-global-args))
-    (should (= 1 (seq-count (lambda (arg) (string-prefix-p "--color" arg))
-                            seen-global-args)))
-    (should (equal seen-args
-                   (majutsu-evolog--inter-diff-command-args "0123abcdef"))))))
+      (should-not seen-keep)
+      (should-not seen-ansi)
+      (should (member "--color=never" seen-global-args))
+      (should (= 1 (seq-count (lambda (arg) (string-prefix-p "--color" arg))
+                              seen-global-args)))
+      (should (equal seen-args
+                     (majutsu-evolog--inter-diff-command-args "0123abcdef"))))))
 
 (ert-deftest majutsu-evolog-inter-diff-refresh/shows-empty-patch ()
   (cl-letf (((symbol-function 'majutsu-jj-wash)

@@ -18,9 +18,6 @@
 
 (require 'majutsu)
 
-(defclass majutsu-split-option (majutsu-selection-option)
-  ())
-
 (defun majutsu-split--diff-source-revision (&optional buffer)
   "Return the single Split source represented by diff BUFFER.
 Return the resolved change ID only when the displayed diff represents exactly
@@ -67,21 +64,17 @@ one change."
   (interactive (list (transient-args 'majutsu-split)))
   (pcase-let* ((`(,args ,filesets) (majutsu-filesets-split-transient-value args))
                ;; Text hunks and hunkless files coexist in one operation.
-               (operation (majutsu-interactive-build-operation-if-selected
-                           nil nil nil nil))
-               (patch (plist-get operation :patch))
-               (file-ops (plist-get operation :file-ops))
+               (plan (majutsu-interactive-build-replay-plan-if-selected))
                (patch-source
-                (and operation (majutsu-split--diff-source-revision)))
-               (args (if operation
+                (and plan (majutsu-split--diff-source-revision)))
+               (args (if plan
                          (majutsu-split--remove-interactive-tool-args args)
                        args)))
-    (if operation
+    (if plan
         (progn
           (majutsu-split--check-patch-source args patch-source)
           ;; Reset to the left tree, then replay precisely the selections.
-          (majutsu-interactive-run-with-patch
-           "split" args filesets patch t file-ops)
+          (majutsu-interactive-run-replay-plan "split" args filesets plan)
           (majutsu-interactive-clear))
       (majutsu-run-jj-with-editor
        (cons "split" (majutsu-jj-append-filesets args filesets))))))
@@ -90,7 +83,7 @@ one change."
 
 (transient-define-argument majutsu-split:--revision ()
   :description "Revision"
-  :class 'majutsu-split-option
+  :class 'majutsu-revision-selection-option
   :selection-label "[REV]"
   :selection-face '(:background "goldenrod" :foreground "black")
   :selection-toggle-key "r"
@@ -101,7 +94,7 @@ one change."
 
 (transient-define-argument majutsu-split:--onto ()
   :description "Onto"
-  :class 'majutsu-split-option
+  :class 'majutsu-revision-selection-option
   :selection-label "[ONTO]"
   :selection-face '(:background "dark green" :foreground "white")
   :selection-toggle-key "o"
@@ -113,7 +106,7 @@ one change."
 
 (transient-define-argument majutsu-split:--insert-after ()
   :description "Insert after"
-  :class 'majutsu-split-option
+  :class 'majutsu-revision-selection-option
   :selection-label "[AFTER]"
   :selection-face '(:background "dark blue" :foreground "white")
   :selection-toggle-key "a"
@@ -125,7 +118,7 @@ one change."
 
 (transient-define-argument majutsu-split:--insert-before ()
   :description "Insert before"
-  :class 'majutsu-split-option
+  :class 'majutsu-revision-selection-option
   :selection-label "[BEFORE]"
   :selection-face '(:background "dark magenta" :foreground "white")
   :selection-toggle-key "b"

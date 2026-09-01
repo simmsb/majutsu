@@ -210,12 +210,12 @@ Also registers a variable watcher to invalidate the template cache."
   (:returns Template :doc "Canonical log id.")
   [:if [:or [:hidden]
             [:divergent]]
-      [:commit_id :shortest 8]
-    [:change_id :shortest 8]])
+      [:commit_id]
+    [:change_id]])
 
 (majutsu-log-define-column id
   [:canonical-log-id]
-  "Template for the commit-id column.")
+  "Template for the canonical log id column.")
 
 (majutsu-log-define-column change-id
   [:label
@@ -325,7 +325,7 @@ can survive transport through the single-line log format.")
   (setq majutsu-log--children-by-id nil))
 
 (when (fboundp 'add-variable-watcher)
-(add-variable-watcher 'majutsu-log-commit-columns
+  (add-variable-watcher 'majutsu-log-commit-columns
                         #'majutsu-log--invalidate-template-cache))
 
 (defun majutsu-log-post-decode-line-separator (value &optional _ctx)
@@ -694,12 +694,6 @@ Return non-nil when the section could be located."
   :type 'hook
   :options '(bug-reference-mode))
 
-;;;###autoload(autoload 'majutsu-log-copy-transient "majutsu-log" nil t)
-(majutsu-row-define-copy-transient
- majutsu-log-copy-transient
- "Transient for semantic copy commands in `majutsu-log-mode'."
- ("h" "Commit hash" majutsu-row-copy-commit-id))
-
 (defvar-keymap majutsu-log-mode-map
   :doc "Keymap for `majutsu-log-mode'."
   :parent majutsu-mode-map
@@ -798,15 +792,14 @@ offer to create one using `jj git init`."
       (let* ((dest (file-name-as-directory (expand-file-name default-directory)))
              (default-directory dest)
              (_ (majutsu--assert-usable-jj))
-             (jj (majutsu-jj--executable))
-             (args (majutsu-process-jj-arguments (list "git" "init"
-                                                       (majutsu-convert-filename-for-jj dest))))
              (exit nil)
              (out ""))
         (with-temp-buffer
           (let ((coding-system-for-read 'utf-8-unix)
                 (coding-system-for-write 'utf-8-unix))
-            (setq exit (apply #'majutsu-process-file jj nil t nil args)))
+            (setq exit (majutsu-process-jj
+                        t "git" "init"
+                        (majutsu-convert-filename-for-jj dest))))
           (setq out (string-trim (buffer-string))))
         (if (zerop exit)
             (let ((default-directory dest))
@@ -826,8 +819,12 @@ offer to create one using `jj git init`."
 INITIAL-INPUT is the current revision filter and is inserted into the
 minibuffer for editing.  Empty input clears the filter."
   (unless current-prefix-arg
-    (majutsu-read-optional-revset
-     prompt nil initial-input history '("log" "-r"))))
+    (majutsu-read-revset
+     prompt
+     :allow-empty t
+     :initial-input initial-input
+     :history history
+     :completion-args '("log" "-r"))))
 
 (defun majutsu-log-transient-reset ()
   "Reset log options to defaults."

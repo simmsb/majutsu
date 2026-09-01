@@ -48,7 +48,7 @@
 
 (defconst majutsu-evolog--signature-template
   '[:if [:method [:call 'config "ui.show-cryptographic-signatures"]
-                 :as_boolean]
+         :as_boolean]
        [:call 'format_short_cryptographic_signature
               [:commit :signature]]]
   "Template fragment for jj's optional compact signature marker.")
@@ -236,12 +236,6 @@ protocol.  Only one limit, reverse-order switch, and graph switch are allowed."
   (majutsu-row-clear-buffer-data)
   (magit-insert-section (evologbuf)
     (majutsu-evolog--insert-entries)))
-
-;;;###autoload(autoload 'majutsu-evolog-copy-transient "majutsu-evolog" nil t)
-(majutsu-row-define-copy-transient
- majutsu-evolog-copy-transient
- "Transient for semantic copy commands in `majutsu-evolog-mode'."
- ("h" "Commit hash" majutsu-row-copy-commit-id))
 
 (defclass majutsu-evolog-prefix (transient-prefix) ())
 
@@ -441,9 +435,7 @@ edit actions inherited from ordinary diff buffers are intentionally disabled."
   "Show the evolution history for REVSET.
 Optional ARGS may contain safe list-formatting options for `jj evolog`."
   (interactive
-   (list (majutsu-read-single-revset
-          "Evolution log for revision"
-          (or (majutsu-revision-at-point) "@"))))
+   (list (majutsu-read-revision "Evolution log for revision")))
   (setq args (majutsu-evolog--validate-args args))
   (let ((root (majutsu--toplevel-safe)))
     (majutsu-setup-buffer #'majutsu-evolog-mode nil
