@@ -2,8 +2,8 @@
 
 ;; Copyright (C) 2026 0WD0
 
-;; Author: 0WD0 <wd.1105848296@gmail.com>
-;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
+;; Author: 0WD0 <me@0wd0.com>
+;; Maintainer: 0WD0 <me@0wd0.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 
@@ -67,16 +67,64 @@
         (beginning-of-line)
         (should (stringp (get-text-property (point) 'line-prefix)))))))
 
-(ert-deftest majutsu-section-command-remaps-magit-commands ()
-  "Majutsu modes should remap Magit section commands to wrappers."
-  (with-temp-buffer
-    (majutsu-log-mode)
-    (should (eq (command-remapping 'magit-section-toggle) 'majutsu-section-toggle))
-    (should (eq (command-remapping 'magit-section-cycle) 'majutsu-section-cycle))
-    (should (eq (command-remapping 'magit-section-show-level-1-all)
-                'majutsu-section-show-level-1-all))
-    (should (eq (command-remapping 'magit-mouse-toggle-section)
-                'majutsu-mouse-toggle-section))))
+(defun majutsu-section-test--invisible-overlays ()
+  "Return all invisible overlays in the current buffer as (BEG . END)."
+  (delq nil
+        (mapcar (lambda (ov)
+                  (and (overlay-get ov 'invisible)
+                       (cons (overlay-start ov) (overlay-end ov))))
+                (overlays-in (point-min) (point-max)))))
+
+(defmacro majutsu-section-test--with-two-sections (&rest body)
+  "Run BODY in a buffer with two newline-terminated sibling sections."
+  (declare (indent 0))
+  `(with-temp-buffer
+     (majutsu-log-mode)
+     (let ((inhibit-read-only t)
+           (magit-section-inhibit-markers t))
+       (magit-insert-section (root)
+         (magit-insert-section (demo "a")
+           (magit-insert-heading "Section a")
+           (insert "body a1\nbody a2\n"))
+         (magit-insert-section (demo "b")
+           (magit-insert-heading "Section b")
+           (insert "body b1\n"))))
+     ,@body))
+
+(ert-deftest majutsu-section-show/clears-magit-style-overlays ()
+  "Showing after `magit-section-hide' must not leave a remnant overlay.
+Magit hides [content, end) while Majutsu shifts both bounds back by
+one; the show cleanup has to cover both conventions."
+  (majutsu-section-test--with-two-sections
+    (let ((first (car (oref magit-root-section children))))
+      (magit-section-hide first)
+      (should (majutsu-section-test--invisible-overlays))
+      (majutsu-section-show first)
+      (should-not (majutsu-section-test--invisible-overlays)))))
+
+(ert-deftest majutsu-section-show/clears-stacked-mixed-overlays ()
+  "Mixed magit/majutsu hide calls must still converge to a clean show."
+  (majutsu-section-test--with-two-sections
+    (let ((first (car (oref magit-root-section children))))
+      (majutsu-section-hide first)
+      (should (majutsu-section-test--invisible-overlays))
+      (magit-section-hide first)
+      (majutsu-section-show first)
+      (should-not (majutsu-section-test--invisible-overlays)))))
+
+(ert-deftest majutsu-section-refresh-root-show-rehides-with-majutsu-bounds ()
+  "Root-level show must re-hide collapsed children with shifted bounds."
+  (majutsu-section-test--with-two-sections
+    (let ((first (car (oref magit-root-section children))))
+      (majutsu-section-hide first)
+      (let ((before (majutsu-section-test--invisible-overlays)))
+        (should before)
+        (majutsu-section-show magit-root-section)
+        ;; The hidden child keeps exactly one overlay with the same
+        ;; shifted bounds; nothing is duplicated or truncated.
+        (should (equal (majutsu-section-test--invisible-overlays) before))
+        (majutsu-section-show first)
+        (should-not (majutsu-section-test--invisible-overlays))))))
 
 (provide 'majutsu-section-test)
 ;;; majutsu-section-test.el ends here

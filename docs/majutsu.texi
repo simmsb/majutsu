@@ -102,7 +102,6 @@ Log Buffer
 * Log Output Protocol (Sequential Markers)::
 * @code{majutsu-log-commit-columns}::
 * Configuration Examples::
-* Migration Notes::
 * Copying From Structured Row Buffers::
 
 Files@comma{} Diffs@comma{} and Operations
@@ -155,6 +154,8 @@ Conflict Resolution
 Bookmarks
 
 * Understanding Bookmarks::
+* Bookmark List::
+* Embark Actions::
 * Bookmark Transient::
 
 Tags
@@ -175,6 +176,7 @@ Git Integration
 Workspaces
 
 * Understanding Workspaces::
+* Embark Actions: Embark Actions (1). 
 * Workspace Transient::
 
 Customizing
@@ -279,12 +281,12 @@ Emacs 29.1 or later.
 @item
 Jujutsu (jj) v0.41.0 or later installed and in your @samp{PATH}.
 @item
-@samp{magit} 3.3.0 or later (for section management).
+@samp{magit} 4.4.0 or later (for section management).
 @item
 @samp{consult} 1.0 or later and @samp{plz} 0.9.1 or later (for native Gerrit
 completion).
 @item
-@samp{transient} 0.5.0 or later (popup menus).
+@samp{transient} 0.7.0 or later (popup menus).
 @item
 @samp{with-editor} (for descriptive message editing).
 @end itemize
@@ -642,7 +644,6 @@ custom template DSL that mirrors the @samp{jj log} output but adds interactivity
 * Log Output Protocol (Sequential Markers)::
 * @code{majutsu-log-commit-columns}::
 * Configuration Examples::
-* Migration Notes::
 * Copying From Structured Row Buffers::
 @end menu
 
@@ -956,22 +957,6 @@ after the field's default postprocessors.
 @end lisp
 @end enumerate
 
-@node Migration Notes
-@subsection Migration Notes
-
-The old @code{majutsu-log-commit-layout}@comma{} its top-level @code{:schema} / @code{:columns}
-tree@comma{} compact @code{(FIELD TEMPLATE)} entries@comma{} and keys such as @code{:align} and
-@code{:visible} have been replaced by flat column plists in
-@code{majutsu-log-commit-columns}.
-The historical @code{right-margin} placement has been replaced by the @code{tail} module@comma{}
-which renders real text on the anchor line with right alignment.
-Move fields between visual areas by changing @code{:module} on the corresponding
-column plist@comma{} and adjust display behavior with @code{:face} and @code{:post}. In log
-buffers@comma{} copying a mixed heading+tail selection strips the tail text by default@comma{}
-while copying the tail itself preserves it. Graph prefixes and graph-related
-indentation are display-only@comma{} so ordinary copy operations only capture semantic
-content rather than the visible graph gutter.
-
 @node Copying From Structured Row Buffers
 @subsection Copying From Structured Row Buffers
 
@@ -1050,7 +1035,7 @@ Select the @samp{--from} and @samp{--to} revisions.
 @kindex --
 Limit diff to selected files/filesets.
   Completion shows full repository-relative paths changed by the active
-  @samp{--revisions} or @samp{--from=/}--to= selection. Without an explicit selection it
+  @samp{--revisions} or @samp{--from} / @samp{--to} selection. Without an explicit selection it
   uses revisions in the active log region@comma{} then the revision at point@comma{} and
   finally @samp{@@}. Fileset expressions remain free-form and can still be entered
   directly.
@@ -1311,6 +1296,38 @@ Enter insert state.
 Editable mode also changes cursor visuals (see
 @code{majutsu-blob-edit-cursor-type}); with Evil@comma{} the normal-state cursor is updated
 too.
+
+Evil bindings in blob buffers keep Evil's motions (@code{p}@comma{} @code{n}@comma{} @code{b}@comma{} @code{e}@comma{} @code{w}@dots{})
+untouched; blob commands live on the @samp{g} prefix and @samp{C-j} / @samp{C-k}@comma{} mirroring
+the annotate-mode keys:
+@table @asis
+@item @kbd{gj / C-j} (@code{majutsu-blob-next})
+@kindex gj / C-j
+@findex majutsu-blob-next
+Next revision touching the file.
+@item @kbd{gk / C-k} (@code{majutsu-blob-previous})
+@kindex gk / C-k
+@findex majutsu-blob-previous
+Previous revision touching the file.
+@item @kbd{gb} (@code{majutsu-annotate-addition})
+@kindex gb
+@findex majutsu-annotate-addition
+Start annotate for the blob.
+@item @kbd{gf} (@code{majutsu-blob-visit-file})
+@kindex gf
+@findex majutsu-blob-visit-file
+Visit the workspace version of the file.
+@item @kbd{gr}
+@kindex gr
+Revert or reload the blob content.
+@item @kbd{q}
+@kindex q
+Bury the blob buffer.
+@item @kbd{@key{RET}} (@code{majutsu-edit-changeset})
+@kindex RET
+@findex majutsu-edit-changeset
+Edit the blob's revision.
+@end table
 
 @node Annotate (Blame)
 @subsection Annotate (Blame)
@@ -2419,6 +2436,8 @@ Refine the conflict.
 
 @menu
 * Understanding Bookmarks::
+* Bookmark List::
+* Embark Actions::
 * Bookmark Transient::
 @end menu
 
@@ -2428,6 +2447,48 @@ Refine the conflict.
 In Jujutsu@comma{} bookmarks are named references similar to Git branches. A local
 bookmark normally targets one revision and may explicitly track a remote
 bookmark; concurrent moves can also leave a bookmark with conflicted targets.
+
+@node Bookmark List
+@section Bookmark List
+
+The bookmark list always includes local and remote bookmarks@comma{} including
+synchronized and untracked remote bookmarks.  No prefix argument is needed.
+
+@samp{Local bookmarks} and @samp{Remote bookmarks} are separate sections;
+remote bookmarks are grouped by remote name@comma{} with fetch URLs and distinct
+push URLs shown in the remote headings.  Configured remotes without bookmarks
+show @samp{No bookmarks}.  On a remote heading@comma{} @samp{r} opens remote management@comma{}
+@samp{f} fetches only that remote@comma{} and the delete action removes the remote.  Both sections remain visible
+when empty.  Git's special @samp{@@git} references appear separately under
+@samp{Git tracking bookmarks} when present.
+
+Remote rows show their tracking state.  For tracked bookmarks@comma{} @samp{synced}
+means there are no commits ahead or behind the local bookmark; @samp{+N/-N}
+counts are relative to the local bookmark@comma{} from the remote's perspective.
+Deleted local bookmarks remain visible@comma{} and their tracked remote rows say
+@samp{local deleted}.  Conflict targets appear beneath their own bookmark.
+Sections initially open and retain their folding state on refresh.
+
+@node Embark Actions
+@section Embark Actions
+
+When Embark is loaded@comma{} @samp{embark-act} recognizes bookmark list sections and
+completion candidates.  No additional Majutsu key binding is installed;
+use your configured Embark key in either Emacs or Evil.
+
+Local bookmarks offer inspect@comma{} edit@comma{} move@comma{} rename@comma{} delete and forget actions.
+Remote bookmarks offer inspection and exactly scoped tracking actions: @samp{t}
+tracks an untracked reference and @samp{u} untracks a tracked reference.  The
+special @samp{@@git} records offer revision inspection without local bookmark
+mutation actions.  Conflict children target their own commit@comma{} not their
+parent bookmark.  Remote headings offer fetch@comma{} rename and remove@comma{} including
+remotes with no bookmarks.  Copying remains available through Embark's
+standard actions.
+
+The default bookmark/revision action shows its diff; @samp{e} explicitly edits the
+working copy.  Commands such as move may still prompt for their remaining
+arguments.  The ordinary bookmark@comma{} fetch and push transients retain their
+parameter controls and remain available without Embark.
 
 @node Bookmark Transient
 @section Bookmark Transient
@@ -2757,7 +2818,8 @@ Transient actions:
 @item @kbd{l} (@code{majutsu-git-remote-list})
 @kindex l
 @findex majutsu-git-remote-list
-List remotes.
+Open the bookmark list at its Remote
+  bookmarks section. Configured remotes with no bookmarks are included.
 @item @kbd{a} (@code{majutsu-git-remote-add-transient})
 @kindex a
 @findex majutsu-git-remote-add-transient
@@ -2769,7 +2831,7 @@ Add a new Git remote as
 @kindex d
 @findex majutsu-git-remote-remove
 Remove an existing remote. In the
-  remote list buffer@comma{} the remote at point is used as the default.
+  bookmark list buffer@comma{} the remote at point is used as the default.
 @item @kbd{r} (@code{majutsu-git-remote-rename})
 @kindex r
 @findex majutsu-git-remote-rename
@@ -2779,7 +2841,7 @@ Rename a remote.
 @findex majutsu-git-remote-set-url-transient
 Set remote URLs. With no
   option@comma{} Majutsu prompts for the fetch URL/path positional; use @samp{--fetch}
-  and/or @samp{--push} to set them explicitly. In the remote list buffer@comma{} the remote
+  and/or @samp{--push} to set them explicitly. In the bookmark list buffer@comma{} the remote
   at point is used as the default.
 @end table
 
@@ -2824,6 +2886,7 @@ Show the Git directory path (@samp{jj git root}).
 
 @menu
 * Understanding Workspaces::
+* Embark Actions: Embark Actions (1). 
 * Workspace Transient::
 @end menu
 
@@ -2832,6 +2895,13 @@ Show the Git directory path (@samp{jj git root}).
 
 Jujutsu supports multiple workspaces sharing the same repository storage. This
 is similar to Git worktrees but more integrated.
+
+@node Embark Actions (1)
+@section Embark Actions
+
+When Embark is loaded@comma{} workspace completion candidates offer @samp{RET} / @samp{v} to
+visit the workspace@comma{} @samp{d} to open its root in Dired@comma{} and @samp{W} to copy its root.
+Actions run in the repository directory associated with the completion.
 
 @node Workspace Transient
 @section Workspace Transient

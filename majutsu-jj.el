@@ -2,8 +2,8 @@
 
 ;; Copyright (C) 2026 0WD0
 
-;; Author: 0WD0 <wd.1105848296@gmail.com>
-;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
+;; Author: 0WD0 <me@0wd0.com>
+;; Maintainer: 0WD0 <me@0wd0.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 
@@ -570,7 +570,7 @@ in the revision identifier (used for recursive refinement)."
         (setq disallow (concat disallow "/")))
       (if disallow
           (majutsu-thingatpt--jj-revision disallow)
-        (and (not (string-match-p "\`[[:space:]]*\'" string))
+        (and (not (string-blank-p string))
              (or
               (and (string-match-p "^[k-z]+$" string)
                    (>= (length string) (if structured-revision 1 4))

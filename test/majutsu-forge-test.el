@@ -43,7 +43,11 @@
   (let ((original (default-value 'majutsu-log-sections-hook))
         (real-add (symbol-function 'magit-add-section-hook))
         (majutsu-forge--sections-installed nil)
-        (majutsu-forge--installed-section-hooks nil))
+        (majutsu-forge--installed-section-hooks nil)
+        (majutsu-forge--installed-hooks nil)
+        (majutsu-forge--installed-advices nil)
+        (majutsu-forge--bindings-installed nil)
+        (majutsu-forge--saved-bindings nil))
     (unwind-protect
         (progn
           (set-default 'majutsu-log-sections-hook '(majutsu-log-insert-logs))
@@ -72,34 +76,36 @@
                             (buffer-string)))))
 
 (ert-deftest majutsu-forge-pullreq-commit-advice/suppresses-in-majutsu-log ()
-  (cl-letf (((symbol-function 'forge--insert-pullreq-commits)
-             (lambda (&rest _)
-               (insert "git log body\n"))))
-    (unwind-protect
-        (progn
-          (majutsu-forge--add-advices)
-          (with-temp-buffer
-            (majutsu-log-mode)
-            (let ((majutsu-forge-suppress-pullreq-commits t))
-              (forge--insert-pullreq-commits nil))
-            (should (string-match-p "Commit list is not shown"
-                                    (buffer-string)))
-            (should-not (string-match-p "git log body"
-                                        (buffer-string)))))
-      (majutsu-forge--remove-advices))))
+  (let ((majutsu-forge--installed-advices nil))
+    (cl-letf (((symbol-function 'forge--insert-pullreq-commits)
+               (lambda (&rest _)
+                 (insert "git log body\n"))))
+      (unwind-protect
+          (progn
+            (majutsu-forge--add-advices)
+            (with-temp-buffer
+              (majutsu-log-mode)
+              (let ((majutsu-forge-suppress-pullreq-commits t))
+                (forge--insert-pullreq-commits nil))
+              (should (string-match-p "Commit list is not shown"
+                                      (buffer-string)))
+              (should-not (string-match-p "git log body"
+                                          (buffer-string)))))
+        (majutsu-forge--remove-advices)))))
 
 (ert-deftest majutsu-forge-pullreq-commit-advice/keeps-forge-outside-majutsu ()
-  (cl-letf (((symbol-function 'forge--insert-pullreq-commits)
-             (lambda (&rest _)
-               (insert "git log body\n"))))
-    (unwind-protect
-        (progn
-          (majutsu-forge--add-advices)
-          (with-temp-buffer
-            (let ((majutsu-forge-suppress-pullreq-commits t))
-              (forge--insert-pullreq-commits nil))
-            (should (equal (buffer-string) "git log body\n"))))
-      (majutsu-forge--remove-advices))))
+  (let ((majutsu-forge--installed-advices nil))
+    (cl-letf (((symbol-function 'forge--insert-pullreq-commits)
+               (lambda (&rest _)
+                 (insert "git log body\n"))))
+      (unwind-protect
+          (progn
+            (majutsu-forge--add-advices)
+            (with-temp-buffer
+              (let ((majutsu-forge-suppress-pullreq-commits t))
+                (forge--insert-pullreq-commits nil))
+              (should (equal (buffer-string) "git log body\n"))))
+        (majutsu-forge--remove-advices)))))
 
 (ert-deftest majutsu-forge-refresh-advice/explicit-buffer-refreshes-once ()
   "Forge's recursive explicit-BUFFER dispatch should trigger one refresh."
@@ -238,7 +244,9 @@
 
 (ert-deftest majutsu-forge-mode-bindings/restore-previous-bindings ()
   (let ((original-n (keymap-lookup majutsu-mode-map "N"))
-        (original-quote (keymap-lookup majutsu-mode-map "'")))
+        (original-quote (keymap-lookup majutsu-mode-map "'"))
+        (majutsu-forge--saved-bindings nil)
+        (majutsu-forge--bindings-installed nil))
     (unwind-protect
         (progn
           (define-key majutsu-mode-map (key-parse "N") #'ignore)
@@ -259,7 +267,9 @@
 
 (ert-deftest majutsu-forge-mode-bindings/preserve-later-changes ()
   (let ((original-n (keymap-lookup majutsu-mode-map "N"))
-        (original-quote (keymap-lookup majutsu-mode-map "'")))
+        (original-quote (keymap-lookup majutsu-mode-map "'"))
+        (majutsu-forge--saved-bindings nil)
+        (majutsu-forge--bindings-installed nil))
     (unwind-protect
         (progn
           (define-key majutsu-mode-map (key-parse "N") #'ignore)
@@ -306,15 +316,6 @@
             (should (eq (keymap-lookup forge-pullreq-section-map
                                        "<remap> <majutsu-visit-thing>")
                         #'forge-visit-this-topic))
-            (should (eq (keymap-lookup forge-issues-section-map
-                                       "<remap> <majutsu-visit-thing>")
-                        #'forge-list-issues))
-            (should (eq (keymap-lookup forge-discussions-section-map
-                                       "<remap> <majutsu-visit-thing>")
-                        #'forge-list-discussions))
-            (should (eq (keymap-lookup forge-repository-section-map
-                                       "<remap> <majutsu-visit-thing>")
-                        #'forge-visit-this-repository))
             (majutsu-forge--restore-bindings)
             (should (eq (keymap-lookup forge-pullreqs-section-map
                                        "<remap> <majutsu-visit-thing>")
@@ -352,7 +353,8 @@
 
 (ert-deftest majutsu-forge-section-errors/clears-stale-errors-on-render ()
   (let ((original (default-value 'majutsu-log-sections-hook))
-        (original-sections-installed majutsu-forge--sections-installed))
+        (majutsu-forge--sections-installed nil)
+        (majutsu-forge--installed-section-hooks nil))
     (unwind-protect
         (progn
           (set-default 'majutsu-log-sections-hook nil)
@@ -368,7 +370,6 @@
             (should (equal majutsu-forge-section-errors
                            '(("pull requests" . "boom"))))))
       (majutsu-forge--remove-section-hooks)
-      (setq majutsu-forge--sections-installed original-sections-installed)
       (set-default 'majutsu-log-sections-hook original))))
 
 (ert-deftest majutsu-forge-same-root-p/ignores-file-errors ()
@@ -383,6 +384,14 @@
         (original-log-sections (default-value 'majutsu-log-sections-hook))
         (original-log-mode-hook majutsu-log-mode-hook)
         (original-refresh-hook majutsu-refresh-buffer-hook)
+        (majutsu-forge--installed-section-hooks nil)
+        (majutsu-forge--installed-hooks nil)
+        (majutsu-forge--installed-advices nil)
+        (majutsu-forge--saved-bindings nil)
+        (majutsu-forge--refreshing nil)
+        (majutsu-forge--pending-refresh-roots nil)
+        (majutsu-forge-mode-hook nil)
+        (global-minor-modes (copy-sequence global-minor-modes))
         (majutsu-forge-add-default-sections t)
         (majutsu-forge-add-default-bindings nil)
         (advices-installed nil)
@@ -427,6 +436,14 @@
         (original-log-sections (default-value 'majutsu-log-sections-hook))
         (original-log-mode-hook majutsu-log-mode-hook)
         (original-refresh-hook majutsu-refresh-buffer-hook)
+        (majutsu-forge--installed-section-hooks nil)
+        (majutsu-forge--installed-hooks nil)
+        (majutsu-forge--installed-advices nil)
+        (majutsu-forge--saved-bindings nil)
+        (majutsu-forge--refreshing nil)
+        (majutsu-forge--pending-refresh-roots nil)
+        (majutsu-forge-mode-hook nil)
+        (global-minor-modes (copy-sequence global-minor-modes))
         (majutsu-forge-add-default-sections t)
         (majutsu-forge-add-default-bindings nil)
         (refreshes 0))

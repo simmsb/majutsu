@@ -2,12 +2,12 @@
 
 ;; Copyright (C) 2025-2026 0WD0
 
-;; Author: 0WD0 <wd.1105848296@gmail.com>
-;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
+;; Author: 0WD0 <me@0wd0.com>
+;; Maintainer: 0WD0 <me@0wd0.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 ;; Version: 0.6.0
-;; Package-Requires: ((emacs "29.1") (compat "31.0.0.1") (transient "0.5.0") (magit "3.3.0") (consult "1.0") (plz "0.9.1"))
+;; Package-Requires: ((emacs "29.1") (compat "31.0.0.1") (transient "0.8.7") (magit "4.4.0") (consult "1.0") (plz "0.9.1"))
 
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -121,5 +121,8 @@ Instead of invoking this alias for `majutsu-log' using
 
 (with-eval-after-load 'evil
   (require 'majutsu-evil nil t))
+
+(with-eval-after-load 'embark
+  (require 'majutsu-embark))
 
 ;;; majutsu.el ends here

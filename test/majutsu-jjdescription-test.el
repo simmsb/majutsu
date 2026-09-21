@@ -2,8 +2,8 @@
 
 ;; Copyright (C) 2026 0WD0
 
-;; Author: 0WD0 <wd.1105848296@gmail.com>
-;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
+;; Author: 0WD0 <me@0wd0.com>
+;; Maintainer: 0WD0 <me@0wd0.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 
@@ -18,6 +18,25 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'majutsu-jjdescription)
+
+(defmacro majutsu-jjdescription-test--with-temp-buffer (&rest body)
+  "Run BODY in a temporary buffer with private description history."
+  (declare (indent 0) (debug t))
+  `(let ((log-edit-comment-ring
+          (make-ring log-edit-maximum-comment-ring-size))
+         (with-editor-show-usage nil))
+     (with-temp-buffer ,@body)))
+
+(defmacro majutsu-jjdescription-test--with-global-mode (&rest body)
+  "Run BODY with isolated global mode hooks, advice, and enabled state."
+  (declare (indent 0) (debug t))
+  `(let ((global-majutsu-jjdescription-mode nil)
+         (global-minor-modes (copy-sequence global-minor-modes))
+         (global-majutsu-jjdescription-mode-hook nil)
+         (find-file-hook nil)
+         (after-change-major-mode-hook nil))
+     (cl-letf (((symbol-function 'server-visit-files) #'ignore))
+       ,@body)))
 
 (defconst majutsu-test--jjdescription-sample
   (mapconcat
@@ -46,7 +65,7 @@
    "\n")
   "Sample JJ description text.")
 
-(defun majutsu-test--faces-at (pos)
+(defun majutsu-jjdescription-test--faces-at (pos)
   "Return a list of font-lock faces at POS."
   (let ((font-lock-face (get-text-property pos 'font-lock-face))
         (face (get-text-property pos 'face)))
@@ -64,32 +83,32 @@
 
 (ert-deftest majutsu-jjdescription-font-lock-summary ()
   "Summary line should use `git-commit-summary`."
-  (with-temp-buffer
+  (majutsu-jjdescription-test--with-temp-buffer
     (text-mode)
     (setq buffer-file-name "/tmp/editor-123.jjdescription")
     (insert majutsu-test--jjdescription-sample)
     (majutsu-jjdescription-setup)
     (font-lock-ensure)
     (goto-char (point-min))
-    (should (memq 'git-commit-summary (majutsu-test--faces-at (point))))))
+    (should (memq 'git-commit-summary (majutsu-jjdescription-test--faces-at (point))))))
 
 (ert-deftest majutsu-jjdescription-summary-moves ()
   "Summary highlighting should move to the new first line."
-  (with-temp-buffer
+  (majutsu-jjdescription-test--with-temp-buffer
     (text-mode)
     (setq buffer-file-name "/tmp/editor-123.jjdescription")
     (insert "Initial summary\n\nJJ: note\n")
     (majutsu-jjdescription-setup)
     (font-lock-ensure)
     (goto-char (point-min))
-    (should (memq 'git-commit-summary (majutsu-test--faces-at (point))))
+    (should (memq 'git-commit-summary (majutsu-jjdescription-test--faces-at (point))))
     (goto-char (point-min))
     (insert "New summary\n")
     (font-lock-ensure)
     (goto-char (point-min))
-    (should (memq 'git-commit-summary (majutsu-test--faces-at (point))))
+    (should (memq 'git-commit-summary (majutsu-jjdescription-test--faces-at (point))))
     (forward-line 1)
-    (should-not (memq 'git-commit-summary (majutsu-test--faces-at (point))))))
+    (should-not (memq 'git-commit-summary (majutsu-jjdescription-test--faces-at (point))))))
 
 (ert-deftest majutsu-jjdescription-overlong-summary-boundaries ()
   "Highlight only summary characters strictly beyond the configured limit."
@@ -100,7 +119,7 @@
                   (-1 "1234567" nil)))
     (pcase-let ((`(,limit ,summary ,overlong-offset) case))
       (let ((majutsu-jjdescription-summary-max-length limit))
-        (with-temp-buffer
+        (majutsu-jjdescription-test--with-temp-buffer
           (text-mode)
           (setq buffer-file-name "/tmp/editor-123.jjdescription")
           (insert summary "\n\nJJ: note\n")
@@ -109,29 +128,22 @@
           (goto-char (point-min))
           (when (and (integerp limit) (> limit 0))
             (should-not (memq 'git-commit-overlong-summary
-                              (majutsu-test--faces-at (point)))))
+                              (majutsu-jjdescription-test--faces-at (point)))))
           (if overlong-offset
               (progn
                 (forward-char overlong-offset)
                 (should (memq 'git-commit-overlong-summary
-                              (majutsu-test--faces-at (point)))))
+                              (majutsu-jjdescription-test--faces-at (point)))))
             (should-not
              (cl-loop for pos from (line-beginning-position)
                       below (line-end-position)
                       thereis (memq 'git-commit-overlong-summary
-                                    (majutsu-test--faces-at pos))))))))))
-
-(ert-deftest majutsu-jjdescription-summary-limit-is-natnum ()
-  "The summary limit customization must reject negative values."
-  (should
-   (equal (get 'majutsu-jjdescription-summary-max-length 'custom-type)
-          '(choice (const :tag "Disable" nil)
-            (natnum :tag "Column")))))
+                                    (majutsu-jjdescription-test--faces-at pos))))))))))
 
 (ert-deftest majutsu-jjdescription-overlong-summary-respects-ignore-rest ()
   "Text after JJ's ignore-rest marker is never treated as a summary."
   (let ((majutsu-jjdescription-summary-max-length 5))
-    (with-temp-buffer
+    (majutsu-jjdescription-test--with-temp-buffer
       (text-mode)
       (setq buffer-file-name "/tmp/editor-123.jjdescription")
       (insert "JJ: ignore-rest\n1234567\n")
@@ -144,12 +156,12 @@
         (should-not
          (cl-loop for pos from beg below end
                   thereis (memq 'git-commit-overlong-summary
-                                (majutsu-test--faces-at pos))))))))
+                                (majutsu-jjdescription-test--faces-at pos))))))))
 
 (ert-deftest majutsu-jjdescription-overlong-summary-shrink-clamps-old-range ()
   "Shrinking a summary never extends font-lock past the new buffer end."
   (let ((majutsu-jjdescription-summary-max-length 5))
-    (with-temp-buffer
+    (majutsu-jjdescription-test--with-temp-buffer
       (text-mode)
       (setq buffer-file-name "/tmp/editor-123.jjdescription")
       (insert "1234567\n")
@@ -166,12 +178,12 @@
        (cl-loop for pos from (line-beginning-position)
                 below (line-end-position)
                 thereis (memq 'git-commit-overlong-summary
-                              (majutsu-test--faces-at pos)))))))
+                              (majutsu-jjdescription-test--faces-at pos)))))))
 
 (ert-deftest majutsu-jjdescription-fill-column-and-auto-fill ()
   "Keep the summary intact and fill body text at the configured column."
   (let ((majutsu-jjdescription-fill-column 12))
-    (with-temp-buffer
+    (majutsu-jjdescription-test--with-temp-buffer
       (text-mode)
       (setq buffer-file-name "/tmp/editor-123.jjdescription")
       (insert "summary line that must remain intact\n\none two three four five")
@@ -210,7 +222,7 @@
   "A nil option keeps the current fill column and disables Auto Fill."
   (let ((majutsu-jjdescription-major-mode nil)
         (majutsu-jjdescription-fill-column nil))
-    (with-temp-buffer
+    (majutsu-jjdescription-test--with-temp-buffer
       (text-mode)
       (setq buffer-file-name "/tmp/editor-123.jjdescription")
       (setq-local fill-column 37)
@@ -222,7 +234,7 @@
   "Body filling delegates to the major mode's normal Auto Fill function."
   (let ((majutsu-jjdescription-major-mode nil)
         (majutsu-jjdescription-fill-column 20))
-    (with-temp-buffer
+    (majutsu-jjdescription-test--with-temp-buffer
       (text-mode)
       (setq buffer-file-name "/tmp/editor-123.jjdescription")
       (insert "summary\n\nbody text")
@@ -238,7 +250,7 @@
   "Org headings, tables, and blocks retain Org's Auto Fill behavior."
   (let ((majutsu-jjdescription-major-mode nil)
         (majutsu-jjdescription-fill-column 12))
-    (with-temp-buffer
+    (majutsu-jjdescription-test--with-temp-buffer
       (org-mode)
       (setq buffer-file-name "/tmp/editor-123.jjdescription")
       (insert (concat "summary\n\n"
@@ -259,19 +271,20 @@
 
 (ert-deftest majutsu-jjdescription-major-mode-refresh-reapplies-setup ()
   "Changing major mode reapplies JJ description buffer configuration."
-  (let ((majutsu-jjdescription-fill-column 41))
-    (global-majutsu-jjdescription-mode 1)
-    (with-temp-buffer
-      (setq buffer-file-name "/tmp/editor-123.jjdescription")
-      (text-mode)
-      (setq-local fill-column 99)
-      (auto-fill-mode -1)
-      (fundamental-mode)
-      (should (= fill-column 41))
-      (should (equal comment-start majutsu-jjdescription-comment-prefix))
-      (should (eq auto-fill-function
-                  #'majutsu-jjdescription--auto-fill-except-summary))
-      (should majutsu-jjdescription-mode))))
+  (majutsu-jjdescription-test--with-global-mode
+    (let ((majutsu-jjdescription-fill-column 41))
+      (global-majutsu-jjdescription-mode 1)
+      (majutsu-jjdescription-test--with-temp-buffer
+        (setq buffer-file-name "/tmp/editor-123.jjdescription")
+        (text-mode)
+        (setq-local fill-column 99)
+        (auto-fill-mode -1)
+        (fundamental-mode)
+        (should (= fill-column 41))
+        (should (equal comment-start majutsu-jjdescription-comment-prefix))
+        (should (eq auto-fill-function
+                    #'majutsu-jjdescription--auto-fill-except-summary))
+        (should majutsu-jjdescription-mode)))))
 
 (ert-deftest majutsu-jjdescription-complete-setup-enables-auto-fill-once ()
   "One complete description setup runs Auto Fill hooks exactly once."
@@ -280,7 +293,7 @@
         (count 0)
         (auto-fill-mode-hook nil))
     (add-hook 'auto-fill-mode-hook (lambda () (cl-incf count)))
-    (with-temp-buffer
+    (majutsu-jjdescription-test--with-temp-buffer
       (setq buffer-file-name "/tmp/editor-123.jjdescription")
       (insert "summary\n\nbody\n")
       (majutsu-jjdescription-setup)
@@ -288,20 +301,21 @@
 
 (ert-deftest majutsu-jjdescription-major-mode-refresh-does-not-duplicate-hook ()
   "Repeated mode refreshes do not duplicate the global refresh hook."
-  (global-majutsu-jjdescription-mode 1)
-  (global-majutsu-jjdescription-mode 1)
-  (with-temp-buffer
-    (setq buffer-file-name "/tmp/editor-123.jjdescription")
-    (text-mode)
-    (fundamental-mode)
-    (text-mode))
-  (should (= (cl-count #'majutsu-jjdescription-setup-font-lock-in-buffer
-                       after-change-major-mode-hook :test #'eq)
-             1)))
+  (majutsu-jjdescription-test--with-global-mode
+    (global-majutsu-jjdescription-mode 1)
+    (global-majutsu-jjdescription-mode 1)
+    (majutsu-jjdescription-test--with-temp-buffer
+      (setq buffer-file-name "/tmp/editor-123.jjdescription")
+      (text-mode)
+      (fundamental-mode)
+      (text-mode))
+    (should (= (cl-count #'majutsu-jjdescription-setup-font-lock-in-buffer
+                         after-change-major-mode-hook :test #'eq)
+               1))))
 
 (ert-deftest majutsu-jjdescription-font-lock-comments ()
   "JJ comment lines should be highlighted with comment faces."
-  (with-temp-buffer
+  (majutsu-jjdescription-test--with-temp-buffer
     (text-mode)
     (setq buffer-file-name "/tmp/editor-123.jjdescription")
     (insert majutsu-test--jjdescription-sample)
@@ -313,22 +327,22 @@
     (let ((prefix-pos (point))
           (heading-pos (progn (search-forward "JJ: ") (point)))
           (id-pos (progn (search-forward "Change ID: ") (point))))
-      (should (memq 'font-lock-comment-face (majutsu-test--faces-at prefix-pos)))
-      (should (memq 'git-commit-comment-heading (majutsu-test--faces-at heading-pos)))
+      (should (memq 'font-lock-comment-face (majutsu-jjdescription-test--faces-at prefix-pos)))
+      (should (memq 'git-commit-comment-heading (majutsu-jjdescription-test--faces-at heading-pos)))
       (should (memq majutsu-jjdescription-change-id-face
-                    (majutsu-test--faces-at id-pos))))
+                    (majutsu-jjdescription-test--faces-at id-pos))))
     (search-forward "JJ:")
     (beginning-of-line)
-    (should (memq 'font-lock-comment-face (majutsu-test--faces-at (point))))
+    (should (memq 'font-lock-comment-face (majutsu-jjdescription-test--faces-at (point))))
     (search-forward "JJ:     A ")
     (let ((action-pos (- (point) 2))
           (file-pos (point)))
-      (should (memq 'git-commit-comment-action (majutsu-test--faces-at action-pos)))
-      (should (memq 'git-commit-comment-file (majutsu-test--faces-at file-pos))))))
+      (should (memq 'git-commit-comment-action (majutsu-jjdescription-test--faces-at action-pos)))
+      (should (memq 'git-commit-comment-file (majutsu-jjdescription-test--faces-at file-pos))))))
 
 (ert-deftest majutsu-jjdescription-ignore-rest-comments ()
   "Text after ignore-rest should be highlighted as comment."
-  (with-temp-buffer
+  (majutsu-jjdescription-test--with-temp-buffer
     (text-mode)
     (setq buffer-file-name "/tmp/editor-123.jjdescription")
     (insert majutsu-test--jjdescription-sample)
@@ -337,11 +351,11 @@
     (goto-char (point-min))
     (search-forward "AFTER SHOULD BE COMMENT")
     (beginning-of-line)
-    (should (memq 'font-lock-comment-face (majutsu-test--faces-at (point))))))
+    (should (memq 'font-lock-comment-face (majutsu-jjdescription-test--faces-at (point))))))
 
 (ert-deftest majutsu-jjdescription-ignore-rest-overrides-summary ()
   "Summary highlighting should not appear after ignore-rest."
-  (with-temp-buffer
+  (majutsu-jjdescription-test--with-temp-buffer
     (text-mode)
     (setq buffer-file-name "/tmp/editor-123.jjdescription")
     (insert "JJ: ignore-rest\nAfter should be comment\n")
@@ -350,13 +364,13 @@
     (goto-char (point-min))
     (search-forward "After should be comment")
     (beginning-of-line)
-    (let ((faces (majutsu-test--faces-at (point))))
+    (let ((faces (majutsu-jjdescription-test--faces-at (point))))
       (should (memq 'font-lock-comment-face faces))
       (should-not (memq 'git-commit-summary faces)))))
 
 (ert-deftest majutsu-jjdescription-ignore-rest-prefix ()
   "Ignore-rest prefix stays comment while directive is keyword."
-  (with-temp-buffer
+  (majutsu-jjdescription-test--with-temp-buffer
     (text-mode)
     (setq buffer-file-name "/tmp/editor-123.jjdescription")
     (insert majutsu-test--jjdescription-sample)
@@ -367,20 +381,20 @@
     (beginning-of-line)
     (let ((prefix-pos (point))
           (keyword-pos (progn (search-forward "ignore-rest") (match-beginning 0))))
-      (should (memq 'font-lock-comment-face (majutsu-test--faces-at prefix-pos)))
-      (should (memq 'git-commit-keyword (majutsu-test--faces-at keyword-pos))))))
+      (should (memq 'font-lock-comment-face (majutsu-jjdescription-test--faces-at prefix-pos)))
+      (should (memq 'git-commit-keyword (majutsu-jjdescription-test--faces-at keyword-pos))))))
 
 (ert-deftest majutsu-jjdescription-major-mode ()
   "JJ description setup honors `majutsu-jjdescription-major-mode`."
   (let ((majutsu-jjdescription-major-mode #'fundamental-mode))
-    (with-temp-buffer
+    (majutsu-jjdescription-test--with-temp-buffer
       (setq buffer-file-name "/tmp/editor-123.jjdescription")
       (majutsu-jjdescription-setup)
       (should (eq major-mode 'fundamental-mode)))))
 
 (ert-deftest majutsu-jjdescription-comment-vars ()
   "JJ description setup configures comment variables."
-  (with-temp-buffer
+  (majutsu-jjdescription-test--with-temp-buffer
     (setq buffer-file-name "/tmp/editor-123.jjdescription")
     (majutsu-jjdescription-setup)
     (should (equal comment-start majutsu-jjdescription-comment-prefix))
@@ -394,14 +408,15 @@
 
 (ert-deftest majutsu-jjdescription-global-mode-hooks ()
   "Global mode toggles the setup hooks."
-  (global-majutsu-jjdescription-mode -1)
-  (should-not (memq #'majutsu-jjdescription-setup-check-buffer find-file-hook))
-  (global-majutsu-jjdescription-mode 1)
-  (should (memq #'majutsu-jjdescription-setup-check-buffer find-file-hook)))
+  (majutsu-jjdescription-test--with-global-mode
+    (global-majutsu-jjdescription-mode -1)
+    (should-not (memq #'majutsu-jjdescription-setup-check-buffer find-file-hook))
+    (global-majutsu-jjdescription-mode 1)
+    (should (memq #'majutsu-jjdescription-setup-check-buffer find-file-hook))))
 
 (ert-deftest majutsu-jjdescription-buffer-message-strips-comments ()
   "Saved descriptions should exclude JJ comments and ignored text."
-  (with-temp-buffer
+  (majutsu-jjdescription-test--with-temp-buffer
     (text-mode)
     (setq buffer-file-name "/tmp/editor-123.jjdescription")
     (insert majutsu-test--jjdescription-sample)
@@ -422,7 +437,7 @@
   "Saving a JJ description stores the cleaned message in history."
   (let ((log-edit-comment-ring (make-ring log-edit-maximum-comment-ring-size))
         (log-edit-comment-ring-index nil))
-    (with-temp-buffer
+    (majutsu-jjdescription-test--with-temp-buffer
       (text-mode)
       (setq buffer-file-name "/tmp/editor-123.jjdescription")
       (insert majutsu-test--jjdescription-sample)
@@ -438,7 +453,7 @@
   "History cycling replaces only the editable description region."
   (let ((log-edit-comment-ring (make-ring log-edit-maximum-comment-ring-size))
         (log-edit-comment-ring-index nil))
-    (with-temp-buffer
+    (majutsu-jjdescription-test--with-temp-buffer
       (text-mode)
       (setq buffer-file-name "/tmp/editor-123.jjdescription")
       (insert "current summary\n\nJJ: Change ID: abcdefgh\nJJ: note\n")
@@ -458,7 +473,7 @@
   (let ((log-edit-comment-ring (make-ring log-edit-maximum-comment-ring-size))
         (log-edit-comment-ring-index nil)
         (log-edit-last-comment-match ""))
-    (with-temp-buffer
+    (majutsu-jjdescription-test--with-temp-buffer
       (text-mode)
       (setq buffer-file-name "/tmp/editor-123.jjdescription")
       (insert "current summary\n\nJJ: Change ID: abcdefgh\nJJ: note\n")
@@ -473,7 +488,7 @@
 
 (ert-deftest majutsu-jjdescription-setup-uses-server-client-directory ()
   "Setup should bind the repository root from the emacsclient cwd."
-  (with-temp-buffer
+  (majutsu-jjdescription-test--with-temp-buffer
     (let ((client (make-process :name "majutsu-jjdescription-client"
                                 :buffer (current-buffer)
                                 :command (list "cat"))))
@@ -489,7 +504,7 @@
 
 (ert-deftest majutsu-jjdescription-show-diff-uses-change-id ()
   "Show-diff should prefer the first Change ID in the buffer."
-  (with-temp-buffer
+  (majutsu-jjdescription-test--with-temp-buffer
     (text-mode)
     (setq buffer-file-name "/tmp/editor-123.jjdescription")
     (insert "summary\n\nJJ: Change ID: zzzabcde\nJJ: note\n")

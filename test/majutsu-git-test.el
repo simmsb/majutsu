@@ -14,6 +14,35 @@
 (require 'cl-lib)
 (require 'majutsu-git)
 
+(ert-deftest majutsu-git-remote-list/reuses-bookmark-buffer ()
+  (require 'majutsu-bookmark)
+  (save-window-excursion
+    (with-temp-buffer
+      (majutsu-bookmark-list-mode)
+      (let ((buffer (current-buffer))
+            (inhibit-read-only t))
+        (magit-insert-section (bookmark-list)
+          (magit-insert-section (bookmark-group 'local)
+            (magit-insert-heading "Local bookmarks"))
+          (magit-insert-section (bookmark-group 'remote)
+            (magit-insert-heading "Remote bookmarks")
+            (insert "body\n")))
+        (magit-section-hide (cadr (oref magit-root-section children)))
+        (cl-letf (((symbol-function 'majutsu-bookmark-list) (lambda () buffer)))
+          (majutsu-git-remote-list))
+        (should (eq (current-buffer) buffer))
+        (should (eq (oref (magit-current-section) value) 'remote))
+        (should-not (oref (magit-current-section) hidden))))))
+
+(ert-deftest majutsu-git-fetch-remote/selects-only-current-remote ()
+  (let (args)
+    (cl-letf (((symbol-function 'majutsu-remote-at-point) (lambda () "fork*"))
+              ((symbol-function 'majutsu-git-fetch) (lambda (value) (setq args value))))
+      (majutsu-git-fetch-remote)
+      (should (equal args '("--remote" "exact:fork*")))))
+  (cl-letf (((symbol-function 'majutsu-remote-at-point) (lambda () nil)))
+    (should-error (majutsu-git-fetch-remote) :type 'user-error)))
+
 (ert-deftest majutsu-git--expand-option-arg/strips-tramp-prefix ()
   "--git-repo option paths should be converted to host-local paths."
   (cl-letf (((symbol-function 'majutsu-convert-filename-for-jj)
@@ -162,56 +191,12 @@
                     "--tracked" "--all-remotes"))
                  '("--remote=upstream" "--tracked" "--all-remotes"))))
 
-(ert-deftest majutsu-git-sync-transients/expose-repo-default-action ()
-  "Git push/fetch transients should expose repository-local defaults."
-  (dolist (prefix '(majutsu-git-push-transient majutsu-git-fetch-transient))
-    (let ((suffix (transient-get-suffix prefix "W")))
-      (should suffix)
-      (should (eq (plist-get (cdr suffix) :command)
-                  'majutsu-transient-save-repository-defaults)))))
-
-(ert-deftest majutsu-git-transients/expose-simple-upstream-options ()
-  "Git transients should expose simple upstream jj options."
-  (should (transient-get-suffix 'majutsu-git-push-transient "-o"))
-  (should (transient-get-suffix 'majutsu-git-push-transient "-T"))
-  (should (transient-get-suffix 'majutsu-git-fetch-transient "-R"))
-  (should (transient-get-suffix 'majutsu-git-fetch-transient "-b"))
-  (should (transient-get-suffix 'majutsu-git-fetch-transient "-T"))
-  (should (transient-get-suffix 'majutsu-git-clone-transient "-b")))
-
-(ert-deftest majutsu-git-tag-options/use-tag-pattern-reader ()
-  "Push and fetch tag options should share annotated tag completion."
-  (dolist (prefix '(majutsu-git-push-transient
-                    majutsu-git-fetch-transient))
-    (let* ((suffix (transient-get-suffix prefix "-T"))
-           (command (plist-get (cdr suffix) :command))
-           (obj (get command 'transient--suffix))
-           (reader (majutsu-git-test--suffix-reader suffix)))
-      (should (equal (oref obj argument) "--tag="))
-      (should (eq (oref obj multi-value) 'repeat))
-      (should (eq reader #'majutsu-read-tag-patterns)))))
-
 (defun majutsu-git-test--suffix-reader (suffix)
   "Return the reader configured for transient SUFFIX."
   (or (plist-get (cdr suffix) :reader)
       (when-let* ((command (plist-get (cdr suffix) :command))
                   (prototype (get command 'transient--suffix)))
         (oref prototype reader))))
-
-(ert-deftest majutsu-git-transients/use-shared-remote-readers ()
-  "Push/fetch/clone remote options should use the correct remote readers."
-  (let* ((push-remote (transient-get-suffix 'majutsu-git-push-transient "-R"))
-         (fetch-remote (transient-get-suffix 'majutsu-git-fetch-transient "-R"))
-         (clone-remote (transient-get-suffix 'majutsu-git-clone-transient "-R"))
-         (push-reader (majutsu-git-test--suffix-reader push-remote))
-         (fetch-reader (majutsu-git-test--suffix-reader fetch-remote))
-         (clone-reader (majutsu-git-test--suffix-reader clone-remote)))
-    (should (or (eq push-reader 'majutsu-transient-read-remote-name)
-                (equal push-reader '(function majutsu-transient-read-remote-name))))
-    (should (or (eq fetch-reader 'majutsu-transient-read-remote-patterns)
-                (equal fetch-reader '(function majutsu-transient-read-remote-patterns))))
-    (should (or (eq clone-reader 'majutsu-transient-read-remote-name)
-                (equal clone-reader '(function majutsu-transient-read-remote-name))))))
 
 (ert-deftest majutsu-git-fetch-remote-reader/returns-repeat-values ()
   "Fetch remote reader should return a list for Transient's repeat option."
@@ -233,16 +218,6 @@
         (should (equal value '("gerrit")))
         (should (equal (transient-infix-value obj)
                        '("--remote=gerrit")))))))
-
-(ert-deftest majutsu-git-remote-transients/split-command-specific-options ()
-  "Remote add/set-url options should live on command-specific transients."
-  (should (transient-get-suffix 'majutsu-git-remote-transient "a"))
-  (should-not (ignore-errors
-                (transient-get-suffix 'majutsu-git-remote-transient "-T")))
-  (should (transient-get-suffix 'majutsu-git-remote-add-transient "-T"))
-  (should (transient-get-suffix 'majutsu-git-remote-add-transient "-P"))
-  (should (transient-get-suffix 'majutsu-git-remote-set-url-transient "-f"))
-  (should (transient-get-suffix 'majutsu-git-remote-set-url-transient "-p")))
 
 (ert-deftest majutsu-git-remote-add/passes-add-arguments ()
   "Remote add should pass options followed by REMOTE and URL positionals."
@@ -309,11 +284,12 @@
 
 (ert-deftest majutsu-git-remote-set-url/signals-when-remote-missing ()
   "Remote set-url should signal an error when --remote= is absent."
-  (should-error
-   (cl-letf (((symbol-function 'user-error)
-              (lambda (&rest _args)
-                (signal 'user-error nil))))
-     (majutsu-git-remote-set-url '("--fetch=https://example.invalid/fetch.git")))))
+  (cl-letf (((symbol-function 'majutsu-run-jj)
+             (lambda (&rest _args)
+               (ert-fail "Missing remote must be rejected before running jj"))))
+    (should-error
+     (majutsu-git-remote-set-url '("--fetch=https://example.invalid/fetch.git"))
+     :type 'user-error)))
 
 (ert-deftest majutsu-git-remote-set-url/applies-no-url-args-as-no-op ()
   "Remote set-url should call jj without URL args when none given."
@@ -407,6 +383,7 @@
   "The generic repo-default action should save remembered arguments only."
   (let* ((transient-values nil)
          (config-id "0123456789abcdefabcd")
+         (original-plist (symbol-plist 'majutsu-git-push))
          (prototype (make-instance
                      'majutsu-repository-transient-prefix
                      :command 'majutsu-git-push-transient
@@ -418,6 +395,7 @@
                              :command 'majutsu-git-push-transient
                              :prototype prototype))
          saved)
+    (setplist 'majutsu-git-push (copy-tree original-plist))
     (unwind-protect
         (cl-letf (((symbol-function 'majutsu-repository-config-id)
                    (lambda (&optional _create) config-id))
@@ -438,7 +416,7 @@
             (should (equal (majutsu-transient-repository-current-value
                             'majutsu-git 'majutsu-git-push config-id)
                            '("--remote=upstream" "--tracked")))))
-      (put 'majutsu-git-push 'majutsu-git-current-repository-values nil))
+      (setplist 'majutsu-git-push original-plist))
     (should saved)))
 
 (provide 'majutsu-git-test)

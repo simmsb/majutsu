@@ -2,8 +2,8 @@
 
 ;; Copyright (C) 2025-2026 0WD0
 
-;; Author: 0WD0 <wd.1105848296@gmail.com>
-;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
+;; Author: 0WD0 <me@0wd0.com>
+;; Maintainer: 0WD0 <me@0wd0.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 
@@ -25,6 +25,8 @@
 (require 'subr-x)
 
 (autoload 'majutsu-gerrit-upload-transient "majutsu-gerrit-upload" nil t)
+
+(declare-function majutsu-bookmark-list "majutsu-bookmark" ())
 
 (declare-function majutsu-repository-transient-prefix "majutsu-core")
 (declare-function majutsu-transient-read-remote-patterns "majutsu-remote")
@@ -95,59 +97,25 @@
   (majutsu-git--start (append '("fetch") args) "Fetched from remote"))
 
 (defun majutsu-git-remote-list ()
-  "List Git remotes in a dedicated buffer."
+  "Show Git remotes in the bookmark list."
   (interactive)
-  (majutsu-setup-buffer #'majutsu-git-remote-list-mode nil
-    :buffer "*Majutsu Git Remotes*"))
+  (require 'majutsu-bookmark)
+  (pop-to-buffer (majutsu-bookmark-list))
+  (when-let* ((section (magit-get-section
+                       '((bookmark-group . remote) (bookmark-list)))))
+    (magit-section-show section)
+    (goto-char (oref section start))))
 
-(defun majutsu-git--remote-line-name (line)
-  "Return the remote name parsed from LINE."
-  (let* ((raw (string-trim (substring-no-properties line)))
-         (token (car (split-string raw "[ \t]+" t))))
-    token))
+(defun majutsu-git-fetch-from (remote)
+  "Fetch from exactly one named REMOTE."
+  (interactive (list (majutsu-read-remote-name "Fetch remote" t)))
+  (majutsu-git-fetch (list "--remote" (concat "exact:" remote))))
 
-(defvar-keymap majutsu-git-remote-section-map
-  :doc "Keymap for `jj-git-remote' sections."
-  "<remap> <majutsu-delete-thing>" #'majutsu-git-remote-remove)
-
-(defun majutsu-git--wash-remote-list (_args)
-  "Wash `jj git remote list' output into remote sections."
-  (let ((count 0))
-    (magit-wash-sequence
-     (lambda ()
-       (let* ((line (buffer-substring (line-beginning-position)
-                                      (line-end-position)))
-              (trimmed (string-trim (substring-no-properties line)))
-              (name (and (not (string-empty-p trimmed))
-                         (majutsu-git--remote-line-name line))))
-         (delete-region (line-beginning-position)
-                        (min (point-max) (1+ (line-end-position))))
-         (when name
-           (setq count (1+ count))
-           (magit-insert-section (jj-git-remote name t)
-             (magit-insert-heading line)
-             (insert "\n")))
-         t)))
-    (if (zerop count)
-        (magit-cancel-section)
-      (insert "\n"))))
-
-(defun majutsu-git-remote-list-refresh-buffer ()
-  "Refresh the git remote list buffer."
-  (majutsu--assert-mode 'majutsu-git-remote-list-mode)
-  (magit-insert-section (git-remote-list)
-    (majutsu-jj-wash #'majutsu-git--wash-remote-list nil
-      "git" "remote" "list")))
-
-(defvar-keymap majutsu-git-remote-list-mode-map
-  :doc "Keymap for `majutsu-git-remote-list-mode'."
-  :parent majutsu-mode-map)
-
-(define-derived-mode majutsu-git-remote-list-mode majutsu-mode "Majutsu Git Remotes"
-  "Major mode for viewing git remotes."
-  :group 'majutsu
-  (setq-local line-number-mode nil)
-  (setq-local revert-buffer-function #'majutsu-refresh-buffer))
+(defun majutsu-git-fetch-remote ()
+  "Fetch only the Git remote at point."
+  (interactive)
+  (majutsu-git-fetch-from (or (majutsu-remote-at-point)
+                             (user-error "No Git remote at point"))))
 
 (defun majutsu-git-remote-add (args)
   "Add a Git remote. Prompts for name and URL; respects ARGS from transient."

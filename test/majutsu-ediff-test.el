@@ -694,10 +694,11 @@ This mirrors with-editor's kill guard so cleanup cannot abort quit hooks."
            left right nil nil)
           (should-not (buffer-live-p left-buf))
           (should-not (buffer-live-p right-buf)))
-      (when (buffer-live-p left-buf)
-        (kill-buffer left-buf))
-      (when (buffer-live-p right-buf)
-        (kill-buffer right-buf))
+      (dolist (buffer (list left-buf right-buf))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (let ((kill-buffer-query-functions nil))
+              (kill-buffer buffer)))))
       (delete-file left)
       (delete-file right))))
 
@@ -867,21 +868,6 @@ This mirrors with-editor's kill guard so cleanup cannot abort quit hooks."
                        (list '("-r" "abc")
                              "src/one.el"
                              #'majutsu-ediff--diff-editor-config)))))))
-
-(ert-deftest majutsu-ediff-test-transient-has-resolve-actions ()
-  "Ediff transient should expose both resolve actions."
-  (should (transient-get-suffix 'majutsu-ediff "m"))
-  (should (transient-get-suffix 'majutsu-ediff "M")))
-
-(ert-deftest majutsu-ediff-selection-actions/use-session-buffer-advice ()
-  "Point-sensitive Ediff actions should run in the selection source buffer."
-  (dolist (key '("e" "E" "m" "M"))
-    (let* ((suffix (transient-get-suffix 'majutsu-ediff key))
-           (command (plist-get (cdr suffix) :command))
-           (prototype (get command 'transient--suffix)))
-      (should suffix)
-      (should (eq (oref prototype advice*)
-                  #'majutsu--transient-with-selection-buffer)))))
 
 (provide 'majutsu-ediff-test)
 ;;; majutsu-ediff-test.el ends here

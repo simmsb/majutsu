@@ -4,8 +4,8 @@
 ;; Copyright (C) 2025-2026 0WD0
 
 ;; Author: Brandon Olivier
-;;         0WD0 <wd.1105848296@gmail.com>
-;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
+;;         0WD0 <me@0wd0.com>
+;; Maintainer: 0WD0 <me@0wd0.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 
@@ -761,7 +761,7 @@ section or a child thereof."
         (magit-section-ident magit-root-section)))]
      (goto-char (oref section start))
      (when expand
-       (with-local-quit (magit-section-show section))
+       (with-local-quit (majutsu-section-show section))
        (recenter 0)))
     ((user-error "No diffstat in this buffer"))))
 

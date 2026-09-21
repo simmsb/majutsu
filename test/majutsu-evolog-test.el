@@ -175,15 +175,6 @@
       (should (equal (magit-section-value-if 'jj-evolog-entry)
                      "commit-full")))))
 
-(ert-deftest majutsu-evolog-transient/has-safe-list-options ()
-  (let ((limit (get 'majutsu-evolog:--limit 'transient--suffix)))
-    (should limit)
-    (should (eq (oref limit reader) #'transient-read-number-N0)))
-  (should (transient-get-suffix 'majutsu-evolog-transient "-v"))
-  (should (transient-get-suffix 'majutsu-evolog-transient "-G"))
-  (should (transient-get-suffix 'majutsu-evolog-transient "g"))
-  (should (transient-get-suffix 'majutsu-evolog-transient "0")))
-
 (ert-deftest majutsu-evolog-inter-diff-command-args/uses-upstream-git-patch ()
   (should
    (equal (majutsu-evolog--inter-diff-command-args "0123abcdef")

@@ -52,7 +52,9 @@
 
 (ert-deftest test-majutsu-process-filter/ignores-with-editor-control-packets ()
   (with-temp-buffer
-    (let* ((packet (format "WITH-EDITOR: 123 OPEN +1%c/tmp/manifest%c IN /tmp\n"
+    (let* ((majutsu-process--with-editor-file-roots
+            (make-hash-table :test #'equal))
+           (packet (format "WITH-EDITOR: 123 OPEN +1%c/tmp/manifest%c IN /tmp\n"
                            ?\x1f ?\x1f))
            (proc (make-process :name "majutsu-test"
                                :buffer (current-buffer)
@@ -66,7 +68,9 @@
 
 (ert-deftest test-majutsu-process-filter/ignores-split-with-editor-packets ()
   (with-temp-buffer
-    (let* ((part1 "WITH-EDITOR: 123 OPEN +1")
+    (let* ((majutsu-process--with-editor-file-roots
+            (make-hash-table :test #'equal))
+           (part1 "WITH-EDITOR: 123 OPEN +1")
            (part2 (format "%c/tmp/manifest%c IN /tmp\n"
                           ?\x1f ?\x1f))
            (proc (make-process :name "majutsu-test"
@@ -343,26 +347,29 @@ The process section should use root as command directory."
 
 (ert-deftest majutsu-process-test-responsive-call-kills-process-on-quit ()
   "`majutsu--call-process-responsive' should clean up when interrupted."
-  (let (deleted)
-    (with-temp-buffer
-      (let ((process-buf (current-buffer)))
-        (cl-letf (((symbol-function 'majutsu-process-environment)
-                   (lambda (_args) process-environment))
-                  ((symbol-function 'majutsu--process-display-buffer)
-                   (lambda (_process) nil))
-                  ((symbol-function 'process-live-p)
-                   (lambda (_process) t))
-                  ((symbol-function 'delete-process)
-                   (lambda (process) (setq deleted process)))
-                  ((symbol-function 'process-status)
-                   (lambda (_process) 'run))
-                  ((symbol-function 'accept-process-output)
-                   (lambda (&rest _args) (signal 'quit nil)))
-                  ((symbol-function 'process-exit-status)
-                   (lambda (_process) (ert-fail "Should not be reached"))))
-          (should (= 255 (majutsu--call-process-responsive
-                          "jj" process-buf 'dummy-section "/repo/")))
-          (should (processp deleted)))))))
+  (let (process)
+    (unwind-protect
+        (with-temp-buffer
+          (let ((process-buf (current-buffer)))
+            (cl-letf (((symbol-function 'majutsu-process-environment)
+                       (lambda (_args) process-environment))
+                      ((symbol-function 'start-file-process)
+                       (lambda (name buffer _program &rest _args)
+                         (setq process
+                               (make-process :name name :buffer buffer
+                                             :command '("cat") :noquery t))))
+                      ((symbol-function 'majutsu--process-display-buffer)
+                       (lambda (_process) nil))
+                      ((symbol-function 'accept-process-output)
+                       (lambda (&rest _args) (signal 'quit nil)))
+                      ((symbol-function 'process-exit-status)
+                       (lambda (_process) (ert-fail "Should not be reached"))))
+              (should (= 255 (majutsu--call-process-responsive
+                              "jj" process-buf 'dummy-section "/repo/")))
+              (should (processp process))
+              (should-not (process-live-p process)))))
+      (when (and process (process-live-p process))
+        (delete-process process)))))
 
 (ert-deftest majutsu-process-test-call-jj-handles-quit ()
   "`majutsu-call-jj' should finalize the section when interrupted."
@@ -568,7 +575,8 @@ the separate standard error process."
   (should (majutsu--process-file-supported-p nil nil))
   ;; Unsupported: input files and stderr-to-buffer require `process-file'.
   (should-not (majutsu--process-file-supported-p "/tmp/in" t))
-  (should-not (majutsu--process-file-supported-p
-               nil (list t (get-buffer-create "*majutsu-test-err*")))))
+  (with-temp-buffer
+    (should-not (majutsu--process-file-supported-p
+                 nil (list t (current-buffer))))))
 
 ;;; majutsu-process-test.el ends here

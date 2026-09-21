@@ -2,8 +2,8 @@
 
 ;; Copyright (C) 2025-2026 0WD0
 
-;; Author: 0WD0 <wd.1105848296@gmail.com>
-;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
+;; Author: 0WD0 <me@0wd0.com>
+;; Maintainer: 0WD0 <me@0wd0.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 
@@ -700,8 +700,7 @@ switch, and graph switch are allowed."
    ["Actions"
     ("l" "Open log" majutsu-op-log)
     ("RET" "Open log" majutsu-op-log)
-    ("s" "Save as default" transient-save-and-exit)
-    ]])
+    ("s" "Save as default" transient-save-and-exit)]])
 
 ;;;###autoload
 (defun majutsu-op-log (&optional args)
@@ -1156,8 +1155,8 @@ switch, and graph switch are allowed."
     ("c" "Clear selections" majutsu-selection-clear :transient t)]
    ["Actions"
     ("d" "Open diff" majutsu-op-diff)
-    ("RET" "Open diff" majutsu-op-diff)
-    ]]
+    ("RET" "Open diff" majutsu-op-diff)]]
+
   (interactive)
   (transient-setup 'majutsu-op-diff-transient nil nil
                    :scope (majutsu-selection-session-begin)))

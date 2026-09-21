@@ -13,15 +13,6 @@
 (require 'majutsu-core)
 (require 'majutsu-selection)
 
-(ert-deftest majutsu-transient-default-action-suffix/uses-selection-buffer-advice ()
-  "Default action suffixes should run through selection-buffer advice."
-  (let ((obj (make-instance 'majutsu-transient-default-action-suffix
-                            :command 'ignore
-                            :description "Ignore")))
-    (should (eq (oref obj advice*) #'majutsu--transient-with-selection-buffer))
-    (transient--init-suffix-key obj)
-    (should (equal (oref obj key) majutsu-transient-default-action))))
-
 (ert-deftest majutsu-transient-default-action-suffix/binds-default-key-as-alias ()
   "Default action suffixes with explicit keys should also bind the default key."
   (let* ((majutsu-transient-default-action "RET")

@@ -14,7 +14,8 @@
 
 (ert-deftest majutsu-diffedit-test-maybe-enable-mode-detects-instructions ()
   "Diffedit mode should be enabled below a JJ-INSTRUCTIONS file."
-  (let ((root (make-temp-file "majutsu-diffedit" t)))
+  (let ((root (make-temp-file "majutsu-diffedit" t))
+        (with-editor-show-usage nil))
     (unwind-protect
         (progn
           (write-region "" nil (expand-file-name "JJ-INSTRUCTIONS" root) nil 'silent)
@@ -45,7 +46,8 @@
 
 (ert-deftest majutsu-diffedit-test-maybe-enable-mode-skips-directory-for-parent-file ()
   "Detection should continue above a same-named directory to a regular file."
-  (let ((root (make-temp-file "majutsu-diffedit" t)))
+  (let ((root (make-temp-file "majutsu-diffedit" t))
+        (with-editor-show-usage nil))
     (unwind-protect
         (let* ((workspace (expand-file-name "workspace" root))
                (nested (expand-file-name "right/file.txt" workspace))
@@ -63,7 +65,8 @@
 
 (ert-deftest majutsu-diffedit-test-finish-on-save-calls-with-editor ()
   "Finish-on-save should call with-editor-finish when active."
-  (let ((called nil))
+  (let ((called nil)
+        (with-editor-show-usage nil))
     (with-temp-buffer
       (setq-local server-buffer-clients '(dummy))
       (with-editor-mode 1)

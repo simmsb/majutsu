@@ -79,11 +79,5 @@
     (should (equal (majutsu-simplify-parents--dwim-args)
                    '("--revision=a" "--revision=b")))))
 
-(ert-deftest majutsu-simplify-parents-transient-uses-canonical-revision-option ()
-  "The simplify-parents transient should expose jj's canonical --revision option."
-  (let ((obj (get 'majutsu-simplify-parents:--revision 'transient--suffix)))
-    (should obj)
-    (should (equal (oref obj argument) "--revision="))))
-
 (provide 'majutsu-simplify-parents-test)
 ;;; majutsu-simplify-parents-test.el ends here

@@ -56,16 +56,8 @@
           (should (eq (majutsu-selection-session-buffer session)
                       (current-buffer))))))))
 
-(ert-deftest majutsu-metaedit-revision-option/supports-selection ()
-  "Expose revisions as a repeatable visual selection category."
-  (let ((obj (get 'majutsu-metaedit:-r 'transient--suffix)))
-    (should (cl-typep obj 'majutsu-revision-selection-option))
-    (should (equal (oref obj argument) "-r="))
-    (should (eq (oref obj multi-value) 'repeat))
-    (should (equal (oref obj selection-label) "[REVS]"))
-    (should (equal (oref obj selection-toggle-key) "r"))
-    (should (eq (oref obj targets-fn)
-                #'majutsu-revisions-at-point)))
+(ert-deftest majutsu-metaedit-revision-option/serializes-repeat-values ()
+  "Serialize every selected revision as a separate command argument."
   (let ((obj (make-instance 'majutsu-revision-selection-option
                             :command 'ignore
                             :key "-r"

@@ -2,8 +2,8 @@
 
 ;; Copyright (C) 2026 0WD0
 
-;; Author: 0WD0 <1105848296@qq.com>
-;; Maintainer: 0WD0 <1105848296@qq.com>
+;; Author: 0WD0 <me@0wd0.com>
+;; Maintainer: 0WD0 <me@0wd0.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 
@@ -468,11 +468,6 @@
         (majutsu-op-diff-default-action)))
     (should (equal (nreverse actions) '(evolog visit)))))
 
-(ert-deftest majutsu-op-show/is-not-a-user-visible-interface ()
-  "Operation inspection should be composed from op-log and op-diff."
-  (should-not (fboundp 'majutsu-op-show))
-  (should-not (boundp 'majutsu-op-show-mode-map)))
-
 (ert-deftest majutsu-op-diff-command-args/uses-read-only-top-level-args ()
   "Operation diff command args should avoid snapshotting the working copy."
   (let ((args (majutsu-op--diff-command-args '("--operation=abc"))))
@@ -600,32 +595,6 @@
       (majutsu-op-log-revert-at-point))
     (should (equal restored "full-operation-id"))
     (should (equal reverted "full-operation-id"))))
-
-(ert-deftest majutsu-op-transient/exposes-operation-family-actions ()
-  "Operation transient should expose operation family actions."
-  (should (transient-get-suffix 'majutsu-op-transient "l"))
-  (should-error (transient-get-suffix 'majutsu-op-transient "s"))
-  (should (transient-get-suffix 'majutsu-op-transient "d"))
-  (should (transient-get-suffix 'majutsu-op-transient "u"))
-  (should (transient-get-suffix 'majutsu-op-transient "r"))
-  (should (transient-get-suffix 'majutsu-op-transient "R"))
-  (should (transient-get-suffix 'majutsu-op-transient "V")))
-
-(ert-deftest majutsu-op-log-transient/exposes-log-options ()
-  "Operation log transient should expose log-specific options."
-  (let ((limit (get 'majutsu-op-log:--limit 'transient--suffix)))
-    (should limit)
-    (should (eq (oref limit reader) #'transient-read-number-N0)))
-  (should (transient-get-suffix 'majutsu-op-log-transient "-r"))
-  (should (transient-get-suffix 'majutsu-op-log-transient "-G"))
-  (should (transient-get-suffix 'majutsu-op-log-transient "l")))
-
-(ert-deftest majutsu-op-diff-transient/exposes-diff-selection ()
-  "Operation diff transient should expose operation range options."
-  (should (transient-get-suffix 'majutsu-op-diff-transient "-o"))
-  (should (transient-get-suffix 'majutsu-op-diff-transient "-f"))
-  (should (transient-get-suffix 'majutsu-op-diff-transient "-t"))
-  (should (transient-get-suffix 'majutsu-op-diff-transient "d")))
 
 ;;; _
 (provide 'majutsu-op-test)

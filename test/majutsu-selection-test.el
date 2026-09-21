@@ -10,6 +10,7 @@
 
 (require 'ert)
 (require 'majutsu-selection)
+(require 'majutsu-log)
 (require 'transient)
 (require 'magit-section)
 

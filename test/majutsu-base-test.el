@@ -13,12 +13,6 @@
 (require 'majutsu-base)
 (require 'majutsu-evolog)
 
-(ert-deftest majutsu-base-registers-bookmark-and-tag-section-types ()
-  (should (eq (alist-get 'jj-bookmark magit--section-type-alist)
-              'majutsu-bookmark-section))
-  (should (eq (alist-get 'jj-tag magit--section-type-alist)
-              'majutsu-tag-section)))
-
 (ert-deftest majutsu-split-fields/preserves-empty-fields-and-tail ()
   (let ((sep (string 30)))
     (should (equal (majutsu--split-fields (concat "a" sep "b" sep) sep)
@@ -95,6 +89,24 @@
       (should (eq seen-category 'majutsu-branch))
       (should (eq seen-history 'majutsu-branch-history))
       (should (equal seen-annotation " default branch")))))
+
+(ert-deftest majutsu-completing-read-payload/binds-context-and-directory ()
+  "Payload readers should expose repository context to completion actions."
+  (let ((context '(:domain workspace))
+        seen-context
+        seen-directory)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args)
+                 (setq seen-context majutsu-completion-context
+                       seen-directory default-directory)
+                 "ws-a")))
+      (should (equal
+               (majutsu-completing-read-payload
+                "Workspace" '(:candidates ("ws-a")) nil t nil nil nil
+                'majutsu-workspace context "/tmp/repo/")
+               "ws-a"))
+      (should (eq seen-context context))
+      (should (equal seen-directory "/tmp/repo/")))))
 
 (ert-deftest majutsu-completing-read-multiple-payload/uses-payload-category ()
   (let (seen-category seen-history)

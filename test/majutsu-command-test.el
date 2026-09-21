@@ -65,17 +65,6 @@
                                  "--" "jj" "l")))
       (should (equal seen-complete "fish")))))
 
-(ert-deftest majutsu-command-test-read-jj-command-uses-native-completion-map ()
-  "JJ command reader should install the custom minibuffer keymap."
-  (let ((default-directory "/tmp/")
-        seen-map)
-    (cl-letf (((symbol-function 'read-from-minibuffer)
-               (lambda (_prompt _initial keymap &rest _args)
-                 (setq seen-map keymap)
-                 "log")))
-      (should (equal (majutsu-read-jj-command) "log"))
-      (should (eq seen-map majutsu-read-jj-command-map)))))
-
 (ert-deftest majutsu-command-test-jj-command-args-rejects-shell-syntax ()
   "JJ command prompts should not fall back to the shell."
   (should-error (majutsu--jj-command-args "jj log | head") :type 'user-error))

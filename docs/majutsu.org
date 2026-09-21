@@ -1,6 +1,6 @@
 #+title: Majutsu User Manual
 #+author: 0WD0
-#+email: wd.1105848296@gmail.com
+#+email: me@0wd0.com
 #+texinfo_dir_category: Emacs
 #+texinfo_dir_title: Majutsu: (majutsu).
 #+texinfo_dir_desc: Using Jujutsu from Emacs with Majutsu.
@@ -48,10 +48,10 @@ Majutsu stands on the shoulders of giants. We are grateful to:
 - Emacs 29.1 or later.
 - =compat= 31.0.0.1 or later.
 - Jujutsu (jj) v0.41.0 or later installed and in your =PATH=.
-- =magit= 3.3.0 or later (for section management).
+- =magit= 4.4.0 or later (for section management).
 - =consult= 1.0 or later and =plz= 0.9.1 or later (for native Gerrit
   completion).
-- =transient= 0.5.0 or later (popup menus).
+- =transient= 0.7.0 or later (popup menus).
 - =with-editor= (for descriptive message editing).
 
 ** Installing from Git
@@ -742,6 +742,19 @@ Editable mode also changes cursor visuals (see
 ~majutsu-blob-edit-cursor-type~); with Evil, the normal-state cursor is updated
 too.
 
+#+attr_keymap: :scope Evil
+Evil bindings in blob buffers keep Evil's motions (~p~, ~n~, ~b~, ~e~, ~w~...)
+untouched; blob commands live on the =g= prefix and =C-j= / =C-k=, mirroring
+the annotate-mode keys:
+#+attr_reference: :kind command-binding :interface "Blob buffer" :mode majutsu-blob-mode :scope Evil :state Normal
+- Key: gj / C-j (majutsu-blob-next) :: Next revision touching the file.
+- Key: gk / C-k (majutsu-blob-previous) :: Previous revision touching the file.
+- Key: gb (majutsu-annotate-addition) :: Start annotate for the blob.
+- Key: gf (majutsu-blob-visit-file) :: Visit the workspace version of the file.
+- Key: gr :: Revert or reload the blob content.
+- Key: q :: Bury the blob buffer.
+- Key: RET (majutsu-edit-changeset) :: Edit the blob's revision.
+
 *** Annotate (Blame)
 Majutsu annotate is implemented by =majutsu-annotate= and uses
 =jj file annotate= under the hood.  The navigation bindings below belong to
@@ -1320,6 +1333,44 @@ In Jujutsu, bookmarks are named references similar to Git branches. A local
 bookmark normally targets one revision and may explicitly track a remote
 bookmark; concurrent moves can also leave a bookmark with conflicted targets.
 
+** Bookmark List
+The bookmark list always includes local and remote bookmarks, including
+synchronized and untracked remote bookmarks.  No prefix argument is needed.
+
+=Local bookmarks= and =Remote bookmarks= are separate sections;
+remote bookmarks are grouped by remote name, with fetch URLs and distinct
+push URLs shown in the remote headings.  Configured remotes without bookmarks
+show =No bookmarks=.  On a remote heading, =r= opens remote management,
+=f= fetches only that remote, and the delete action removes the remote.  Both sections remain visible
+when empty.  Git's special =@git= references appear separately under
+=Git tracking bookmarks= when present.
+
+Remote rows show their tracking state.  For tracked bookmarks, =synced=
+means there are no commits ahead or behind the local bookmark; =+N/-N=
+counts are relative to the local bookmark, from the remote's perspective.
+Deleted local bookmarks remain visible, and their tracked remote rows say
+=local deleted=.  Conflict targets appear beneath their own bookmark.
+Sections initially open and retain their folding state on refresh.
+
+** Embark Actions
+When Embark is loaded, =embark-act= recognizes bookmark list sections and
+completion candidates.  No additional Majutsu key binding is installed;
+use your configured Embark key in either Emacs or Evil.
+
+Local bookmarks offer inspect, edit, move, rename, delete and forget actions.
+Remote bookmarks offer inspection and exactly scoped tracking actions: =t=
+tracks an untracked reference and =u= untracks a tracked reference.  The
+special =@git= records offer revision inspection without local bookmark
+mutation actions.  Conflict children target their own commit, not their
+parent bookmark.  Remote headings offer fetch, rename and remove, including
+remotes with no bookmarks.  Copying remains available through Embark's
+standard actions.
+
+The default bookmark/revision action shows its diff; =e= explicitly edits the
+working copy.  Commands such as move may still prompt for their remaining
+arguments.  The ordinary bookmark, fetch and push transients retain their
+parameter controls and remain available without Embark.
+
 ** Bookmark Transient
 #+attr_reference: :kind command-binding :interface "Majutsu buffer" :mode majutsu-mode
 - Key: b (majutsu-bookmark) ::
@@ -1492,17 +1543,18 @@ completion.
 
 Transient actions:
 #+attr_reference: :kind command-binding :interface "Remote Management transient"
-- Key: l (majutsu-git-remote-list) :: List remotes.
+- Key: l (majutsu-git-remote-list) :: Open the bookmark list at its Remote
+  bookmarks section. Configured remotes with no bookmarks are included.
 - Key: a (majutsu-git-remote-add-transient) :: Add a new Git remote as
   =jj git remote add [OPTIONS] REMOTE URL=. Majutsu prompts for a new remote
   name, rejects names that already exist, prompts for the URL/path positional,
   and exposes =--fetch-tags= and =--push-url=.
 - Key: d (majutsu-git-remote-remove) :: Remove an existing remote. In the
-  remote list buffer, the remote at point is used as the default.
+  bookmark list buffer, the remote at point is used as the default.
 - Key: r (majutsu-git-remote-rename) :: Rename a remote.
 - Key: u (majutsu-git-remote-set-url-transient) :: Set remote URLs. With no
   option, Majutsu prompts for the fetch URL/path positional; use =--fetch=
-  and/or =--push= to set them explicitly. In the remote list buffer, the remote
+  and/or =--push= to set them explicitly. In the bookmark list buffer, the remote
   at point is used as the default.
 
 ** Clone and Init
@@ -1529,6 +1581,11 @@ layouts, use the commands below to synchronize the repositories explicitly:
 ** Understanding Workspaces
 Jujutsu supports multiple workspaces sharing the same repository storage. This
 is similar to Git worktrees but more integrated.
+
+** Embark Actions
+When Embark is loaded, workspace completion candidates offer =RET= / =v= to
+visit the workspace, =d= to open its root in Dired, and =W= to copy its root.
+Actions run in the repository directory associated with the completion.
 
 ** Workspace Transient
 #+attr_reference: :kind command-binding :interface "Majutsu buffer" :mode majutsu-mode

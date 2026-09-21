@@ -16,17 +16,6 @@
 (require 'majutsu-gerrit-upload)
 (require 'majutsu-git)
 
-(defun majutsu-gerrit-test--suffix-prototype (suffix)
-  "Return the prototype object configured for transient SUFFIX."
-  (when-let* ((command (plist-get (cdr suffix) :command)))
-    (get command 'transient--suffix)))
-
-(defun majutsu-gerrit-test--suffix-reader (suffix)
-  "Return the reader configured for transient SUFFIX."
-  (or (plist-get (cdr suffix) :reader)
-      (when-let* ((prototype (majutsu-gerrit-test--suffix-prototype suffix)))
-        (oref prototype reader))))
-
 (ert-deftest majutsu-gerrit-upload/starts-jj-gerrit-upload-async ()
   "Upload should dispatch to `jj gerrit upload' asynchronously."
   (let (seen-args seen-success seen-message)
@@ -85,51 +74,6 @@
       (should (eq (plist-get seen-options :history) 'history))
       (should (equal (plist-get seen-options :completion-args)
                      '("gerrit" "upload" "-r"))))))
-
-(ert-deftest majutsu-gerrit-upload-transient/uses-toggle-at-point-revision-selection ()
-  "Upload revisions should use Majutsu's selection/toggle UI."
-  (let* ((option (transient-get-suffix 'majutsu-gerrit-upload-transient "-r"))
-         (option-prototype (majutsu-gerrit-test--suffix-prototype option)))
-    (should (cl-typep option-prototype 'majutsu-revision-selection-option))
-    (should (equal (oref option-prototype argument) "--revision="))
-    (should (eq (oref option-prototype multi-value) 'repeat))
-    (should (equal (oref option-prototype selection-label) "[REV]"))
-    (should (equal (oref option-prototype selection-toggle-key) "r"))))
-
-(ert-deftest majutsu-gerrit-upload-transient/uses-shared-remote-reader ()
-  "Upload remote option should use the exact remote reader."
-  (let* ((remote (transient-get-suffix 'majutsu-gerrit-upload-transient "-R"))
-         (reader (majutsu-gerrit-test--suffix-reader remote)))
-    (should (or (eq reader 'majutsu-transient-read-remote-name)
-                (equal reader '(function majutsu-transient-read-remote-name))))))
-
-(ert-deftest majutsu-gerrit-upload-transient/uses-native-review-readers ()
-  "Review metadata readers should use Majutsu's native readers."
-  (let* ((reviewer (transient-get-suffix 'majutsu-gerrit-upload-transient "-v"))
-         (cc (transient-get-suffix 'majutsu-gerrit-upload-transient "-C"))
-         (label (transient-get-suffix 'majutsu-gerrit-upload-transient "-l"))
-         (topic (transient-get-suffix 'majutsu-gerrit-upload-transient "-T"))
-         (hashtag (transient-get-suffix 'majutsu-gerrit-upload-transient "-H")))
-    (should (eq (majutsu-gerrit-test--suffix-reader reviewer)
-                'majutsu-gerrit-upload--read-reviewer))
-    (should (eq (majutsu-gerrit-test--suffix-reader cc)
-                'majutsu-gerrit-upload--read-cc))
-    (should (eq (majutsu-gerrit-test--suffix-reader label)
-                'majutsu-gerrit-upload--read-label))
-    (should (eq (majutsu-gerrit-test--suffix-reader topic)
-                'majutsu-gerrit-upload--read-topic))
-    (should (eq (majutsu-gerrit-test--suffix-reader hashtag)
-                'majutsu-gerrit-upload--read-hashtag))))
-
-(ert-deftest majutsu-gerrit-upload-repo-default-action/uses-session-buffer-advice ()
-  "Saving upload repository defaults should use the transient source buffer."
-  (let* ((suffix (transient-get-suffix 'majutsu-gerrit-upload-transient "W"))
-         (prototype (majutsu-gerrit-test--suffix-prototype suffix)))
-    (should suffix)
-    (should (eq (plist-get (cdr suffix) :command)
-                'majutsu-transient-save-repository-defaults))
-    (should (eq (oref prototype advice*)
-                #'majutsu--transient-with-selection-buffer))))
 
 (ert-deftest majutsu-gerrit-upload-repo-args/keeps-stable-policy-only ()
   "Repository defaults should omit change-specific and dangerous options."

@@ -50,7 +50,12 @@ SANDBOX is a temporary directory that is deleted after BODY.  Inside BODY,
     `(let ((,jj (majutsu-jj-integration-executable)))
        (skip-unless ,jj)
        (let ((,sandbox (make-temp-file "majutsu-jj-" t))
-             (majutsu-jj-integration--jj ,jj))
+             (majutsu-jj-integration--jj ,jj)
+             (process-environment
+              (append '("JJ_CONFIG="
+                        "JJ_USER=Majutsu Test"
+                        "JJ_EMAIL=majutsu@example.invalid")
+                      process-environment)))
          (unwind-protect
              (progn ,@body)
            (when (file-directory-p ,sandbox)

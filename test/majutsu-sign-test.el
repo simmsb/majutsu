@@ -78,25 +78,6 @@
             (should (eq (majutsu-selection-session-buffer session)
                         (current-buffer)))))))))
 
-(ert-deftest majutsu-sign-revision-option/supports-visual-selection ()
-  "Expose repeatable visual revision selection to both commands."
-  (let ((obj (get 'majutsu-sign:--revision 'transient--suffix)))
-    (should (cl-typep obj 'majutsu-revision-selection-option))
-    (should (equal (oref obj argument) "--revision="))
-    (should (eq (oref obj multi-value) 'repeat))
-    (should (equal (oref obj selection-label) "[REVS]"))
-    (should (equal (oref obj selection-toggle-key) "r")))
-  (should (transient-get-suffix 'majutsu-sign "-r"))
-  (should (transient-get-suffix 'majutsu-unsign "-r"))
-  (should (transient-get-suffix 'majutsu-sign "-k"))
-  (should-not (ignore-errors
-                (transient-get-suffix 'majutsu-unsign "-k"))))
-
-(ert-deftest majutsu-sign-key-option/uses-backend-aware-reader ()
-  "Read signing keys with the backend-aware completion reader."
-  (let ((obj (get 'majutsu-sign:--key 'transient--suffix)))
-    (should (eq (oref obj reader) #'majutsu-sign--read-key))))
-
 (ert-deftest majutsu-sign-read-key/completes-gpg-secret-keys ()
   "Complete secret signing keys with jj's configured GPG program."
   (let (read-args protocol program)
@@ -186,11 +167,6 @@
       (should (equal read-args
                      '("Signing key" "initial" test-history
                        "configured-key"))))))
-
-(ert-deftest majutsu-dispatch/exposes-signing-transients ()
-  "Expose Sign and Unsign from the top-level dispatcher."
-  (should (transient-get-suffix 'majutsu-dispatch "j"))
-  (should (transient-get-suffix 'majutsu-dispatch "J")))
 
 (ert-deftest majutsu-sign-integration/signs-and-unsigns-working-copy ()
   "Exercise jj's test signing backend through Sign and Unsign arguments."

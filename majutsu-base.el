@@ -2,8 +2,8 @@
 
 ;; Copyright (C) 2025-2026 0WD0
 
-;; Author: 0WD0 <wd.1105848296@gmail.com>
-;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
+;; Author: 0WD0 <me@0wd0.com>
+;; Maintainer: 0WD0 <me@0wd0.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 
@@ -120,7 +120,9 @@ for a class of actions that would normally ask for confirmation."
    (keymap :initform 'majutsu-commit-section-map)))
 
 (defclass majutsu-bookmark-section (majutsu-revision-section)
-  ((keymap :initform 'majutsu-bookmark-section-map)))
+  ((keymap :initform 'majutsu-bookmark-section-map)
+   (remote :initform nil :initarg :remote)
+   (tracked :initform nil :initarg :tracked)))
 
 (defclass majutsu-tag-section (majutsu-revision-section)
   ((keymap :initform 'majutsu-tag-section-map)))
@@ -277,11 +279,14 @@ is `any', require non-empty input without requiring a candidate match."
 (defun majutsu-completing-read-payload
     (prompt payload &optional predicate require-match initial-input hist def category context directory)
   "Read one value from structured completion PAYLOAD.
-PAYLOAD may provide :category and richer completion metadata.  CONTEXT and
-DIRECTORY are accepted for API compatibility within Majutsu and are ignored.
+PAYLOAD may provide :category and richer completion metadata.  CONTEXT is
+bound as `majutsu-completion-context' while the reader is active.  DIRECTORY
+is bound as `default-directory', allowing completion actions to operate in the
+repository that produced the candidates.
 REQUIRE-MATCH follows `majutsu-completing-read'."
-  (ignore context directory)
-  (let* ((completion-extra-properties
+  (let* ((default-directory (or directory default-directory))
+         (majutsu-completion-context context)
+         (completion-extra-properties
           (majutsu-completion-payload-properties payload category))
          (collection (plist-get payload :candidates))
          (value (completing-read (format-prompt prompt def)
@@ -318,11 +323,14 @@ requiring a candidate match."
 (defun majutsu-completing-read-multiple-payload
     (prompt payload &optional predicate require-match initial-input hist def category context directory)
   "Read multiple values from structured completion PAYLOAD.
-PAYLOAD may provide :category and richer completion metadata.  CONTEXT and
-DIRECTORY are accepted for API compatibility within Majutsu and are ignored.
+PAYLOAD may provide :category and richer completion metadata.  CONTEXT is
+bound as `majutsu-completion-context' while the reader is active.  DIRECTORY
+is bound as `default-directory', allowing completion actions to operate in the
+repository that produced the candidates.
 REQUIRE-MATCH follows `majutsu-completing-read-multiple'."
-  (ignore context directory)
-  (let* ((completion-extra-properties
+  (let* ((default-directory (or directory default-directory))
+         (majutsu-completion-context context)
+         (completion-extra-properties
           (majutsu-completion-payload-properties payload category))
          (collection (plist-get payload :candidates))
          (values (completing-read-multiple (format-prompt prompt def)

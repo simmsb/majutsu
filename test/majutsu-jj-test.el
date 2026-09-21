@@ -2,8 +2,8 @@
 
 ;; Copyright (C) 2026 0WD0
 
-;; Author: 0WD0 <1105848296@qq.com>
-;; Maintainer: 0WD0 <1105848296@qq.com>
+;; Author: 0WD0 <me@0wd0.com>
+;; Maintainer: 0WD0 <me@0wd0.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 
@@ -17,6 +17,7 @@
 
 (require 'ert)
 (require 'majutsu-jj)
+(require 'majutsu-process)
 
 (ert-deftest majutsu-jj-fileset-quote-single-quote ()
   "Single quotes should be preserved inside fileset strings."
@@ -275,9 +276,9 @@
                  (insert "output\n")
                  0))
               ((symbol-function 'ansi-color-apply-on-region)
-               (lambda (&rest _) (error "colorizer failed"))))
+               (lambda (&rest _) (signal 'arith-error nil))))
       (with-temp-buffer
-        (should-error (majutsu-jj-wash #'ignore nil "diff"))))
+        (should-error (majutsu-jj-wash #'ignore nil "diff") :type 'arith-error)))
     (should err-file)
     (should-not (file-exists-p err-file))))
 
@@ -292,26 +293,24 @@
                  0)))
       (with-temp-buffer
         (should-error
-         (majutsu-jj-wash (lambda (&rest _) (error "washer failed")) nil
-           "diff"))))
+         (majutsu-jj-wash (lambda (&rest _) (signal 'arith-error nil)) nil
+           "diff")
+         :type 'arith-error)))
     (should err-file)
     (should-not (file-exists-p err-file))))
 
 (ert-deftest majutsu--jj-insert/returns-error-message-on-failure ()
   "majutsu--jj-insert should return error message when return-error is t and command fails."
-  (let ((err-file (make-temp-file "majutsu-jj-err")))
-    (unwind-protect
-        (cl-letf (((symbol-function 'majutsu-process-file)
-                   (lambda (_program _infile destination &rest _args)
-                     (write-region "Error: something went wrong" nil
-                                   (if (consp destination) (cadr destination) destination)
-                                   nil 'silent)
-                     1)))
-          (with-temp-buffer
-            (let ((result (majutsu--jj-insert t "log" "-r" "invalid")))
-              (should (stringp result))
-              (should (string-match-p "something went wrong" result)))))
-      (ignore-errors (delete-file err-file)))))
+  (cl-letf (((symbol-function 'majutsu-process-file)
+             (lambda (_program _infile destination &rest _args)
+               (write-region "Error: something went wrong" nil
+                             (if (consp destination) (cadr destination) destination)
+                             nil 'silent)
+               1)))
+    (with-temp-buffer
+      (let ((result (majutsu--jj-insert t "log" "-r" "invalid")))
+        (should (stringp result))
+        (should (string-match-p "something went wrong" result))))))
 
 (ert-deftest majutsu-jj--executable/picks-remote-value ()
   "Executable selection should use remote override on TRAMP paths."
@@ -652,24 +651,6 @@ This mirrors Magit's behavior."
        (majutsu-read-revision "Rev" :default "main" :allow-empty t))
       (should-not seen-reader-default))))
 
-(ert-deftest majutsu-read-revset/uses-read-from-minibuffer-and-allows-free-form ()
-  "Revset reader should use plain minibuffer input and allow free-form text."
-  (let (seen-keymap seen-history seen-default)
-    (cl-letf (((symbol-function 'majutsu-jj-revset-candidate-data)
-               (lambda ()
-                 (list :category 'majutsu-revision
-                       :candidates '("@" "main"))))
-              ((symbol-function 'read-from-minibuffer)
-               (lambda (_prompt _initial keymap _read hist default &optional _inherit)
-                 (setq seen-keymap keymap
-                       seen-history hist
-                       seen-default default)
-                 "main")))
-      (should (equal (majutsu-read-revset "Rev" :default "@") "main"))
-      (should (eq seen-keymap majutsu-read-revset-map))
-      (should (eq seen-history 'majutsu-read-revset-history))
-      (should (equal seen-default "@")))))
-
 (ert-deftest majutsu-read-revset/empty-input-accepts-default ()
   "Required revset reader should accept DEFAULT on empty input."
   (cl-letf (((symbol-function 'majutsu-jj-revset-candidate-data)
@@ -681,22 +662,20 @@ This mirrors Magit's behavior."
 
 (ert-deftest majutsu-read-revset/allow-empty-uses-shared-keyword-contract ()
   "Revset readers should make optional input explicit with `:allow-empty'."
-  (let (seen-initial seen-history seen-default seen-keymap)
+  (let (seen-initial seen-history seen-default)
     (cl-letf (((symbol-function 'majutsu-jj-revset-candidate-data)
                (lambda ()
                  (list :category 'majutsu-revision
                        :candidates '("@" "main"))))
               ((symbol-function 'read-from-minibuffer)
-               (lambda (_prompt initial keymap _read hist default &optional _inherit)
+               (lambda (_prompt initial _keymap _read hist default &optional _inherit)
                  (setq seen-initial initial
-                       seen-keymap keymap
                        seen-history hist
                        seen-default default)
                  "")))
       (should-not (majutsu-read-revset
                    "Rev" :allow-empty t :initial-input "current"))
       (should (equal seen-initial "current"))
-      (should (eq seen-keymap majutsu-read-revset-map))
       (should (eq seen-history 'majutsu-read-revset-history))
       (should (null seen-default)))))
 

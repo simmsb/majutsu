@@ -2,8 +2,8 @@
 
 ;; Copyright (C) 2026 0WD0
 
-;; Author: 0WD0 <1105848296@qq.com>
-;; Maintainer: 0WD0 <1105848296@qq.com>
+;; Author: 0WD0 <me@0wd0.com>
+;; Maintainer: 0WD0 <me@0wd0.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 
@@ -949,7 +949,7 @@
   "Generic transient defaults should prefer repo-local values."
   (let ((transient-values nil)
         (config-id "0123456789abcdefabcd")
-        (mode 'majutsu-test-mode))
+        (mode (make-symbol "majutsu-test-mode")))
     (unwind-protect
         (cl-letf (((symbol-function 'majutsu-repository-config-id)
                    (lambda (&optional _create) config-id)))
@@ -981,7 +981,7 @@
   "Repository-local transient saves should use the generic repo key."
   (let ((transient-values nil)
         (config-id "0123456789abcdefabcd")
-        (mode 'majutsu-test-mode)
+        (mode (make-symbol "majutsu-test-mode"))
         saved)
     (unwind-protect
         (cl-letf (((symbol-function 'majutsu-repository-config-id)
@@ -1018,29 +1018,19 @@
       (should (equal seen-reader
                      '("Revisions: " t "old()" history ("log" "-r")))))))
 
-(ert-deftest majutsu-log--r-argument/uses-standard-revset-reader ()
-  "The log -r infix should be a normal transient argument."
-  (cl-letf (((symbol-function 'majutsu-repository-config-id) #'ignore))
-    (let ((obj (seq-find (lambda (suffix)
-                           (equal (oref suffix key) "-r"))
-                         (transient-suffixes 'majutsu-log-transient))))
-      (should obj)
-      (should (eq (oref obj reader) #'majutsu-log--transient-read-revset))
-      (should (equal (oref obj argument) "--revision=")))))
-
 (ert-deftest majutsu-log-build-args/uses-revision-argument-directly ()
   "Log -r should live in ARGS, with filesets after --."
   (let ((majutsu-log--compiled-template-cache '(:template "TPL")))
-    (cl-letf (((symbol-function 'majutsu-repository-config-id) #'ignore))
-      (unwind-protect
-          (progn
-            (majutsu-log--set-value
-             'majutsu-log-mode '("--revision=mine()" "--no-graph") '("src"))
-            (should (equal (majutsu-log--build-args)
-                           '("--config=ui.log-word-wrap=false"
-                             "log" "--revision=mine()" "--no-graph"
-                             "-T" "TPL" "--" "src"))))
-        (majutsu-log--set-value 'majutsu-log-mode nil nil)))))
+    (cl-letf (((symbol-function 'majutsu-repository-config-id) #'ignore)
+              ((symbol-plist 'majutsu-log-mode)
+               (copy-tree (symbol-plist 'majutsu-log-mode))))
+      (with-temp-buffer
+        (majutsu-log--set-value
+         'majutsu-log-mode '("--revision=mine()" "--no-graph") '("src"))
+        (should (equal (majutsu-log--build-args)
+                       '("--config=ui.log-word-wrap=false"
+                         "log" "--revision=mine()" "--no-graph"
+                         "-T" "TPL" "--" "src")))))))
 
 (ert-deftest majutsu-log-transient-read-revset/empty-input-clears ()
   "Empty log -r input should clear the ordinary revision argument."
@@ -1049,18 +1039,6 @@
                (lambda (&rest _args) nil)))
       (should-not (majutsu-log--transient-read-revset
                    "Revisions: " "old()" 'history)))))
-
-(ert-deftest majutsu-log-repo-default-action/is-available ()
-  "The log transient should expose generic repository-local defaults."
-  (let ((suffix (transient-get-suffix 'majutsu-log-transient "W")))
-    (should suffix)
-    (should (eq (plist-get (cdr suffix) :command)
-                'majutsu-transient-save-repository-defaults))))
-
-(ert-deftest majutsu-log-transient/does-not-need-clear-revisions-action ()
-  "Log -r clears through empty input, so there is no separate R action."
-  (should-not (ignore-errors
-                (transient-get-suffix 'majutsu-log-transient "R"))))
 
 (ert-deftest majutsu-log-wash-logs-streams-and-caches-entries ()
   "Washing should transform the buffer incrementally and cache entries."

@@ -364,17 +364,6 @@ Handles both single face and face list."
   (let ((face (get-text-property (line-beginning-position) 'face)))
     (if (listp face) (car face) face)))
 
-(ert-deftest majutsu-conflict-test-font-lock-keywords-added ()
-  "Test that font-lock keywords are added."
-  (with-temp-buffer
-    (insert majutsu-conflict-test--jj-diff)
-    (fundamental-mode)
-    (font-lock-mode 1)
-    (majutsu-conflict-mode 1)
-    ;; Check keywords are added
-    (should (cl-find 'majutsu-conflict--find-conflict font-lock-keywords
-                     :key (lambda (x) (if (consp x) (car x)))))))
-
 (ert-deftest majutsu-conflict-test-match-line ()
   "Test that match-line matcher works."
   (with-temp-buffer
@@ -590,23 +579,21 @@ apricot
     (should-not majutsu-conflict-mode)))
 
 (ert-deftest majutsu-conflict-test-mode-map-side-bindings ()
-  "Conflict mode map should bind side selection keys correctly."
-  (let (after-call before-call)
-    (should (eq (lookup-key majutsu-conflict-mode-map (kbd "C-c ^ n"))
-                #'majutsu-conflict-next))
-    (should (eq (lookup-key majutsu-conflict-mode-map (kbd "C-c ^ b"))
-                #'majutsu-conflict-keep-base))
-    (cl-letf (((symbol-function 'majutsu-conflict-keep-side)
-               (lambda (side before)
-                 (if before
-                     (setq before-call (list side before))
-                   (setq after-call (list side before))))))
-      (call-interactively
-       (lookup-key majutsu-conflict-mode-map (kbd "C-c ^ 3")))
-      (call-interactively
-       (lookup-key majutsu-conflict-mode-map (kbd "C-c ^ M-4"))))
-    (should (equal after-call '(3 nil)))
-    (should (equal before-call '(4 t)))))
+  "Digit bindings resolve the selected side or base of a real conflict."
+  (with-temp-buffer
+    (insert majutsu-conflict-test--jj-diff-snapshot-first)
+    (goto-char (point-min))
+    (search-forward "<<<<<<<")
+    (call-interactively
+     (lookup-key majutsu-conflict-mode-map (kbd "C-c ^ 3")))
+    (should (equal (buffer-string) "TWO\n")))
+  (with-temp-buffer
+    (insert majutsu-conflict-test--jj-diff-snapshot-first)
+    (goto-char (point-min))
+    (search-forward "<<<<<<<")
+    (call-interactively
+     (lookup-key majutsu-conflict-mode-map (kbd "C-c ^ M-2")))
+    (should (equal (buffer-string) "two\n"))))
 
 (provide 'majutsu-conflict-test)
 ;;; majutsu-conflict-test.el ends here

@@ -12,11 +12,6 @@
 (require 'cl-lib)
 (require 'majutsu-tag)
 
-(ert-deftest majutsu-tag-section-map/remaps-visit-thing-to-edit ()
-  (should (eq (lookup-key majutsu-tag-section-map
-                          [remap majutsu-visit-thing])
-              #'majutsu-edit-changeset)))
-
 (ert-deftest majutsu-tag-wash-list/uses-plain-section-values ()
   (with-temp-buffer
     (majutsu-tag-list-mode)

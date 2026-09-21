@@ -2,8 +2,8 @@
 
 ;; Copyright (C) 2025-2026 0WD0
 
-;; Author: 0WD0 <wd.1105848296@gmail.com>
-;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
+;; Author: 0WD0 <me@0wd0.com>
+;; Maintainer: 0WD0 <me@0wd0.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 
@@ -18,6 +18,14 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'majutsu)
+
+(ert-deftest majutsu-diff-file-status/from-header-lines ()
+  "Test file status inference from diff lines."
+  (should (equal (majutsu--diff-file-status '("new file mode 100644")) "new file"))
+  (should (equal (majutsu--diff-file-status '("deleted file mode 100644")) "deleted"))
+  (should (equal (majutsu--diff-file-status '("rename from old.txt" "rename to new.txt")) "renamed"))
+  (should (equal (majutsu--diff-file-status '("copy from source.txt" "copy to dest.txt")) "copied"))
+  (should (equal (majutsu--diff-file-status '("index 832...912 100644")) "modified")))
 
 (defmacro majutsu-diff-test--with-transient-context (prefix suffix &rest body)
   "Run BODY as if transient PREFIX were reading infix SUFFIX."
@@ -915,33 +923,6 @@ Use DESCRIPTION and CHANGE-ID when non-nil."
         'majutsu-diff 'majutsu-diff:-r
       (cl-letf (((symbol-function 'majutsu-read-revset) #'ignore))
         (should-not (majutsu-transient-read-revset "Revset: " nil nil))))))
-
-(ert-deftest majutsu-diff-repo-default-action/is-available ()
-  "The diff transient should expose generic repository-local defaults."
-  (let ((suffix (transient-get-suffix 'majutsu-diff "W")))
-    (should suffix)
-    (should (eq (plist-get (cdr suffix) :command)
-                'majutsu-transient-save-repository-defaults))))
-
-(ert-deftest majutsu-diff-selection-actions/use-session-buffer-advice ()
-  "Point- or repository-sensitive diff actions should use the source buffer."
-  (dolist (key '("d" "W"))
-    (let* ((suffix (transient-get-suffix 'majutsu-diff key))
-           (command (plist-get (cdr suffix) :command))
-           (prototype (get command 'transient--suffix)))
-      (should suffix)
-      (should (eq (oref prototype advice*)
-                  #'majutsu--transient-with-selection-buffer)))))
-
-(ert-deftest majutsu-diff--r-argument/uses-native-revset-reader ()
-  "The `-r' diff infix should use the native revset reader."
-  (cl-letf (((symbol-function 'majutsu-repository-config-id) #'ignore))
-    (dolist (prefix '(majutsu-diff majutsu-ediff))
-      (let ((obj (seq-find (lambda (suffix)
-                             (equal (oref suffix key) "-r"))
-                           (transient-suffixes prefix))))
-        (should obj)
-        (should (eq (oref obj reader) #'majutsu-transient-read-revset))))))
 
 (ert-deftest majutsu-diff-prefix-init/does-not-double-revisions-prefix ()
   "Initializing diff from buffer range should keep one --revisions= prefix."

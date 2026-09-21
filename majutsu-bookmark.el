@@ -2,8 +2,8 @@
 
 ;; Copyright (C) 2025-2026 0WD0
 
-;; Author: 0WD0 <wd.1105848296@gmail.com>
-;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
+;; Author: 0WD0 <me@0wd0.com>
+;; Maintainer: 0WD0 <me@0wd0.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 
@@ -248,8 +248,27 @@ bookmark(s) at point."
                      (format " (remote(s): %s)" (string-join remote-patterns ", "))
                    ""))))))
 
-(defvar-local majutsu-bookmark--list-all nil
-  "Non-nil when the bookmark list includes remote bookmarks.")
+(defun majutsu-bookmark--track-ref (ref untrack)
+  "Track REF, or untrack it when UNTRACK is non-nil.
+REF is one exact NAME@REMOTE, not a bookmark or remote pattern."
+  (pcase-let ((`(,name . ,remote) (majutsu--bookmark-split-remote-ref ref)))
+    (unless (and remote (not (equal remote "git")))
+      (user-error "Expected a network remote bookmark"))
+    (majutsu-start-jj (list "bookmark" (if untrack "untrack" "track")
+                            (concat "exact:" name) "--remote" (concat "exact:" remote)))))
+
+(defun majutsu-bookmark-track-ref (ref)
+  "Track one exact remote bookmark REF."
+  (interactive (list (majutsu-read-string "Remote bookmark")))
+  (majutsu-bookmark--track-ref ref nil))
+
+(defun majutsu-bookmark-untrack-ref (ref)
+  "Untrack one exact remote bookmark REF."
+  (interactive (list (majutsu-read-string "Remote bookmark")))
+  (majutsu-bookmark--track-ref ref t))
+
+(defvar-local majutsu-bookmark--list-remotes nil
+  "Remote metadata for the current bookmark list refresh.")
 
 (defvar majutsu-bookmark--compiled-template-cache nil
   "Cached compiled `jj bookmark list' row metadata.")
@@ -279,20 +298,17 @@ bookmark(s) at point."
   "Template used for bookmark-list commit summaries.")
 
 (majutsu-bookmark-define-template heading
-  [:if [:remote]
-      [:if [:tracked]
-          ["  " [:separate " "
-                           [:majutsu-bookmark-list-name]
-                           [:if [:present] [:majutsu-bookmark-list-tracking]]
-                           [:if [:present]
-                               [:majutsu-bookmark-list-target-summary]
-                             "(not created yet)"]]]
-        [:separate " " [:majutsu-bookmark-list-name] [:majutsu-bookmark-list-target-summary]]]
-    [:separate " "
-               [:majutsu-bookmark-list-name]
-               [:if [:present]
-                   [:majutsu-bookmark-list-target-summary]
-                 "(deleted)"]]]
+  [:separate " "
+             [:majutsu-bookmark-list-name]
+             [:if [:present]
+                 [:majutsu-bookmark-list-target-summary]
+               [:if [:remote] "(not created yet)" "(deleted)"]]
+             [:if [:remote]
+                 [:if [:tracked]
+                     [:if [:tracking_present]
+                         ["[tracked" [:majutsu-bookmark-list-tracking] "]"]
+                       "[tracked, local deleted]"]
+                   "[untracked]"]]]
   "Template used for bookmark-list headings.")
 
 (majutsu-template-defkeyword majutsu-bookmark-list-commit-summary Commit
@@ -301,12 +317,7 @@ bookmark(s) at point."
 
 (majutsu-template-defkeyword majutsu-bookmark-list-name CommitRef
   (:returns Template :doc "Default bookmark-list ref name.")
-  [:label "bookmark"
-          [:if [:remote]
-              [:if [:tracked]
-                  ["@" [:remote]]
-                [[:name] "@" [:remote]]]
-            [:name]]])
+  [:label "bookmark" [:if [:remote] [[:name] "@" [:remote]] [:name]]])
 
 (majutsu-template-defmethod majutsu-bookmark-list-distance-part SizeHint
   ((prefix Template))
@@ -318,12 +329,14 @@ bookmark(s) at point."
 (majutsu-template-defkeyword majutsu-bookmark-list-tracking CommitRef
   (:returns Template :doc "Compact tracked-remote distance summary.")
   [:if [:tracking_present]
-      [:surround "(" ")"
-                 [:separate "/"
-                            [:method [:tracking_ahead_count]
-                             :majutsu-bookmark-list-distance-part "+"]
-                            [:method [:tracking_behind_count]
-                             :majutsu-bookmark-list-distance-part "-"]]]])
+      [:if [:and [:method [:tracking_ahead_count] :zero]
+                 [:method [:tracking_behind_count] :zero]]
+          ", synced"
+        [", " [:separate "/"
+                        [:method [:tracking_ahead_count]
+                         :majutsu-bookmark-list-distance-part "+"]
+                        [:method [:tracking_behind_count]
+                         :majutsu-bookmark-list-distance-part "-"]]]]])
 
 (majutsu-template-defkeyword majutsu-bookmark-list-target-summary CommitRef
   (:returns Template :doc "Default bookmark-list target summary.")
@@ -433,31 +446,6 @@ bookmark(s) at point."
   "Return cached row template used by `jj bookmark list'."
   (plist-get (majutsu-bookmark--ensure-list-template) :template))
 
-(defun majutsu-bookmark--tracked-child-p (local entry)
-  "Return non-nil when ENTRY is a tracked child of LOCAL."
-  (and local
-       (null (majutsu-row-column local 'remote))
-       (majutsu-row-column entry 'remote)
-       (majutsu-row-column entry 'tracked)
-       (equal (majutsu-row-column local 'name)
-              (majutsu-row-column entry 'name))))
-
-(defun majutsu-bookmark--group-list-entries (entries)
-  "Group flat bookmark ENTRIES into roots with tracked remotes."
-  (let (groups current)
-    (dolist (entry entries)
-      (if (and current
-               (majutsu-bookmark--tracked-child-p
-                (plist-get current :root) entry))
-          (let ((root (plist-get current :root)))
-            (plist-put entry :parent root)
-            (setf (plist-get current :tracked-remotes)
-                  (append (plist-get current :tracked-remotes) (list entry))))
-        (plist-put entry :parent nil)
-        (setq current (list :root entry :tracked-remotes nil))
-        (push current groups)))
-    (nreverse groups)))
-
 (defun majutsu-bookmark--conflict-targets (entry compiled)
   "Return conflict target rows for ENTRY, or `:invalid'.
 Each target row is a cons of its full commit id and rendered heading.
@@ -488,54 +476,93 @@ Return nil when ENTRY has no conflict target data."
     (magit-insert-heading
       (majutsu-bookmark--target-heading (cdr target)))))
 
-(defun majutsu-bookmark--insert-list-entry
-    (entry compiled &optional tracked-remotes)
-  "Insert bookmark ENTRY and TRACKED-REMOTES using COMPILED."
+(defun majutsu-bookmark--insert-list-entry (entry compiled)
+  "Insert bookmark ENTRY using COMPILED."
   (let* ((targets (majutsu-bookmark--conflict-targets entry compiled))
          (valid-targets (and (not (eq targets :invalid)) targets))
          (body-inserter
-          (and (or valid-targets tracked-remotes)
+          (and valid-targets
                (lambda ()
-                 (mapc #'majutsu-bookmark--insert-conflict-target valid-targets)
-                 (dolist (remote tracked-remotes)
-                   (majutsu-bookmark--insert-list-entry remote compiled))))))
-    (majutsu-row-insert-entry entry compiled body-inserter valid-targets)))
+                 (mapc #'majutsu-bookmark--insert-conflict-target valid-targets)))))
+    (let ((section (majutsu-row-insert-entry entry compiled body-inserter valid-targets)))
+      (oset section remote (majutsu-row-column entry 'remote))
+      (oset section tracked (majutsu-row-column entry 'tracked))
+      section)))
 
 ;;;###autoload
-(defun majutsu-bookmark-list (&optional all)
-  "List bookmarks in a dedicated buffer.
-With prefix ALL, include remote bookmarks."
-  (interactive "P")
+(defun majutsu-bookmark-list ()
+  "List all local and remote bookmarks in a dedicated buffer."
+  (interactive)
   (majutsu-setup-buffer #'majutsu-bookmark-list-mode nil
-    :buffer "*Majutsu Bookmarks*"
-    (majutsu-bookmark--list-all (and all t))))
+    :buffer "*Majutsu Bookmarks*"))
+
+(defun majutsu-bookmark--insert-list-group (kind title entries compiled)
+  "Insert a KIND section with TITLE for ENTRIES using COMPILED."
+  (magit-insert-section (bookmark-group kind)
+    (magit-insert-heading title)
+    (dolist (entry entries)
+      (majutsu-bookmark--insert-list-entry entry compiled))
+    (insert "\n")))
+
+(defun majutsu-bookmark--remote-heading (remote)
+  "Return a styled heading for REMOTE, including its configured URLs."
+  (let* ((entry (and majutsu-bookmark--list-remotes
+                     (gethash remote majutsu-bookmark--list-remotes)))
+         (fetch (plist-get entry :fetch-url))
+         (push (plist-get entry :push-url)))
+    (concat (propertize remote 'font-lock-face 'magit-branch-remote)
+            (and fetch (concat "  " fetch))
+            (and push (not (equal push fetch))
+                 (format " (push: %s)" push)))))
 
 (defun majutsu-bookmark--wash-list (_args)
-  "Wash structured `jj bookmark list' row output into bookmark sections."
+  "Wash structured row output into local, remote, and Git sections."
   (let* ((compiled (majutsu-bookmark--ensure-list-template))
          (parsed (majutsu-row-read-buffer compiled))
          (entries (plist-get parsed :entries))
-         (groups (majutsu-bookmark--group-list-entries entries))
+         local git remotes displayed
          (inhibit-read-only t))
     (majutsu-row-report-diagnostics (plist-get parsed :diagnostics))
+    (dolist (entry entries)
+      (let ((remote (majutsu-row-column entry 'remote)))
+        (cond ((null remote) (push entry local))
+              ((equal remote "git") (push entry git))
+              (t (push entry (alist-get remote remotes nil nil #'equal))))))
+    (when majutsu-bookmark--list-remotes
+      (maphash (lambda (name _entry)
+                 (unless (assoc name remotes)
+                   (push (list name) remotes)))
+               majutsu-bookmark--list-remotes))
+    (setq local (nreverse local) git (nreverse git)
+          remotes (sort remotes (lambda (a b) (string< (car a) (car b)))))
     (delete-region (point-min) (point-max))
-    (if (null entries)
-        (magit-cancel-section)
-      (dolist (group groups)
-        (majutsu-bookmark--insert-list-entry
-         (plist-get group :root) compiled (plist-get group :tracked-remotes)))
-      (majutsu-row-set-buffer-data
-       compiled entries (mapcar (lambda (group) (plist-get group :root))
-                                groups))
-      (insert "\n"))))
+    (majutsu-bookmark--insert-list-group 'local "Local bookmarks" local compiled)
+    (setq displayed local)
+    (magit-insert-section (bookmark-group 'remote)
+      (magit-insert-heading "Remote bookmarks")
+      (dolist (group remotes)
+        (let ((refs (nreverse (cdr group))))
+          (magit-insert-section (jj-git-remote (car group))
+            (magit-insert-heading (majutsu-bookmark--remote-heading (car group)))
+            (if refs
+                (dolist (entry refs)
+                  (majutsu-bookmark--insert-list-entry entry compiled))
+              (insert (propertize "  No bookmarks\n" 'font-lock-face 'shadow))))
+          (setq displayed (append displayed refs))))
+      (insert "\n"))
+    (when git
+      (majutsu-bookmark--insert-list-group 'git "Git tracking bookmarks" git compiled)
+      (setq displayed (append displayed git)))
+    (majutsu-row-set-buffer-data compiled displayed)))
 
 (defun majutsu-bookmark-list-refresh-buffer ()
   "Refresh the bookmark list buffer."
   (majutsu--assert-mode 'majutsu-bookmark-list-mode)
+  (setq majutsu-bookmark--list-remotes
+        (plist-get (majutsu-remote-candidate-data) :entries))
   (magit-insert-section (bookmark-list)
     (majutsu-jj-wash #'majutsu-bookmark--wash-list nil
-      (append '("bookmark" "list" "--quiet")
-              (and majutsu-bookmark--list-all '("--all-remotes"))
+      (append '("bookmark" "list" "--quiet" "--all-remotes")
               (list "-T" (majutsu-bookmark--list-template))))))
 
 (defvar-keymap majutsu-bookmark-list-mode-map

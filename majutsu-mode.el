@@ -2,8 +2,8 @@
 
 ;; Copyright (C) 2025-2026 0WD0
 
-;; Author: 0WD0 <wd.1105848296@gmail.com>
-;; Maintainer: 0WD0 <wd.1105848296@gmail.com>
+;; Author: 0WD0 <me@0wd0.com>
+;; Maintainer: 0WD0 <me@0wd0.com>
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 
@@ -508,7 +508,7 @@ CREATED, INITIAL-SECTION, and SELECT-SECTION are for internal use."
                 ((majutsu--refresh-buffer-set-positions positions))))))
       (let ((magit-section-cache-visibility nil))
         (when (bound-and-true-p magit-root-section)
-          (magit-section-show magit-root-section)))
+          (majutsu-section-show magit-root-section)))
       (run-hooks 'majutsu-refresh-buffer-hook)
       (magit-section-update-highlight)
       (set-buffer-modified-p nil))))
