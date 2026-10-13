@@ -20,13 +20,15 @@
 
 (require 'majutsu)
 (require 'majutsu-jj)
+(require 'majutsu-jjosh)
 (require 'majutsu-row)
+(require 'majutsu-file-tree)
 
 ;;; Section Keymaps
 
 (defvar-keymap majutsu-commit-section-map
   :doc "Keymap for `jj-commit' sections."
-  "<remap> <majutsu-visit-thing>" #'majutsu-edit-changeset
+  "<remap> <majutsu-visit-thing>" #'majutsu-edit
   "<remap> <majutsu-delete-thing>" 'majutsu-abandon)
 
 ;;; Log State
@@ -44,47 +46,31 @@ Returns an (ARGS FILESETS) pair.  USE-BUFFER-ARGS follows
           ('nil majutsu-direct-use-buffer-arguments)
           ((or 'always 'selected 'current 'never)
            use-buffer-args)))
-  (cond
-   ((and (memq use-buffer-args '(always selected current))
-         (eq major-mode mode))
-    (list majutsu-buffer-log-args
-          majutsu-buffer-log-filesets))
-   ((and (memq use-buffer-args '(always selected))
-         (when-let* ((buf (majutsu--get-mode-buffer mode (eq use-buffer-args 'selected))))
-           (list (buffer-local-value 'majutsu-buffer-log-args buf)
-                 (buffer-local-value 'majutsu-buffer-log-filesets buf)))))
-   (t
-    (list (majutsu-transient-default-value
-           'majutsu-log mode
-           'majutsu-log-current-arguments
-           'majutsu-log-default-arguments)
-          (or (get mode 'majutsu-log-current-filesets)
-              (get mode 'majutsu-log-default-filesets))))))
+  (let ((buffer (cond
+                 ((and (memq use-buffer-args '(always selected current))
+                       (eq major-mode mode))
+                  (current-buffer))
+                 ((memq use-buffer-args '(always selected))
+                  (majutsu--get-mode-buffer
+                   mode (eq use-buffer-args 'selected)
+                   (or (majutsu--buffer-root) (majutsu-toplevel)))))))
+    (list (if buffer
+              (buffer-local-value 'majutsu-buffer-log-args buffer)
+            (majutsu-transient-default-value
+             'majutsu-log mode 'majutsu-log-default-arguments))
+          (and (eq buffer (current-buffer))
+               majutsu-buffer-log-filesets))))
 
-(defun majutsu-log--set-value (mode args filesets &optional save)
-  "Set current log values for MODE.
-
-When SAVE is non-nil, also persist ARGS using `transient-values'."
-  (setq args (seq-remove #'null (flatten-tree args)))
-  (setq filesets
-        (and filesets
-             (seq-remove (lambda (s)
-                           (or (null s)
-                               (and (stringp s) (string-empty-p s))))
-                         (flatten-tree filesets))))
-  (if-let* ((config-id (majutsu-repository-config-id)))
-      (majutsu-transient-put-repository-current-value
-       'majutsu-log mode args config-id)
-    (put mode 'majutsu-log-current-arguments args))
-  (put mode 'majutsu-log-current-filesets filesets)
-  (when save
-    (setf (alist-get (majutsu-transient-global-default-key 'majutsu-log mode)
-                     transient-values)
-          args)
-    (transient-save-values))
+(defun majutsu-log--set-value (mode args filesets)
+  "Apply ARGS and FILESETS only to the current buffer when it uses MODE."
   (when (eq major-mode mode)
-    (setq-local majutsu-buffer-log-args args)
-    (setq-local majutsu-buffer-log-filesets filesets))
+    (setq-local majutsu-buffer-log-args
+                (seq-remove #'null (flatten-tree args)))
+    (setq-local majutsu-buffer-log-filesets
+                (seq-remove (lambda (s)
+                              (or (null s)
+                                  (and (stringp s) (string-empty-p s))))
+                            (flatten-tree filesets))))
   nil)
 
 (defvar-local majutsu-log--this-error nil
@@ -124,11 +110,6 @@ rendered by `majutsu-log-insert-error-header' on the next refresh.")
 (defconst majutsu-log--field-list-separator "\x1c"
   "Separator character inserted between list items inside a single field value.")
 
-(defconst majutsu-log--field-line-separator
-  majutsu-row-field-line-separator
-  "Encoded newline separator used inside template field payloads.
-Log records are transported as single lines, then this separator is
-decoded back to literal newlines after field splitting.")
 
 (defconst majutsu-log--default-column-postprocessors nil
   "Default postprocessors appended to every column instance.")
@@ -147,41 +128,47 @@ decoded back to literal newlines after field splitting.")
   "Machine template for the canonical one-line description.")
 
 (defcustom majutsu-log-commit-columns
-  '((:field change-id :module heading
-     :template majutsu-log-template-change-id :face t)
-    (:field bookmarks :module heading
-     :template majutsu-log-template-bookmarks :face magit-branch-local)
-    (:field tags :module heading
-     :template majutsu-log-template-tags :face magit-tag)
-    (:field working-copies :module heading
-     :template majutsu-log-template-working-copies :face magit-branch-remote)
-    (:field empty :module heading
-     :template majutsu-log-template-empty :face t)
-    (:field git-head :module heading
-     :template majutsu-log-template-git-head :face t)
-    (:field description :module heading
-     :template majutsu-log-template-description :face t)
-    (:field commit-id :module tail
-     :template majutsu-log-template-commit-id :face t)
-    (:field author :module tail
-     :template majutsu-log-template-author :face magit-log-author)
-    (:field timestamp :module tail
-     :template majutsu-log-template-timestamp :face magit-log-date)
-    (:field long-desc :module body
-     :template majutsu-log-template-long-desc :face t)
-    (:field id :module metadata
-     :template majutsu-log-template-id :face nil)
-    (:field commit-id :module metadata
-     :template majutsu-log--canonical-commit-id-template :face nil)
-    (:field parent-ids :module metadata
-     :template majutsu-log-template-parent-ids :face nil)
-    (:field flags :module metadata
-     :template majutsu-log-template-flags :face nil)
-    (:field description :module metadata
-     :template majutsu-log--canonical-description-template :face nil))
+  (eval-when-compile
+    `((:field change-id :module heading
+       :template majutsu-log-template-change-id :face t)
+      (:field bookmarks :module heading
+       :template majutsu-log-template-bookmarks :face magit-branch-local)
+      (:field tags :module heading
+       :template majutsu-log-template-tags :face magit-tag)
+      (:field working-copies :module heading
+       :template majutsu-log-template-working-copies :face magit-branch-remote)
+      (:field empty :module heading
+       :template majutsu-log-template-empty :face t)
+      (:field git-head :module heading
+       :template majutsu-log-template-git-head :face t)
+      ,@(majutsu-jjosh
+          '((:field touched-projects :module heading
+             :template majutsu-log-template-touched-projects :face font-lock-type-face)))
+      (:field description :module heading
+       :template majutsu-log-template-description :face t)
+      (:field commit-id :module tail
+       :template majutsu-log-template-commit-id :face t)
+      (:field author :module tail
+       :template majutsu-log-template-author :face magit-log-author)
+      (:field timestamp :module tail
+       :template majutsu-log-template-timestamp :face magit-log-date)
+      (:field long-desc :module body
+       :template majutsu-log-template-long-desc :face t)
+      (:field id :module metadata
+       :template majutsu-log-template-id :face nil)
+      (:field commit-id :module metadata
+       :template majutsu-log--canonical-commit-id-template :face nil)
+      (:field parent-ids :module metadata
+       :template majutsu-log-template-parent-ids :face nil)
+      (:field flags :module metadata
+       :template majutsu-log-template-flags :face nil)
+      (:field description :module metadata
+       :template majutsu-log--canonical-description-template :face nil)))
   "Flat row columns controlling log transport and rendering.
 Only metadata occurrences become semantic entry fields; visible occurrences
-remain available through point-local row copy commands."
+remain available through point-local row copy commands.
+The touched-projects column is included only in the jjosh build.
+Remove a column to disable it."
   :type 'sexp
   :group 'majutsu
   :set (lambda (symbol value)
@@ -249,6 +236,16 @@ Also registers a variable watcher to invalidate the template cache."
   [:tags]
   "Template for the tags column.")
 
+(majutsu-jjosh
+  (majutsu-template-defkeyword touched_projects Commit
+    (:returns (:list String) :doc "Subprojects touched by this commit (jjosh)."))
+
+  (majutsu-log-define-column touched-projects
+    [:surround "[" "]" [:touched_projects :join ", "]]
+    "Template for the optional jjosh project summary column.
+Names come from the loaded operation's project layout, not bookmark names.
+Empty summaries produce no brackets.  Only available in the jjosh build."))
+
 (majutsu-log-define-column working-copies
   [:working_copies]
   "Template for the working-copies column.")
@@ -304,10 +301,8 @@ Also registers a variable watcher to invalidate the template cache."
   "Template for the timestamp column.")
 
 (majutsu-log-define-column long-desc
-  [:description :lines :skip 1 :join "\x1f"]
-  "Template for the long-desc column.
-Newlines are encoded as an internal separator so ANSI/label styling
-can survive transport through the single-line log format.")
+  [:description :lines :skip 1 :join "\n"]
+  "Template for the long-desc column.")
 
 (defvar majutsu-log--compiled-template-cache nil
   "Cached structure holding the compiled log template and column metadata.")
@@ -328,17 +323,6 @@ can survive transport through the single-line log format.")
   (add-variable-watcher 'majutsu-log-commit-columns
                         #'majutsu-log--invalidate-template-cache))
 
-(defun majutsu-log-post-decode-line-separator (value &optional _ctx)
-  "Decode `majutsu-log--field-line-separator' inside VALUE.
-
-This is the default postprocessor for log fields so all modules can
-transport logical newlines safely through single-line payload segments."
-  (if (stringp value)
-      (subst-char-in-string
-       (aref majutsu-log--field-line-separator 0)
-       ?\n
-       value t)
-    value))
 
 (defun majutsu-log-post-split-list-separator (value &optional _ctx)
   "Split VALUE by `majutsu-log--field-list-separator'."
@@ -362,21 +346,16 @@ transport logical newlines safely through single-line payload segments."
    :columns-var 'majutsu-log-commit-columns
    :default-postprocessors majutsu-log--default-column-postprocessors
    :field-postprocessors majutsu-log--field-default-postprocessors
-   :decode-function 'majutsu-log-post-decode-line-separator
    :entry-id-function 'majutsu-log--entry-id
    :section-class 'jj-commit
    :section-value-function 'majutsu-log--entry-id
    :tail-align t))
 
-(defun majutsu-log--compile-columns ()
-  "Compile `majutsu-log-commit-columns' into row metadata."
-  (majutsu-row-compile (majutsu-log--row-profile)))
-
 (defun majutsu-log--ensure-template ()
-  "Return cached compiled template structure, recomputing if necessary."
+  "Return the compiled template for the configured log columns."
   (or majutsu-log--compiled-template-cache
       (setq majutsu-log--compiled-template-cache
-            (majutsu-log--compile-columns))))
+            (majutsu-row-compile (majutsu-log--row-profile)))))
 
 (defun majutsu-log--build-args ()
   "Build argument list for `jj log' using current log variables."
@@ -439,7 +418,7 @@ transport logical newlines safely through single-line payload segments."
 (defun majutsu-log--current-entry-id ()
   "Return current `jj-commit' section id or signal a user error."
   (or (magit-section-value-if 'jj-commit)
-      (user-error "No changeset at point")))
+      (user-error "No revision at point")))
 
 (defun majutsu-log--visible-parent-ids (entry)
   "Return visible parent ids for ENTRY in current buffer order."
@@ -514,7 +493,7 @@ disappear again."
 When WINDOW is nil, use the current row tail owner window."
   (when (derived-mode-p 'majutsu-log-mode)
     (setq window (or window (majutsu-row--tail-owner-window)))
-    (majutsu-row-refresh-tail-spacers nil nil window)
+    (majutsu-row-refresh-tail-spacers)
     (when window
       (force-window-update window))))
 
@@ -523,8 +502,8 @@ When WINDOW is nil, use the current row tail owner window."
   (majutsu-log--refresh-tail-window (selected-window)))
 
 (defun majutsu-log--after-window-size-change (window)
-  "Refresh tail alignment after the selected log WINDOW changes size."
-  (when (eq window (selected-window))
+  "Refresh tail alignment after log WINDOW changes size."
+  (when (eq (window-buffer window) (current-buffer))
     (majutsu-log--refresh-tail-window window)))
 
 (defun majutsu-log--wash-logs (_args)
@@ -561,22 +540,27 @@ This function is meant to be used as a WASHER for `majutsu-jj-wash'."
 
 ;;; Log insert conflicts
 
+(defun majutsu-log--insert-conflicted-file (entry heading-prefix _body-prefix)
+  "Insert conflicted-file ENTRY with its tree HEADING-PREFIX."
+  (let* ((file (plist-get entry :path))
+         (sides (plist-get entry :sides))
+         (name (majutsu-file-tree-escape-label (file-name-nondirectory file))))
+    (magit-insert-section (jj-file file)
+      (magit-insert-heading
+        (propertize
+         (concat heading-prefix name
+                 (and sides (format " (%d-sided conflict)" sides)))
+         'face 'error 'help-echo file)))))
+
 (defun majutsu-log-insert-conflicts ()
-  "Insert conflicted files section."
-  (let ((entries (majutsu-jj-conflicted-files)))
-    (when entries
-      (magit-insert-section (conflict)
-        (magit-insert-heading "Unresolved Conflicts")
-        (dolist (entry entries)
-          (let* ((file (plist-get entry :path))
-                 (sides (plist-get entry :sides))
-                 (heading (if sides
-                              (format "%s (%d-sided conflict)" file sides)
-                            file)))
-            (magit-insert-section (jj-file file)
-              (magit-insert-heading (propertize heading 'face 'error))
-              (insert "\n"))))
-        (insert "\n")))))
+  "Insert the working copy's conflicted files as a collapsible path tree."
+  (when-let* ((entries (majutsu-jj-conflicted-files)))
+    (magit-insert-section (conflict)
+      (magit-insert-heading "Unresolved Conflicts")
+      (majutsu-file-tree-insert
+       (majutsu-file-tree-build entries (lambda (entry) (plist-get entry :path)))
+       #'majutsu-log--insert-conflicted-file)
+      (insert "\n"))))
 
 ;;; Log Navigation
 
@@ -588,35 +572,35 @@ This function is meant to be used as a WASHER for `majutsu-jj-wash'."
     (string-trim output)))
 
 (defun majutsu-log-goto-@ ()
-  "Jump to the current changeset (@)."
+  "Jump to the working-copy revision (@)."
   (interactive)
   (majutsu--goto-log-entry (majutsu-current-id)))
 
 (defun majutsu-log-goto-parent ()
-  "Jump to a parent of the changeset at point.
+  "Jump to a parent of the revision at point.
 
-When the current changeset has multiple visible parents, prompt for which
+When the current revision has multiple visible parents, prompt for which
 parent to visit."
   (interactive)
   (majutsu--assert-mode 'majutsu-log-mode)
   (let* ((entry-id (majutsu-log--current-entry-id))
          (entry (or (majutsu-log--entry-for-id entry-id)
-                    (user-error "Changeset %s is not available in the current log" entry-id))))
+                    (user-error "Revision %s is not available in the current log" entry-id))))
     (majutsu-log--goto-related
      (majutsu-log--visible-parent-ids entry)
      "Go to parent: "
      "No parent revisions visible in the current log")))
 
 (defun majutsu-log-goto-child ()
-  "Jump to a child of the changeset at point.
+  "Jump to a child of the revision at point.
 
-When the current changeset has multiple visible children, prompt for which
+When the current revision has multiple visible children, prompt for which
 child to visit."
   (interactive)
   (majutsu--assert-mode 'majutsu-log-mode)
   (let* ((entry-id (majutsu-log--current-entry-id))
          (entry (or (majutsu-log--entry-for-id entry-id)
-                    (user-error "Changeset %s is not available in the current log" entry-id))))
+                    (user-error "Revision %s is not available in the current log" entry-id))))
     (majutsu-log--goto-related
      (majutsu-log--visible-child-ids entry)
      "Go to child: "
@@ -653,8 +637,8 @@ Return non-nil when the section could be located."
     t))
 
 ;;;###autoload
-(defun majutsu-goto-next-changeset ()
-  "Navigate to the next changeset in the log."
+(defun majutsu-goto-next-revision ()
+  "Navigate to the next revision in the log."
   (interactive)
   (let ((pos (point))
         found)
@@ -667,11 +651,11 @@ Return non-nil when the section could be located."
           (setq found t))))
     (unless found
       (goto-char pos)
-      (message "No more changesets"))))
+      (message "No more revisions"))))
 
 ;;;###autoload
-(defun majutsu-goto-prev-changeset ()
-  "Navigate to the previous changeset in the log."
+(defun majutsu-goto-prev-revision ()
+  "Navigate to the previous revision in the log."
   (interactive)
   (let ((pos (point))
         found)
@@ -684,7 +668,7 @@ Return non-nil when the section could be located."
           (setq found t))))
     (unless found
       (goto-char pos)
-      (message "No more changesets"))))
+      (message "No more revisions"))))
 
 ;;; Log Mode
 
@@ -697,8 +681,8 @@ Return non-nil when the section could be located."
 (defvar-keymap majutsu-log-mode-map
   :doc "Keymap for `majutsu-log-mode'."
   :parent majutsu-mode-map
-  "n" 'majutsu-goto-next-changeset
-  "p" 'majutsu-goto-prev-changeset
+  "n" 'majutsu-goto-next-revision
+  "p" 'majutsu-goto-prev-revision
   "[" 'majutsu-log-goto-parent
   "]" 'majutsu-log-goto-child
   "O" 'majutsu-new-dwim
@@ -785,8 +769,13 @@ offer to create one using `jj git init`."
          (topdir (majutsu-toplevel default-directory)))
     (cond
      (topdir
-      (let ((default-directory topdir))
-        (majutsu-log-setup-buffer)))
+      (if (equal topdir (majutsu--buffer-root))
+          (let ((default-directory topdir))
+            (majutsu-log-setup-buffer))
+        ;; Opening another workspace must not reuse the caller's buffer args.
+        (with-temp-buffer
+          (setq default-directory topdir)
+          (majutsu-log-setup-buffer))))
      ((y-or-n-p (format "Create jj repository in %s? "
                         (abbreviate-file-name default-directory)))
       (let* ((dest (file-name-as-directory (expand-file-name default-directory)))
@@ -802,7 +791,8 @@ offer to create one using `jj git init`."
                         (majutsu-convert-filename-for-jj dest))))
           (setq out (string-trim (buffer-string))))
         (if (zerop exit)
-            (let ((default-directory dest))
+            (with-temp-buffer
+              (setq default-directory dest)
               (majutsu-log-setup-buffer))
           (user-error "jj git init failed: %s"
                       (if (string-empty-p out)
@@ -827,17 +817,19 @@ minibuffer for editing.  Empty input clears the filter."
      :completion-args '("log" "-r"))))
 
 (defun majutsu-log-transient-reset ()
-  "Reset log options to defaults."
+  "Clear current log options and the popup, without changing defaults."
   (interactive)
   (majutsu-log--set-value 'majutsu-log-mode nil nil)
-  (transient-reset))
-
+  (transient-prefix-set nil)
+  (when (eq major-mode 'majutsu-log-mode)
+    (majutsu-refresh-buffer)))
 
 ;;; Arguments
 ;;;; Prefix Classes
 
-(defclass majutsu-log-prefix (transient-prefix)
+(defclass majutsu-log-prefix (majutsu-defaults-prefix)
   ((history-key :initform 'majutsu-log)
+   (defaults-namespace :initform 'majutsu-log)
    (major-mode :initform 'majutsu-log-mode)))
 
 ;;;; Prefix Methods
@@ -851,34 +843,11 @@ minibuffer for editing.  Empty input clears the filter."
                (majutsu-log--get-value (oref obj major-mode) 'prefix)))
     (oset obj value (majutsu-filesets-build-transient-value args filesets))))
 
-(cl-defmethod transient-set-value ((obj majutsu-log-prefix))
-  (let* ((obj (oref obj prototype))
-         (mode (or (oref obj major-mode) major-mode)))
-    (pcase-let ((`(,args ,files) (transient-args (oref obj command))))
-      (majutsu-log--set-value mode args files)
-      (transient--history-push obj)
-      (majutsu-refresh))))
-
-(cl-defmethod transient-save-value ((obj majutsu-log-prefix))
-  (let* ((obj (oref obj prototype))
-         (mode (or (oref obj major-mode) major-mode)))
-    (pcase-let ((`(,args ,files) (transient-args (oref obj command))))
-      (majutsu-log--set-value mode args files t)
-      (transient--history-push obj)
-      (majutsu-refresh))))
-
-(cl-defmethod majutsu-transient--save-repository-defaults ((obj majutsu-log-prefix))
-  (let* ((obj (oref obj prototype))
-         (mode (or (oref obj major-mode) major-mode)))
-    (pcase-let ((`(,args ,files) (transient-args (oref obj command))))
-      (majutsu-transient-save-repository-value 'majutsu-log mode args)
-      (put mode 'majutsu-log-current-filesets files)
-      (transient--history-push obj)
-      (when (eq major-mode mode)
-        (setq-local majutsu-buffer-log-args args)
-        (setq-local majutsu-buffer-log-filesets files))
-      (majutsu-refresh)
-      (message "Saved log arguments as repository defaults"))))
+(cl-defmethod majutsu-transient-apply-value ((obj majutsu-log-prefix) value)
+  (when (eq major-mode (oref obj major-mode))
+    (pcase-let ((`(,args ,filesets) value))
+      (majutsu-log--set-value (oref obj major-mode) args filesets))
+    (majutsu-refresh-buffer)))
 
 (transient-define-argument majutsu-log:-r ()
   :description "Revisions"
@@ -913,6 +882,7 @@ minibuffer for editing.  Empty input clears the filter."
   :class 'transient-files
   :key "--"
   :argument "--"
+  :unsavable t
   :prompt "Limit to filesets"
   :reader #'majutsu-read-files
   :multi-value t)
@@ -934,9 +904,8 @@ minibuffer for editing.  Empty input clears the filter."
     (majutsu-log:--)]
    ["Actions"
     ("g" "buffer" majutsu-log-transient)
-    ("s" "buffer and set defaults" transient-set-and-exit)
-    ("w" "buffer and save defaults" transient-save-and-exit)
-    ("W" "buffer and save repo defaults" majutsu-transient-save-repository-defaults)
+    ("s" "buffer and set workspace session" transient-set-and-exit)
+    ("w" "Save defaults..." majutsu-transient-defaults-menu)
     ("0" "Reset options" majutsu-log-transient-reset :transient t)]]
   (interactive)
   (cond

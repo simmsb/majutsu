@@ -21,6 +21,7 @@
 (require 'majutsu-remote)
 (require 'majutsu-row)
 (require 'majutsu-template)
+(require 'majutsu-jjosh)
 
 (require 'cl-lib)
 (require 'seq)
@@ -28,13 +29,13 @@
 
 (declare-function majutsu-bookmark-at-point "majutsu-jj" (&optional bookmark-type))
 (declare-function majutsu-revision-at-point "majutsu-jj" ())
-(declare-function majutsu-edit-changeset "majutsu-edit" (&optional arg))
+(declare-function majutsu-edit "majutsu-edit" (&optional arg))
 
 ;;; Section Keymaps
 
 (defvar-keymap majutsu-bookmark-section-map
   :doc "Keymap for `jj-bookmark' sections."
-  "<remap> <majutsu-visit-thing>" #'majutsu-edit-changeset
+  "<remap> <majutsu-visit-thing>" #'majutsu-edit
   "<remap> <majutsu-delete-thing>" #'majutsu-bookmark-delete)
 
 ;;; majutsu-bookmark
@@ -102,10 +103,13 @@ SCOPE should be one of the scopes accepted by
            (majutsu--get-bookmark-names scope))))
 
 (defun majutsu--bookmark-forget-name-candidates ()
-  "Return bookmark name candidates for `jj bookmark forget'."
-  (delete-dups
-   (append (majutsu--get-bookmark-names 'local)
-           (majutsu--bookmark-base-names-from-scope 'remote))))
+  "Return bookmark candidates for this build's `jj bookmark forget'.
+The jjosh build also offers exact remote refs."
+  (if (majutsu-jjosh t)
+      (delete-dups
+       (append (majutsu--get-bookmark-names 'local)
+               (majutsu--get-bookmark-names 'remote)))
+    (majutsu--get-bookmark-names 'local)))
 
 (defun majutsu--bookmark-track-name-candidates ()
   "Return bookmark name candidates for `jj bookmark track'."
@@ -214,7 +218,10 @@ bookmark(s) at point."
 
 ;;;###autoload
 (defun majutsu-bookmark-forget (names)
-  "Forget bookmarks or bookmark patterns NAMES locally only."
+  "Forget bookmarks or bookmark patterns NAMES without recording a deletion.
+Forgetting a local bookmark untracks corresponding remotes.  In the jjosh
+build, NAMES may also contain exact NAME@REMOTE refs to forget until the
+next fetch."
   (interactive (list (majutsu-read-bookmark-patterns
                       "Forget bookmark(s)/pattern(s)"
                       nil nil
@@ -267,6 +274,16 @@ REF is one exact NAME@REMOTE, not a bookmark or remote pattern."
   (interactive (list (majutsu-read-string "Remote bookmark")))
   (majutsu-bookmark--track-ref ref t))
 
+(majutsu-jjosh
+  (defun majutsu-bookmark-forget-ref (ref)
+    "Forget one exact remote bookmark REF using the jjosh extension.
+REF is one exact NAME@REMOTE, including Git-tracking NAME@git."
+    (interactive (list (majutsu-read-string "Remote bookmark")))
+    (pcase-let ((`(,name . ,remote) (majutsu--bookmark-split-remote-ref ref)))
+      (unless remote
+        (user-error "Expected a remote bookmark"))
+      (majutsu-start-jj (list "bookmark" "forget" (concat name "@" remote))))))
+
 (defvar-local majutsu-bookmark--list-remotes nil
   "Remote metadata for the current bookmark list refresh.")
 
@@ -300,15 +317,10 @@ REF is one exact NAME@REMOTE, not a bookmark or remote pattern."
 (majutsu-bookmark-define-template heading
   [:separate " "
              [:majutsu-bookmark-list-name]
+             [:majutsu-bookmark-list-tracking]
              [:if [:present]
                  [:majutsu-bookmark-list-target-summary]
-               [:if [:remote] "(not created yet)" "(deleted)"]]
-             [:if [:remote]
-                 [:if [:tracked]
-                     [:if [:tracking_present]
-                         ["[tracked" [:majutsu-bookmark-list-tracking] "]"]
-                       "[tracked, local deleted]"]
-                   "[untracked]"]]]
+               [:if [:remote] "(not created yet)" "(deleted)"]]]
   "Template used for bookmark-list headings.")
 
 (majutsu-template-defkeyword majutsu-bookmark-list-commit-summary Commit
@@ -324,19 +336,25 @@ REF is one exact NAME@REMOTE, not a bookmark or remote pattern."
   (:returns Template :doc "One compact tracked-distance fragment.")
   `[:if [:not [:zero]]
        [,prefix
-        [:if [:exact] [:exact] [[:lower] "+"]]]])
+        [:if [:exact] [:exact] ["≥" [:lower]]]]])
 
 (majutsu-template-defkeyword majutsu-bookmark-list-tracking CommitRef
-  (:returns Template :doc "Compact tracked-remote distance summary.")
-  [:if [:tracking_present]
-      [:if [:and [:method [:tracking_ahead_count] :zero]
-                 [:method [:tracking_behind_count] :zero]]
-          ", synced"
-        [", " [:separate "/"
-                        [:method [:tracking_ahead_count]
-                         :majutsu-bookmark-list-distance-part "+"]
-                        [:method [:tracking_behind_count]
-                         :majutsu-bookmark-list-distance-part "-"]]]]])
+  (:returns Template :doc "Tracking state and distances from the local perspective.")
+  [:if [:remote]
+      [:if [:tracked]
+          [:if [:tracking_present]
+              [:if [:and [:method [:tracking_ahead_count] :zero]
+                         [:method [:tracking_behind_count] :zero]]
+                  [:label "elided" "≡"]
+                [:separate " "
+                           [:label "diff added"
+                                   [:method [:tracking_behind_count]
+                                    :majutsu-bookmark-list-distance-part "↑"]]
+                           [:label "diff modified"
+                                   [:method [:tracking_ahead_count]
+                                    :majutsu-bookmark-list-distance-part "↓"]]]]
+            [:label "warning heading" "× local"]]
+        [:label "elided" "○"]]])
 
 (majutsu-template-defkeyword majutsu-bookmark-list-target-summary CommitRef
   (:returns Template :doc "Default bookmark-list target summary.")
@@ -367,15 +385,15 @@ REF is one exact NAME@REMOTE, not a bookmark or remote pattern."
     (:field conflict-details :module body
      :template
      [:if [:conflict]
-         [:separate "\x1f"
+         [:separate "\n"
                     [:method [:removed_targets]
                      :map [:lambda (target)
                                    [:concat "  - " [:majutsu-bookmark-list-commit-summary]]]
-                     :join "\x1f"]
+                     :join "\n"]
                     [:method [:added_targets]
                      :map [:lambda (target)
                                    [:concat "  + " [:majutsu-bookmark-list-commit-summary]]]
-                     :join "\x1f"]]
+                     :join "\n"]]
        ""]
      :face t)
     (:field name :module metadata :template [:name] :face nil)
@@ -387,12 +405,12 @@ REF is one exact NAME@REMOTE, not a bookmark or remote pattern."
     (:field removed-target-ids :module metadata
      :template [:method [:removed_targets]
                 :map [:lambda (target) [:commit_id]]
-                :join "\x1f"]
+                :join "\n"]
      :face nil :post majutsu-bookmark--row-lines)
     (:field added-target-ids :module metadata
      :template [:method [:added_targets]
                 :map [:lambda (target) [:commit_id]]
-                :join "\x1f"]
+                :join "\n"]
      :face nil :post majutsu-bookmark--row-lines))
   "Flat row columns emitted by `jj bookmark list'."
   :type 'sexp
@@ -487,6 +505,13 @@ Return nil when ENTRY has no conflict target data."
     (let ((section (majutsu-row-insert-entry entry compiled body-inserter valid-targets)))
       (oset section remote (majutsu-row-column entry 'remote))
       (oset section tracked (majutsu-row-column entry 'tracked))
+      (when (majutsu-row-column entry 'remote)
+        (save-excursion
+          (goto-char (oref section start))
+          (put-text-property
+           (point) (line-end-position) 'help-echo
+           (concat "≡ synced; ○ untracked; ↑ local-only commits; ↓ remote-only commits; "
+                   "× local: local bookmark deleted; ≥: at least this many commits"))))
       section)))
 
 ;;;###autoload
@@ -729,7 +754,7 @@ REMOTES are remote name patterns passed via repeated `--remote`."
    [("d" "Delete bookmark" majutsu-bookmark-delete
      :description "Delete (propagate)")
     ("f" "Forget bookmark" majutsu-bookmark-forget
-     :description "Forget (local)")]])
+     :description "Forget (no push)")]])
 
 ;;; _
 (provide 'majutsu-bookmark)

@@ -33,6 +33,11 @@
 (require 'majutsu-template)
 
 (autoload 'majutsu-process-jj "majutsu-process" nil nil)
+(defun majutsu-jj-append-filesets (args filesets)
+  "Return jj ARGS followed by -- and FILESETS."
+  (if filesets
+      (append args (cons "--" filesets))
+    args))
 
 (defvar corfu-margin-formatters)
 
@@ -472,7 +477,7 @@ until an accessible directory is found.  Return nil if none is found."
 
 ;;; Change at Point
 
-(defvar majutsu-buffer-blob-revision)
+(defvar majutsu-buffer-blob-commit-id)
 (defvar majutsu-buffer-diff-range)
 
 (defun majutsu--regexp-char-class (chars)
@@ -497,8 +502,8 @@ until an accessible directory is found.  Return nil if none is found."
 
 (defun majutsu--buffer-revision-at-point ()
   "Return the revision implied by the surrounding Majutsu buffer."
-  (or (and (bound-and-true-p majutsu-buffer-blob-revision)
-           majutsu-buffer-blob-revision)
+  (or (and (bound-and-true-p majutsu-buffer-blob-commit-id)
+           majutsu-buffer-blob-commit-id)
       (majutsu--diff-revision-at-point)))
 
 (defun majutsu-revision-at-point ()
@@ -601,10 +606,12 @@ in the revision identifier (used for recursive refinement)."
 
 (defun majutsu-tag-at-point ()
   "Return the tag name at point, or nil when none is found."
-  (or (magit-section-value-if 'jj-tag)
-      (and (eq (majutsu-text-property-near-point 'majutsu-row-field)
-               'tags)
-           (magit-thing-at-point 'jj-revision t))))
+  (let ((section (magit-current-section)))
+    (while (and section (not (magit-section-match 'jj-tag section)))
+      (setq section (oref section parent)))
+    (or (and section (oref section value))
+        (and (eq (majutsu-text-property-near-point 'majutsu-row-field) 'tags)
+             (magit-thing-at-point 'jj-revision t)))))
 
 ;;; Errors
 
@@ -676,6 +683,68 @@ to do the following.
 * Flatten ARGS, removing nil arguments.
 * Prepend `majutsu-jj-global-arguments' to ARGS."
   (append majutsu-jj-global-arguments (flatten-tree args)))
+
+(defun majutsu-jj-option-values (args option &optional short)
+  "Return values supplied for OPTION in ARGS, also accepting SHORT.
+
+Both `--option=VALUE' and separate-value spellings are recognized.  Stop at
+`--', so filesets cannot be mistaken for options.  An option without a value
+contributes an empty string; callers can distinguish it from an absent option."
+  (let (values)
+    (while args
+      (let ((arg (pop args)))
+        (cond
+         ((equal arg "--")
+          (setq args nil))
+         ((or (equal arg option) (and short (equal arg short)))
+          (if (and args
+                   (stringp (car args))
+                   (not (string-prefix-p "-" (car args))))
+              (push (pop args) values)
+            (push "" values)))
+         ((and (stringp arg)
+               (string-prefix-p (concat option "=") arg))
+          (push (substring arg (1+ (length option))) values))
+         ((and short (stringp arg)
+               (string-prefix-p short arg)
+               (> (length arg) (length short)))
+          (let ((value (substring arg (length short))))
+            ;; clap accepts both `-rREV' and `-r=REV'.  Keep the attached
+            ;; equals as syntax instead of returning it as part of REV.
+            (push (if (string-prefix-p "=" value)
+                      (substring value 1)
+                    value)
+                  values))))))
+    (nreverse values)))
+
+(defun majutsu-jj-set-option-value (args option value &optional short)
+  "Return ARGS with OPTION replaced by VALUE, also removing SHORT spellings.
+
+Every spelling recognized by `majutsu-jj-option-values' is removed before a
+single =VALUE spelling is inserted.  When VALUE is nil, only remove the
+option.  Preserve arguments at and after `--' unchanged."
+  (let (kept tail)
+    (while args
+      (let ((arg (pop args)))
+        (cond
+         ((equal arg "--")
+          (setq tail (cons arg args)
+                args nil))
+         ((or (equal arg option) (and short (equal arg short)))
+          (when (and args
+                     (stringp (car args))
+                     (not (string-prefix-p "-" (car args))))
+            (pop args)))
+         ((and (stringp arg)
+               (or (string-prefix-p (concat option "=") arg)
+                   (and short
+                        (string-prefix-p short arg)
+                        (> (length arg) (length short))))))
+         (t
+          (push arg kept)))))
+    (append (nreverse kept)
+            (and value (list (concat option "=" value)))
+            tail)))
 
 (defun majutsu--jj-insert (return-error &rest args)
   "Run jj with ARGS and insert output at point.
@@ -758,7 +827,7 @@ Empty items are omitted from the result."
 (defun majutsu-jj--parse-conflicted-file-record (record)
   "Parse one conflicted-file machine RECORD into a plist."
   (let* ((fields (majutsu--split-fields
-                  (or record "") majutsu-jj--conflicted-file-field-separator 2))
+                   (or record "") majutsu-jj--conflicted-file-field-separator 2))
          (sides (string-to-number (or (nth 0 fields) "")))
          (path (nth 1 fields)))
     (when (and (stringp path)
@@ -770,7 +839,8 @@ Empty items are omitted from the result."
   "Return conflicted file entries at REV using `jj file list -T'.
 REV defaults to \"@\".  FILESETS, when non-nil, is a string or list of jj
 fileset expressions used to restrict the query.  Each returned entry is a
-plist with `:path' and `:sides'."
+plist with `:path' and `:sides'.  Signal a user error if the query fails;
+failure must not be mistaken for a revision without conflicts."
   (let* ((filesets (cond
                     ((null filesets) nil)
                     ((listp filesets) filesets)
@@ -778,9 +848,15 @@ plist with `:path' and `:sides'."
          (args (append (list "file" "list" "-r" (or rev "@")
                              "-T" majutsu-jj--conflicted-files-template)
                        (and filesets (cons "--" filesets)))))
-    (delq nil
-          (mapcar #'majutsu-jj--parse-conflicted-file-record
-                  (apply #'majutsu-jj-items args)))))
+    (majutsu--with-no-color
+      (with-temp-buffer
+        (let ((result (apply #'majutsu--jj-insert t args)))
+          (unless (and (integerp result) (zerop result))
+            (user-error "Cannot query conflicted files at %s: %s"
+                        (or rev "@") result)))
+        (delq nil
+              (mapcar #'majutsu-jj--parse-conflicted-file-record
+                      (split-string (buffer-string) "\0" t)))))))
 
 (defun majutsu-jj-string (&rest args)
   "Run jj command with ARGS and return the first line of output.
@@ -795,6 +871,36 @@ newline, return an empty string.  This function aligns with
       (unless (bobp)
         (goto-char (point-min))
         (buffer-substring-no-properties (point) (line-end-position))))))
+
+(defun majutsu-jj-operation-id (&optional directory snapshot)
+  "Return DIRECTORY's current jj operation ID.
+
+DIRECTORY defaults to `default-directory'.  Return nil when jj cannot provide
+a nonempty ID.  When SNAPSHOT is nil, do not snapshot the working copy first."
+  (condition-case nil
+      (let ((default-directory (or directory default-directory)))
+        (when-let* ((id (majutsu-jj-string
+                         (unless snapshot "--ignore-working-copy")
+                         "operation" "log"
+                         "--no-graph" "-n" "1" "-T" "id")))
+          (unless (string-empty-p id)
+            id)))
+    (error nil)))
+
+(defun majutsu-jj-resolve-single-commit (revset)
+  "Return REVSET's only commit ID, or nil unless it resolves exactly once.
+
+Unlike helpers that use `latest', this preserves cardinality: a range is not
+silently reduced to one of its commits."
+  (condition-case nil
+      (when-let* ((commit-id
+                   (majutsu-jj-string
+                    "--ignore-working-copy" "log" "-r"
+                    (format "exactly((%s), 1)" revset)
+                    "--no-graph" "--limit" "1" "-T" "commit_id")))
+        (unless (string-empty-p commit-id)
+          commit-id))
+    (error nil)))
 
 (defun majutsu-jj--escape-fileset-string (s)
   "Escape S for a jj fileset string literal."

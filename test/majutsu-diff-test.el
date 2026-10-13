@@ -18,6 +18,63 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'majutsu)
+(require 'majutsu-jj-integration)
+
+(ert-deftest majutsu-diff-single-source-commit/rejects-non-single-revision-ranges ()
+  "Only a single changes-in commit is a valid Split/Squash patch source."
+  (majutsu-jj-integration-with-repo repo
+    (majutsu-jj-integration-write-text
+     (majutsu-jj-integration-file repo "file") "base\n")
+    (majutsu-jj-integration-commit repo "base")
+    (let ((current (string-trim
+                    (majutsu-jj-integration-output
+                     repo "log" "--no-graph" "-r" "@" "-T" "commit_id")))
+          (parent (string-trim
+                   (majutsu-jj-integration-output
+                    repo "log" "--no-graph" "-r" "@-" "-T" "commit_id"))))
+      (with-temp-buffer
+        (should-not (majutsu-diff-single-source-commit))
+        (majutsu-diff-mode)
+        (dolist (case (list (cons nil current)
+                           (cons '("--revisions=@-") parent)
+                           (cons '("-r" "@") current)
+                           (cons '("--revisions=@|@-") nil)
+                           (cons '("--revisions=@" "-r=@-") nil)
+                           (cons '("--from=@-" "--to=@") nil)
+                           (cons '("-f=@" "-t=@-") nil)
+                           (cons '("--revisions=none()") nil)))
+          (setq-local majutsu-buffer-diff-range (car case))
+          (should (equal (majutsu-diff-single-source-commit)
+                         (cdr case))))))))
+
+(ert-deftest majutsu-diff-single-source-commit/follows-render-and-range-not-moving-at ()
+  "Keep the rendered source until refresh, independently in each diff buffer."
+  (majutsu-jj-integration-with-repo repo
+    (let ((file (majutsu-jj-integration-file repo "file")))
+      (majutsu-jj-integration-write-text file "base\n")
+      (majutsu-jj-integration-commit repo "base")
+      (majutsu-jj-integration-write-text file "first\n")
+      (with-temp-buffer
+        (majutsu-diff-mode)
+        (setq-local majutsu-buffer-diff-range (list "--revisions=@"))
+        (majutsu-refresh-buffer)
+        (let ((rendered (majutsu-diff-single-source-commit)))
+          (majutsu-jj-integration-write-text file "second\n")
+          (let ((current (string-trim
+                          (majutsu-jj-integration-output
+                           repo "log" "--no-graph" "-r" "@" "-T" "commit_id"))))
+            (should-not (equal rendered current))
+            (with-temp-buffer
+              (majutsu-diff-mode)
+              (should (equal (majutsu-diff-single-source-commit) current)))
+            (should (equal (majutsu-diff-single-source-commit) rendered))
+            (majutsu-refresh-buffer)
+            (should (equal (majutsu-diff-single-source-commit) current))
+            ;; A range can change without changing the rendered-text tick.
+            (setcar majutsu-buffer-diff-range "--revisions=none()")
+            (should-not (majutsu-diff-single-source-commit))
+            (setcar majutsu-buffer-diff-range "--revisions=@")
+            (should (equal (majutsu-diff-single-source-commit) current))))))))
 
 (ert-deftest majutsu-diff-file-status/from-header-lines ()
   "Test file status inference from diff lines."
@@ -26,6 +83,28 @@
   (should (equal (majutsu--diff-file-status '("rename from old.txt" "rename to new.txt")) "renamed"))
   (should (equal (majutsu--diff-file-status '("copy from source.txt" "copy to dest.txt")) "copied"))
   (should (equal (majutsu--diff-file-status '("index 832...912 100644")) "modified")))
+
+(ert-deftest majutsu-diff-wash-diffs/renders-mode-only-change ()
+  "A mode-only Git diff should expose its old and new modes."
+  (with-temp-buffer
+    (magit-section-mode)
+    (let ((inhibit-read-only t)
+          (magit-section-inhibit-markers t))
+      (magit-insert-section (diffbuf)
+        (insert "diff --git a/script b/script\n"
+                "old mode 100644\n"
+                "new mode 100755\n")
+        (save-restriction
+          (narrow-to-region (point-min) (point-max))
+          (majutsu-diff-wash-diffs '("--git"))))
+      (let* ((file (car (oref magit-root-section children)))
+             (mode-change (car (oref file children))))
+        (should (equal (oref file value) "script"))
+        (should (eq (oref mode-change type) 'jj-mode-change))
+        (should (equal (oref mode-change value) '("script" chmod)))
+        (should (string-match-p
+                 "old mode 100644\nnew mode 100755"
+                 (buffer-string)))))))
 
 (defmacro majutsu-diff-test--with-transient-context (prefix suffix &rest body)
   "Run BODY as if transient PREFIX were reading infix SUFFIX."
@@ -169,6 +248,156 @@
         (should (oref diff-file content))
         (should-not (text-properties-at 0 (oref diffstat-file value)))
         (should-not (text-properties-at 0 (oref diff-file value)))))))
+
+(ert-deftest majutsu-diff-wash-diffstat-groups-full-paths-and-keeps-navigation ()
+  "Clipped JJ stat names should render as collapsible, navigable file trees."
+  (with-temp-buffer
+    (magit-section-mode)
+    (let* ((inhibit-read-only t)
+           (magit-section-inhibit-markers t)
+           (nested "fixtures/sample-project/packages/module-a/src/components/nested/item.rs")
+           (sibling "fixtures/sample-project/packages/module-a/src/components/nested.rs")
+           (peer "fixtures/sample-project/packages/module-b/src/lib.rs")
+           (binary "assets/logo.bin")
+           (output
+            (concat
+             (string-join
+              '("assets/logo.bin | (binary) +3 bytes"
+                ".../src/components/nested/item.rs | 123 +++--"
+                ".../src/components/nested.rs | 2 +-"
+                ".../module-b/src/lib.rs | 0"
+                "4 files changed, 75 insertions(+), 50 deletions(-)")
+              "\n")
+             "\n"
+             (mapconcat
+              (lambda (path)
+                (format
+                 "diff --git a/%s b/%s\nindex 1234567..89abcde 100644\n--- a/%s\n+++ b/%s\n@@ -1 +1 @@\n-old\n+new\n"
+                 path path path path))
+              (list binary nested sibling peer)
+              ""))))
+      (magit-insert-section (diffbuf)
+        (magit-insert-section (diff-root)
+          (insert output)
+          (save-restriction
+            (narrow-to-region (point-min) (point-max))
+            (majutsu-diff-wash-diffs '("--stat")))))
+      (let* ((diff-root (car (oref magit-root-section children)))
+             (diffstat (car (oref diff-root children)))
+             (stat-file (majutsu-diff--stat-file-section nested))
+             (patch (seq-find (lambda (section)
+                                (and (eq (oref section type) 'jj-file)
+                                     (equal (oref section value) nested)))
+                              (oref diff-root children)))
+             (directory (oref stat-file parent))
+             (text (buffer-substring-no-properties
+                    (oref diffstat start) (oref diffstat end))))
+        (should (equal (oref diffstat type) 'diffstat))
+        (should (equal (oref directory type) 'jj-directory))
+        (should (equal (oref directory value)
+                       "fixtures/sample-project/packages/module-a/src/components/nested/"))
+        (should (string-match-p "└── fixtures/sample-project/packages/" text))
+        (should (string-match-p "item.rs +| 123 \\+\\+\\+--" text))
+        (should (string-match-p "nested.rs +| 2 \\+-" text))
+        (should (string-match-p "lib.rs +| 0 " text))
+        (should-not (string-match-p "\\.\\.\\./src/components" text))
+        (goto-char (oref diffstat start))
+        (search-forward "(binary)")
+        (should (eq (get-text-property (- (point) (length "(binary)"))
+                                       'font-lock-face)
+                    'majutsu-diffstat-binary))
+        (should patch)
+        (goto-char (oref stat-file start))
+        (majutsu-jump-to-diffstat-or-diff)
+        (should (eq (magit-current-section) patch))
+        (majutsu-section-hide directory)
+        (should (get-char-property (oref stat-file start) 'invisible))
+        (majutsu-jump-to-diffstat-or-diff)
+        (should (eq (magit-current-section) stat-file))
+        (should-not (get-char-property (oref stat-file start) 'invisible))))))
+
+(ert-deftest majutsu-diff-wash-diffstat/keeps-unresolved-paths-flat ()
+  "Truncated and compact rename labels must not invent directory targets."
+  (dolist (label '(".../nested/file.el" "src/{old.el => new.el}"))
+    (with-temp-buffer
+      (magit-section-mode)
+      (let ((inhibit-read-only t))
+        (magit-insert-section (diffbuf)
+          (insert label " | 0\n1 file changed, 0 insertions(+), 0 deletions(-)\n")
+          (goto-char (point-min))
+          (majutsu-diff-wash-diffstat)))
+      (let* ((stat (car (oref magit-root-section children)))
+             (file (car (oref stat children))))
+        (should (magit-section-match 'jj-file file))
+        (goto-char (oref file start))
+        (should (equal (majutsu-file-at-point) label))))))
+
+(ert-deftest majutsu-diff-wash-diffstat-renames-follow-target-paths ()
+  "Renames keep target identity and hide their full source in a foldable body."
+  (with-temp-buffer
+    (magit-section-mode)
+    (let* ((inhibit-read-only t)
+           (magit-section-inhibit-markers t)
+           (source-path "fixtures/sample-project/packages/legacy-module/src/components/nested/moved.rs")
+           (metadata
+            (list '(:status "renamed" :source "src/old.rs" :target "src/new.rs")
+                  (list :status "renamed" :source source-path :target "dst/new.rs")
+                  '(:status "modified" :source "src/changed.rs" :target "src/changed.rs")))
+           (majutsu-diff--active-file-metadata metadata)
+           (majutsu-diff--file-metadata-queue (copy-sequence metadata)))
+      (magit-insert-section (diffbuf)
+        (magit-insert-section (diff-root)
+          (insert "src/{old.rs => new.rs} | 0\n"
+                  "{.../nested/moved.rs => dst/new.rs} | 0\n"
+                  "src/changed.rs | 2 +-\n"
+                  "3 files changed, 1 insertion(+), 1 deletion(-)\n"
+                  "diff --git a/src/old.rs b/src/new.rs\n"
+                  "rename from src/old.rs\nrename to src/new.rs\n"
+                  (format "diff --git a/%s b/dst/new.rs\nrename from %s\nrename to dst/new.rs\n"
+                          source-path source-path)
+                  "diff --git a/src/changed.rs b/src/changed.rs\n"
+                  "--- a/src/changed.rs\n+++ b/src/changed.rs\n"
+                  "@@ -1 +1 @@\n-old\n+new\n")
+          (majutsu-diff-wash-diffs '("--stat"))
+          (majutsu-diff--attach-file-metadata metadata)))
+      (majutsu-section-show magit-root-section)
+      (dolist (entry metadata)
+        (let* ((path (plist-get entry :target))
+               (source (and (equal (plist-get entry :status) "renamed")
+                            (plist-get entry :source)))
+               (stat (majutsu-diff--stat-file-section path)))
+          (should (equal (oref (oref stat parent) value)
+                         (file-name-directory path)))
+          (goto-char (oref stat start))
+          (when source
+            (should (oref stat hidden))
+            (should (invisible-p (oref stat content)))
+            (should-not
+             (string-match-p (regexp-quote (file-name-nondirectory source))
+                             (buffer-substring-no-properties
+                              (oref stat start) (oref stat content))))
+            (should
+             (string-match-p (regexp-quote source)
+                             (buffer-substring-no-properties
+                              (oref stat content) (oref stat end))))
+            (magit-section-toggle stat)
+            (should-not (invisible-p (oref stat content)))
+            ;; Commands on the expanded detail still act on the target file.
+            (goto-char (oref stat content)))
+          (majutsu-jump-to-diffstat-or-diff)
+          (should (equal (plist-get (majutsu-diff-file-metadata
+                                     (magit-current-section)) :target)
+                         path))
+          (majutsu-jump-to-diffstat-or-diff)
+          (should (eq (magit-current-section) stat))
+          (when source
+            (magit-section-toggle stat)
+            (should (oref stat hidden))
+            (should (invisible-p (oref stat content))))))
+      (goto-char (oref (majutsu-diff--stat-file-section "dst/new.rs") start))
+      (search-forward "|" (line-end-position))
+      ;; Even a long source path must not push the count column to the right.
+      (should (< (current-column) (string-width source-path))))))
 
 (ert-deftest majutsu-jj-wash/failed-diff-keeps-stderr-outside-parser ()
   "Failed `--git --stat' output should keep its tree and append stderr safely."
@@ -411,18 +640,37 @@ Use DESCRIPTION and CHANGE-ID when non-nil."
   (majutsu-diff--parse-revision-metadata
    (majutsu-diff-test--metadata-output description)))
 
-(ert-deftest majutsu-diff-metadata-revision/default-and-explicit-single ()
-  "Default diffs and explicit revision options select a metadata revset."
-  (with-temp-buffer
-    (majutsu-diff-mode)
-    (setq-local majutsu-buffer-diff-range nil)
-    (should (equal (majutsu-diff--metadata-revision) "@"))
-    (setq-local majutsu-buffer-diff-range '("-r" "mine"))
-    (should (equal (majutsu-diff--metadata-revision) "mine"))
-    (setq-local majutsu-buffer-diff-range '("--revisions=mine"))
-    (should (equal (majutsu-diff--metadata-revision) "mine"))
-    (setq-local majutsu-buffer-diff-range '("--revisions" "mine"))
-    (should (equal (majutsu-diff--metadata-revision) "mine"))))
+(ert-deftest majutsu-diff-metadata/uses-complete-selection ()
+  "Metadata describes the complete selection, never its first option only."
+  (majutsu-jj-integration-with-repo repo
+    (majutsu-jj-integration-write-text
+     (majutsu-jj-integration-file repo "file") "base\n")
+    (majutsu-jj-integration-commit repo "base")
+    (with-temp-buffer
+      (majutsu-diff-mode)
+      (dolist (range '(nil ("--revisions=@") ("--revisions" "@")
+                       ("-r" "@") ("-r@") ("-r=@")
+                       ("--revisions=@" "-r=@")
+                       ("--revisions=none()" "-r@")))
+        (setq-local majutsu-buffer-diff-range range)
+        (should (majutsu-diff--revision-metadata)))
+      (dolist (range '(("--revisions=@" "--revisions=@-")
+                       ("--revisions" "@" "-r" "@-")
+                       ("-r@" "-r=@-")
+                       ("-r" "ancestors(@, 2)")
+                       ("--from=@-" "--to=@")
+                       ("--from" "@-" "--to" "@")
+                       ("-f@-" "-t=@")
+                       ("-f" "@-" "-t" "@")
+                       ("--revisions=@" "-t@")))
+        (setq-local majutsu-buffer-diff-range range)
+        (should-not (majutsu-diff--revision-metadata))
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (magit-insert-section (root)
+            (majutsu-insert-diff-revision-headers)
+            (majutsu-insert-diff-revision-message))
+          (should (string-empty-p (buffer-string))))))))
 
 (ert-deftest majutsu-diff-metadata-revision/ranges-and-empty-do-not-qualify ()
   "From/to ranges and an empty revision option never select TO metadata."
@@ -533,62 +781,31 @@ Use DESCRIPTION and CHANGE-ID when non-nil."
                                      (plist-get fields :commit-id))
                   'commit-face)))))
 
-(ert-deftest majutsu-diff-revision-metadata/multi-revset-does-not-display ()
-  "A `--revisions' revset resolving to two changes has no metadata."
-  (with-temp-buffer
-    (majutsu-diff-mode)
-    (setq-local majutsu-buffer-diff-args '("--git")
-                majutsu-buffer-diff-range '("--revisions=A|B"))
-    (let ((record (concat (majutsu-diff-test--metadata-output) "\n")))
-      (cl-letf (((symbol-function 'majutsu-jj-insert)
-                 (lambda (&rest _args)
-                   (insert record record)
-                   0)))
-        (should-not (majutsu-diff--revision-metadata))))))
-
-(ert-deftest majutsu-diff-query-revision-metadata/uses-local-bookmarks ()
-  "Query labelled local and remote bookmark components as structured JSON."
-  (let (seen-args seen-global-args)
-    (cl-letf (((symbol-function 'majutsu-jj-insert)
-               (lambda (&rest args)
-                 (setq seen-args args
-                       seen-global-args majutsu-jj-global-arguments)
-                 1)))
-      (should-not (majutsu-diff--query-revision-metadata "@")))
-    (let ((template (cadr (member "-T" seen-args))))
-      (should (stringp template))
-      (should (string-search
-               "json(self.local_bookmarks().map(|ref| ref.name()))" template))
-      (should (string-search
-               "label(\"local_bookmarks map join name\"" template))
-      (should (string-search "self.remote_bookmarks().map(|ref|" template))
-      (should (string-search "json(ref.name())" template))
-      (should (string-search "json(ref.remote())" template))
-      (should (string-search "label(\"description\", json(self.description()))"
-                             template))
-      (should (string-prefix-p "concat(join(\"\\0\"," template))
-      (should (string-suffix-p ", \"\\0\")" template))
-      (should-not (string-search "separate(" template))
-      (let ((cursor 0))
-        (dolist (label '("change_id"
-                         "local_bookmarks map join name"
-                         "remote_bookmarks map join name remote"
-                         "commit_id"
-                         "author name"
-                         "author email"
-                         "author timestamp format"
-                         "committer name"
-                         "committer email"
-                         "committer timestamp format"
-                         "description"))
-          (let ((position (string-search (format "label(\"%s\"" label)
-                                         template cursor)))
-            (should position)
-            (setq cursor (1+ position)))))
-      (should (string-search "\\0" template))
-      (should (member "--limit" seen-args))
-      (should (member "--color=always" seen-global-args))
-      (should-not (member "--color=never" seen-global-args)))))
+(ert-deftest majutsu-diff-query-revision-metadata/reads-native-bookmarks ()
+  "Native metadata keeps descriptions and local/remote bookmark identities."
+  (majutsu-jj-integration-with-sandbox sandbox
+    (let* ((source (majutsu-jj-integration-init sandbox "source"))
+           (destination (expand-file-name "clone" sandbox))
+           (majutsu-jj-executable majutsu-jj-integration--jj)
+           (majutsu-jj-global-arguments '("--no-pager" "--color=never"))
+           (description "Summary \"quoted\"\n\nBody")
+           (default-directory (file-name-as-directory source)))
+      (majutsu-jj-integration-commit source description)
+      (majutsu-jj-integration-call source "bookmark" "create" "topic" "-r" "@-")
+      (let ((fields (majutsu-diff--query-revision-metadata "topic")))
+        (should (equal (plist-get fields :local-bookmarks) '("topic")))
+        (should (equal (plist-get fields :description) (concat description "\n")))
+        (should (equal (plist-get fields :commit-id)
+                       (majutsu-jj-integration-output
+                        source "log" "--no-graph" "-r" "topic" "-T" "commit_id"))))
+      (majutsu-jj-integration-call
+       sandbox "git" "clone" "--remote=upstream" source destination)
+      (let* ((default-directory (file-name-as-directory destination))
+             (fields (majutsu-diff--query-revision-metadata "topic@upstream")))
+        (should (member '("topic" "upstream")
+                        (plist-get fields :remote-bookmarks)))
+        (should (equal (plist-get fields :description)
+                       (concat description "\n")))))))
 
 (ert-deftest majutsu-diff-format-refs/filters-git-and-applies-faces ()
   "Ref formatting hides synthetic git and escapes controls to one line."
@@ -930,29 +1147,15 @@ Use DESCRIPTION and CHANGE-ID when non-nil."
     (majutsu-diff-mode)
     (setq-local majutsu-buffer-diff-args '("--git" "--stat"))
     (setq-local majutsu-buffer-diff-range '("--revisions=abc123"))
-    (cl-letf (((symbol-function 'majutsu-repository-config-id) #'ignore))
-      (let* ((transient--prefix (transient--init-prefix 'majutsu-diff))
-             (transient--suffixes (transient--flatten-suffixes
-                                   (transient--init-suffixes 'majutsu-diff))))
-        (let ((value (transient-get-value)))
-          (should (member "--revisions=abc123" value))
-          (should-not (member "--revisions=--revisions=abc123" value)))))))
+    (let* ((transient--prefix (transient--init-prefix 'majutsu-diff))
+           (transient--suffixes (transient--flatten-suffixes
+                                 (transient--init-suffixes 'majutsu-diff))))
+      (let ((value (transient-get-value)))
+        (should (member "--revisions=abc123" value))
+        (should-not (member "--revisions=--revisions=abc123" value))))))
 
-(ert-deftest majutsu-diff-repeat-revset-reader/splits-comma-values ()
-  "Custom repeat revset readers should preserve CRM comma splitting."
-  (let ((obj (seq-find (lambda (suffix)
-                         (equal (oref suffix key) "-r"))
-                       (transient-suffixes 'majutsu-diff))))
-    (should (equal (cl-letf (((symbol-function 'majutsu-read-revset)
-                              (lambda (&rest _args) "a, b"))
-                             ((symbol-function 'transient--show) #'ignore))
-                     (majutsu-diff-test--with-transient-context
-                         'majutsu-diff 'majutsu-diff:-r
-                       (transient-infix-read obj)))
-                   '("a" "b")))))
-
-(ert-deftest majutsu-diff-revset-falls-back-to-default-args-when-nil ()
-  "`majutsu-diff-revset' should use default formatting args when ARGS is nil."
+(ert-deftest majutsu-diff-revset-preserves-empty-args ()
+  "Explicitly empty formatting args must not be replaced by builtins."
   (let (captured-args
         captured-range)
     (cl-letf (((symbol-function 'majutsu-setup-buffer-internal)
@@ -966,10 +1169,34 @@ Use DESCRIPTION and CHANGE-ID when non-nil."
       (let ((buffer (majutsu-diff-revset "abc123")))
         (unwind-protect
             (progn
-              (should (equal captured-args '("--git" "--stat")))
+              (should-not captured-args)
               (should (equal captured-range '("--revisions=abc123"))))
           (when (buffer-live-p buffer)
             (kill-buffer buffer)))))))
+
+(ert-deftest majutsu-diff-empty-args/render-diff ()
+  "An explicitly empty options list must still render the diff."
+  (with-temp-buffer
+    (majutsu-diff-mode)
+    (let ((inhibit-read-only t)
+          (majutsu-diff-sections-hook
+           (list (lambda () (insert "diff contents\n")))))
+      (majutsu-diff--set-value 'majutsu-diff-mode nil nil nil)
+      (should-not majutsu-buffer-diff-args)
+      (majutsu-diff-refresh-buffer)
+      (should (equal (buffer-string) "diff contents\n")))))
+
+(ert-deftest majutsu-diff-empty-args/inherit-from-selected-buffer ()
+  "Empty buffer options must not fall through to stored defaults."
+  (with-temp-buffer
+    (majutsu-diff-mode)
+    (setq-local majutsu-buffer-diff-args nil)
+    (let ((source (current-buffer)))
+      (with-temp-buffer
+        (cl-letf (((symbol-function 'majutsu--get-mode-buffer)
+                   (lambda (&rest _) source)))
+          (should (equal (majutsu-diff--get-value 'majutsu-diff-mode 'always)
+                         '(nil nil nil))))))))
 
 (ert-deftest majutsu-diff-dwim-uses-transient-args-when-active ()
   "When called from the transient, DWIM should use current transient args."
@@ -1047,34 +1274,6 @@ Use DESCRIPTION and CHANGE-ID when non-nil."
     (should (equal (majutsu-diff--dwim)
                    '(revision . "main@origin")))))
 
-(ert-deftest majutsu-diff-refine-hunk-default-disabled ()
-  "Diff refinement should be disabled by default."
-  (with-temp-buffer
-    (majutsu-diff-mode)
-    (should-not majutsu-diff-refine-hunk)))
-
-(ert-deftest majutsu-diff-toggle-refine-hunk-updates ()
-  "Toggling refinement should update local state and trigger refresh."
-  (with-temp-buffer
-    (majutsu-diff-mode)
-    (let ((calls 0))
-      (cl-letf (((symbol-function 'majutsu-diff--update-hunk-refinement)
-                 (lambda (&rest _)
-                   (setq calls (1+ calls)))))
-        (should-not majutsu-diff-refine-hunk)
-        (majutsu-diff-toggle-refine-hunk nil)
-        (should (eq majutsu-diff-refine-hunk t))
-        (should (= calls 1))
-        (majutsu-diff-toggle-refine-hunk t)
-        (should (eq majutsu-diff-refine-hunk 'all))
-        (should (= calls 2))
-        (majutsu-diff-toggle-refine-hunk t)
-        (should (eq majutsu-diff-refine-hunk t))
-        (should (= calls 3))
-        (majutsu-diff-toggle-refine-hunk nil)
-        (should-not majutsu-diff-refine-hunk)
-        (should (= calls 4))))))
-
 (ert-deftest majutsu-diff-refinement/majutsu-owns-git-hunks ()
   "Git font-lock must not refine hunks independently of Majutsu.
 This is a regression test for issue #42."
@@ -1103,6 +1302,16 @@ This is a regression test for issue #42."
         (should (majutsu-diff-test--fine-overlays current))
         (should-not (majutsu-diff-test--fine-overlays other))
         (should-not (majutsu-diff-test--font-lock-refine-markers))
+
+        ;; Prefix toggles affect every hunk, then return to the current hunk.
+        (majutsu-diff-toggle-refine-hunk t)
+        (should (eq majutsu-diff-refine-hunk 'all))
+        (should (majutsu-diff-test--fine-overlays current))
+        (should (majutsu-diff-test--fine-overlays other))
+        (majutsu-diff-toggle-refine-hunk t)
+        (should (eq majutsu-diff-refine-hunk t))
+        (should (majutsu-diff-test--fine-overlays current))
+        (should-not (majutsu-diff-test--fine-overlays other))
 
         ;; Toggling off removes Majutsu's overlays.  A complete re-fontify must
         ;; not resurrect upstream automatic refinement.
@@ -1155,19 +1364,6 @@ This is a regression test for issue #42."
              (lambda (&optional _pos) nil)))
     (should (majutsu-diff--color-words-goto-from '(:from-line 10)))
     (should-not (majutsu-diff--color-words-goto-from '(:from-line 10 :to-line 12)))))
-
-(ert-deftest majutsu-diff-color-words-column-uses-side-aware-helper ()
-  "Color-words column helper should receive side selection."
-  (let ((info '(:content-column 4))
-        called)
-    (cl-letf (((symbol-function 'majutsu-color-words-column-at-point)
-               (lambda (goto-from &optional _pos _info)
-                 (setq called goto-from)
-                 17)))
-      (should (= (majutsu-diff--color-words-column info t) 17))
-      (should called)
-      (should (= (majutsu-diff--color-words-column info nil) 17))
-      (should-not called))))
 
 (provide 'majutsu-diff-test)
 

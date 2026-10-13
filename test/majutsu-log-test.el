@@ -18,6 +18,7 @@
 (require 'ert)
 (require 'majutsu-log)
 (require 'majutsu-section)
+(require 'majutsu-jj-integration)
 
 (defconst majutsu-log-test--required-columns
   '((:field id :module metadata :face nil)
@@ -32,15 +33,11 @@
         (symbol-value var)
       (user-error "Unknown log test field %S" field))))
 
-(defun majutsu-log-test--column-spec-field (spec)
-  "Return FIELD from test column SPEC."
-  (plist-get spec :field))
-
 (defun majutsu-log-test--ensure-required-columns (columns)
   "Return COLUMNS with required hidden metadata appended."
   (let ((out (copy-sequence columns)))
     (dolist (spec majutsu-log-test--required-columns out)
-      (let ((field (majutsu-log-test--column-spec-field spec)))
+      (let ((field (plist-get spec :field)))
         (unless (seq-some
                  (lambda (column)
                    (and (eq (plist-get column :field) field)
@@ -111,48 +108,89 @@
 
 (defun majutsu-log-test--transport-value (value)
   "Return transport encoding for test VALUE."
-  (cond
-   ((null value) "")
-   ((stringp value) value)
-   ((listp value) (string-join value majutsu-log--field-list-separator))
-   (t (format "%s" value))))
+  (json-serialize
+   (cond
+    ((null value) "")
+    ((stringp value) value)
+    ((listp value) (string-join value majutsu-log--field-list-separator))
+    (t (format "%s" value)))))
 
-(ert-deftest majutsu-log-insert-conflicts/uses-path-section-values ()
-  "Conflict headings should show sidedness but retain pure file section values."
-  (cl-letf (((symbol-function 'majutsu-jj-conflicted-files)
-             (lambda (&optional _rev _filesets)
-               '((:path "dir with spaces/file name.txt" :sides 2)
-                 (:path "other.txt" :sides 3)))))
-    (with-temp-buffer
-      (require 'magit-section)
-      (majutsu-log-mode)
-      (setq buffer-read-only nil)
-      (magit-insert-section (root)
-        (majutsu-log-insert-conflicts))
-      (should (string-match-p
-               (regexp-quote
-                "dir with spaces/file name.txt (2-sided conflict)")
-               (buffer-string)))
-      (goto-char (point-min))
-      (search-forward "dir with spaces/file name.txt")
-      (should (equal (magit-section-value-if 'jj-file)
-                     "dir with spaces/file name.txt"))
-      (search-forward "other.txt")
-      (should (equal (magit-section-value-if 'jj-file)
-                     "other.txt")))))
+(ert-deftest majutsu-log-insert-conflicts/inherited-conflicts-remain-navigable ()
+  "Group inherited conflicts even when the merge has no changes-in diff."
+  (majutsu-jj-integration-with-repo repo
+    (let ((paths '("src/one.el" "src/two.el" "tests/unit/one.el"))
+          base left)
+      (dolist (path paths)
+        (let ((file (majutsu-jj-integration-file repo path)))
+          (make-directory (file-name-directory file) t)
+          (majutsu-jj-integration-write-text file "base\n")))
+      (majutsu-jj-integration-commit repo "base")
+      (setq base (majutsu-jj-resolve-single-commit "@-"))
+      (dolist (path paths)
+        (majutsu-jj-integration-write-text
+         (majutsu-jj-integration-file repo path) "left\n"))
+      (majutsu-jj-integration-commit repo "left")
+      (setq left (majutsu-jj-resolve-single-commit "@-"))
+      (majutsu-jj-integration-call repo "new" base "-m" "right")
+      (dolist (path paths)
+        (majutsu-jj-integration-write-text
+         (majutsu-jj-integration-file repo path) "right\n"))
+      (majutsu-jj-integration-call repo "new" left "@" "-m" "merge")
+      (should (equal (majutsu-jj-integration-output repo "diff" "--summary") ""))
+      (with-temp-buffer
+        (majutsu-log-mode)
+        (let ((inhibit-read-only t))
+          (magit-insert-section (root)
+            (majutsu-log-insert-conflicts)))
+        (let* ((conflicts (car (oref magit-root-section children)))
+               (directories (oref conflicts children))
+               (src (car directories))
+               (tests (cadr directories)))
+          (should (equal (mapcar (lambda (section) (oref section value)) directories)
+                         '("src/" "tests/unit/")))
+          (should (equal (majutsu-file-tree-files conflicts) paths))
+          (magit-map-sections
+           (lambda (section)
+             (when (magit-section-match 'jj-file section)
+               (goto-char (oref section start))
+               (should (equal (majutsu-file-at-point) (oref section value)))))
+           conflicts)
+          (majutsu-section-hide src)
+          (should (equal (majutsu-file-tree-files src)
+                         '("src/one.el" "src/two.el")))
+          (dolist (file (oref src children))
+            (should (invisible-p (oref file start))))
+          (should-not (invisible-p (oref (car (oref tests children)) start))))))))
 
-(defun majutsu-log-test--module-payload (compiled module values)
-  "Return transport payload for MODULE in COMPILED using VALUES alist."
+(ert-deftest majutsu-log-insert-conflicts/escapes-labels-without-changing-targets ()
+  "Control characters cannot split headings or alter file action targets."
+  (let ((path "dir\nname/sub\tfolder/file\rname.el"))
+    (cl-letf (((symbol-function 'majutsu-jj-conflicted-files)
+               (lambda (&optional _rev _filesets)
+                 (list (list :path path :sides 3)))))
+      (with-temp-buffer
+        (majutsu-log-mode)
+        (let ((inhibit-read-only t))
+          (magit-insert-section (root)
+            (majutsu-log-insert-conflicts)))
+        (let* ((conflicts (car (oref magit-root-section children)))
+               (directory (car (oref conflicts children)))
+               (file (car (oref directory children))))
+          (should (equal (oref directory value) "dir\nname/sub\tfolder/"))
+          (dolist (section (list directory file))
+            (should (= (count-lines (oref section start) (oref section content)) 1)))
+          (goto-char (oref file start))
+          (should (equal (majutsu-file-at-point) path))
+          (should (equal (get-text-property (point) 'help-echo) path)))))))
+
+(defun majutsu-log-test--metadata-payload (compiled values)
+  "Return metadata payload for COMPILED using VALUES alist."
   (string-join
    (mapcar (lambda (column)
              (majutsu-log-test--transport-value
               (alist-get (plist-get column :field) values nil nil #'eq)))
-           (majutsu-row-module-columns compiled module))
+           (majutsu-row-module-columns compiled 'metadata))
    majutsu-row-field-separator))
-
-(defun majutsu-log-test--metadata-payload (compiled values)
-  "Return metadata payload for COMPILED using VALUES alist."
-  (majutsu-log-test--module-payload compiled 'metadata values))
 
 (defun majutsu-log-test--column (compiled field module)
   "Return FIELD occurrence in MODULE from COMPILED."
@@ -165,7 +203,8 @@
   "Return one raw relation-aware log entry for ID and TITLE."
   (let ((compiled (majutsu-log-test--relations-compiled)))
     (concat
-     "○ " majutsu-row-start-token id majutsu-row-field-separator title
+     "○ " majutsu-row-start-token id
+     majutsu-row-field-separator title
      majutsu-row-tail-token
      majutsu-row-body-token
      majutsu-row-meta-token
@@ -178,10 +217,6 @@
      majutsu-row-end-token
      "\n")))
 
-(defun majutsu-log-test--post-wrap (value _ctx)
-  "Wrap VALUE in square brackets for postprocessor tests."
-  (format "[%s]" value))
-
 (defun majutsu-log-test--post-by-module (value ctx)
   "Return a module-specific projection of VALUE using CTX."
   (pcase (plist-get ctx :module)
@@ -189,94 +224,48 @@
     ('body (upcase value))
     (_ value)))
 
-(ert-deftest majutsu-log-long-desc-template-uses-line-separator ()
-  "Default long-desc template should encode line breaks with \x1f."
-  (should (equal majutsu-log-template-long-desc
-                 [:description :lines :skip 1 :join "\x1f"])))
-
-(ert-deftest majutsu-log-canonical-log-id-template-preserves-id-kind ()
-  "Canonical log ids should be full change or commit ids as appropriate."
-  (should (equal (majutsu-template-compile majutsu-log-template-id 'Commit)
-                 "if((self.hidden() || self.divergent()), self.commit_id(), self.change_id())"))
-  (should (equal (majutsu-template-compile majutsu-log-template-parent-ids 'Commit)
-                 "self.parents().map(|p| if((p.hidden() || p.divergent()), p.commit_id(), p.change_id())).join(\"\\x1C\")")))
-
-(ert-deftest majutsu-log-default-columns-contain-module-and-face ()
-  "Compiled default columns should include module/face/post metadata."
-  (let* ((compiled (majutsu-log--compile-columns))
-         (spec (seq-find (lambda (column)
-                           (eq (plist-get column :field) 'description))
-                         (plist-get compiled :columns))))
-    (should spec)
-    (should (eq (plist-get spec :module) 'heading))
-    (should (eq (plist-get spec :face) t))
-    (should (equal (plist-get spec :post) nil))))
-
-(ert-deftest majutsu-log-metadata-templates-ignore-visible-customization ()
-  "Presentation templates must not change canonical machine fields."
-  (let ((majutsu-log-template-commit-id
-         '["\n" [:commit_id :shortest 8]])
-        (majutsu-log-template-description
-         '["\n"
-           [:if [:description]
-               [:method [:description] :first_line]
-             [:label
-              [:if [:empty] "empty"]
-              [:label "description placeholder" "□"]]]]))
-    (let* ((compiled (majutsu-log--compile-columns))
-           (heading-description
-            (majutsu-log-test--column compiled 'description 'heading))
-           (tail-commit-id
-            (majutsu-log-test--column compiled 'commit-id 'tail))
-           (metadata-description
-            (majutsu-log-test--column compiled 'description 'metadata))
-           (metadata-commit-id
-            (majutsu-log-test--column compiled 'commit-id 'metadata)))
-      (should (equal (majutsu-row--column-template heading-description)
-                     majutsu-log-template-description))
-      (should (equal (majutsu-row--column-template tail-commit-id)
-                     majutsu-log-template-commit-id))
-      (should (equal (majutsu-row--column-template metadata-description)
-                     '[:description :first_line]))
-      (should (equal (majutsu-row--column-template metadata-commit-id)
-                     '[:commit_id])))))
-
-(ert-deftest majutsu-log-explicit-default-postprocessors-keep-field-defaults ()
-  "Explicit `:post :default' should retain field-specific defaults."
-  (let ((spec (majutsu-row-normalize-column-spec
-               (majutsu-log--row-profile)
-               '(:field parent-ids :module metadata
-                 :template majutsu-log-template-parent-ids
-                 :post :default))))
-    (should (equal (plist-get spec :post)
-                   '(majutsu-log-post-split-list-separator)))))
-
-(ert-deftest majutsu-log-columns-emit-sequential-markers ()
-  "Compiled log template should include S/T/B/M/E markers in order."
-  (let* ((compiled (majutsu-log-test--base-compiled))
-         (tpl (prin1-to-string (plist-get compiled :template)))
-         (s-pos (string-match (regexp-quote "\\x1dS") tpl))
-         (t-pos (string-match (regexp-quote "\\x1dT") tpl))
-         (b-pos (string-match (regexp-quote "\\x1dB") tpl))
-         (m-pos (string-match (regexp-quote "\\x1dM") tpl))
-         (e-pos (string-match (regexp-quote "\\x1dE") tpl)))
-    (should s-pos)
-    (should t-pos)
-    (should b-pos)
-    (should m-pos)
-    (should e-pos)
-    (should (< s-pos t-pos))
-    (should (< t-pos b-pos))
-    (should (< b-pos m-pos))
-    (should (< m-pos e-pos))))
-
-(ert-deftest majutsu-log-test-columns-add-hidden-metadata-fields ()
-  "Test columns should preserve hidden transport fields needed by log semantics."
-  (let* ((compiled (majutsu-log-test--compile-columns
-                    '((:field description :module heading :face t))))
-         (fields (mapcar (lambda (column) (plist-get column :field))
-                         (majutsu-row-module-columns compiled 'metadata))))
-    (should (equal fields '(id commit-id parent-ids)))))
+(ert-deftest majutsu-log/integration-identities-survive-display-customization ()
+  "Hidden and divergent rows retain exact targets despite custom display IDs."
+  (majutsu-jj-integration-with-repo repo
+    (majutsu-jj-integration-call repo "describe" "-m" "before")
+    (let* ((old (majutsu-jj-integration-output
+                 repo "log" "--no-graph" "-r" "@" "-T" "commit_id"))
+           (change (majutsu-jj-integration-output
+                    repo "log" "--no-graph" "-r" "@" "-T" "change_id"))
+           (majutsu-log-template-description "DISPLAY")
+           (majutsu-log-template-commit-id "display-id")
+           (compiled (majutsu-log--ensure-template)))
+      (majutsu-jj-integration-call repo "describe" "-m" "after")
+      (let ((new (majutsu-jj-integration-output
+                  repo "log" "--no-graph" "-r" "@" "-T" "commit_id")))
+        (cl-labels
+            ((entry (revision)
+               (car (majutsu-log-test--parse-entries
+                     compiled
+                     (majutsu-jj-integration-output
+                      repo "--ignore-working-copy" "--color=never"
+                      "log" "--no-graph" "-r" revision
+                      "-T" (plist-get compiled :template))))))
+          (let ((hidden (entry old))
+                (visible (entry "@")))
+            (should (equal (majutsu-log--entry-id hidden) old))
+            (should (equal (majutsu-log--entry-id visible) change))
+            (should (equal (majutsu-row-column hidden 'description) "before"))
+            (should (equal (majutsu-row-column visible 'description) "after"))
+            (should (equal (majutsu-row-column visible 'commit-id) new))
+            (should (equal
+                     (majutsu-row-column-value
+                      visible (majutsu-log-test--column compiled 'description 'heading))
+                     "DISPLAY"))
+            (should (equal
+                     (majutsu-row-column-value
+                      visible (majutsu-log-test--column compiled 'commit-id 'tail))
+                     "display-id")))
+          (majutsu-jj-integration-call repo "new" old "-m" "side")
+          (dolist (commit (list old new))
+            (should (equal (majutsu-log--entry-id (entry commit)) commit)))
+          (should (equal (majutsu-row-column (entry "@") 'parent-ids)
+                         (list old))))))))
 
 (ert-deftest majutsu-log-entry-id-uses-canonical-log-id ()
   "Entry ids should use the transported canonical log id."
@@ -290,25 +279,15 @@
                               (commit-id . "commit-full"))))
                  "change-full")))
 
-(ert-deftest majutsu-log-post-decode-line-separator-restores-faces ()
-  "\x1f decoding should keep surrounding text properties."
-  (let* ((sep (aref majutsu-log--field-line-separator 0))
-         (encoded (concat (propertize "A" 'font-lock-face 'error)
-                          (string sep)
-                          (propertize "B" 'font-lock-face 'warning)))
-         (decoded (majutsu-log-post-decode-line-separator encoded)))
-    (should (equal decoded "A\nB"))
-    (should (eq (get-text-property 0 'font-lock-face decoded) 'error))
-    (should (eq (get-text-property 2 'font-lock-face decoded) 'warning))))
 
 (ert-deftest majutsu-log-parse-entry-with-graph-and-multiline-heading ()
   "Parser should handle graph prefixes and multiline heading payload."
   (let* ((compiled (majutsu-log-test--base-compiled))
          (raw (concat
-               "○ " majutsu-row-start-token "chg" majutsu-row-field-separator "Title line 1\n"
-               "│ Title line 2" majutsu-row-tail-token
+               "○ " majutsu-row-start-token "chg" majutsu-row-field-separator
+               "Title line 1\n│ Title line 2" majutsu-row-tail-token
                majutsu-row-body-token
-               "body line 1" majutsu-log--field-line-separator "body line 2"
+               "\n│ body line 1\n│ body line 2"
                majutsu-row-meta-token
                (majutsu-log-test--metadata-payload
                 compiled
@@ -337,8 +316,9 @@
   "Parser should also support --no-graph output (indent = 0)."
   (let* ((compiled (majutsu-log-test--base-compiled))
          (raw (concat
-               majutsu-row-start-token "chg" majutsu-row-field-separator "Top\n"
-               "Tail" majutsu-row-tail-token majutsu-row-body-token "payload"
+               majutsu-row-start-token "chg" majutsu-row-field-separator
+               "Top\nTail" majutsu-row-tail-token
+               majutsu-row-body-token "\npayload"
                majutsu-row-meta-token
                (majutsu-log-test--metadata-payload
                 compiled
@@ -367,7 +347,7 @@
                majutsu-row-tail-token
                "Alice" majutsu-row-field-separator "2m ago"
                majutsu-row-body-token
-               "body line 1" majutsu-log--field-line-separator "body line 2"
+               "\n│ body line 1\n│ body line 2"
                majutsu-row-meta-token
                (majutsu-log-test--metadata-payload
                 compiled
@@ -383,7 +363,7 @@
     (should (equal (majutsu-row-render-tail entry compiled) "Alice 2m"))))
 
 (ert-deftest majutsu-log-parse-entry-preserves-between-entry-lines ()
-  "Lines between E of one entry and S of next entry stay with previous entry."
+  "Raw lines remain ordered events outside both adjacent entries."
   (let* ((compiled (majutsu-log-test--base-compiled))
          (raw (concat
                "○ " majutsu-row-start-token "chg1" majutsu-row-field-separator "Title1"
@@ -403,14 +383,19 @@
                 compiled
                 '((id . "id-2")))
                majutsu-row-end-token "\n"))
-         (entries (majutsu-log-test--parse-entries compiled raw))
+         (parsed (with-temp-buffer
+                   (insert raw)
+                   (majutsu-row-read-buffer compiled)))
+         (entries (plist-get parsed :entries))
          (first (nth 0 entries))
          (second (nth 1 entries)))
     (should (= 2 (length entries)))
     (should (equal (majutsu-row-column first 'id) "id-1"))
     (should (equal (majutsu-row-column second 'id) "id-2"))
-    (should (equal (plist-get first :suffix-lines) '("│ carry-line")))
-    (should (null (plist-get second :suffix-lines)))))
+    (should (equal (plist-get parsed :events)
+                   (list first "│ carry-line\n" second)))
+    (should (= (plist-get first :end)
+               (1+ (string-match (regexp-quote "│ carry-line\n") raw))))))
 
 (ert-deftest majutsu-log-parse-entry-records-raw-region ()
   "Parser should record the raw entry region for streaming washing."
@@ -423,9 +408,8 @@
                      (majutsu-log-test--metadata-payload
                       compiled
                       '((id . "id-1")))
-                     majutsu-row-end-token "\n"
-                     "│ carry-line\n"))
-         (raw (concat first-raw
+                     majutsu-row-end-token "\n"))
+         (raw (concat first-raw "│ carry-line\n"
                       "○ " majutsu-row-start-token "chg2" majutsu-row-field-separator "Title2"
                       majutsu-row-tail-token
                       majutsu-row-body-token
@@ -475,31 +459,6 @@
       (should (equal (gethash "change-parent" majutsu-log--children-by-id)
                      '("change-child-a" "change-child-b"))))))
 
-(ert-deftest majutsu-log-postprocessor-runs-per-field ()
-  "Field-level :post handlers should run after parsing."
-  (let* ((compiled
-          (majutsu-log-test--compile-columns
-           `((:field description :module heading :face t :post majutsu-log-test--post-wrap)
-             (:field id :module metadata :face nil))))
-         (raw (concat
-               "○ " majutsu-row-start-token "desc"
-               majutsu-row-tail-token
-               majutsu-row-body-token
-               majutsu-row-meta-token
-               (majutsu-log-test--metadata-payload
-                compiled
-                '((id . "row-id")))
-               majutsu-row-end-token "\n"))
-         (entries (majutsu-log-test--parse-entries compiled raw))
-         (entry (car entries)))
-    (should (= 1 (length entries)))
-    (should-not (majutsu-row-column entry 'description))
-    (should (equal (majutsu-row-column entry 'id) "row-id"))
-    (should (equal (mapconcat #'substring-no-properties
-                              (majutsu-row-render-heading-lines entry compiled)
-                              "\n")
-                   "○ [desc]"))))
-
 (ert-deftest majutsu-log-postprocessor-runs-per-column-instance ()
   "Module-specific `:post' results should be stored per column instance."
   (let* ((compiled
@@ -510,32 +469,43 @@
          (raw (concat
                "○ " majutsu-row-start-token "desc"
                majutsu-row-tail-token
-               majutsu-row-body-token "desc"
+               majutsu-row-body-token "\n│ desc"
                majutsu-row-meta-token
                (majutsu-log-test--metadata-payload
                 compiled
                 '((id . "row-id")))
                majutsu-row-end-token "\n"))
          (entry (car (majutsu-log-test--parse-entries compiled raw))))
-    (should (equal (mapconcat #'substring-no-properties
-                              (majutsu-row-render-heading-lines entry compiled)
-                              "\n")
-                   "○ [desc]"))
-    (should (equal (majutsu-row-render-body entry compiled) "DESC"))))
+    (with-temp-buffer
+      (magit-section-mode)
+      (let ((inhibit-read-only t))
+        (majutsu-row-insert-entry entry compiled))
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     "[desc]\nDESC\n"))
+      (should (equal (get-text-property (point-min) 'line-prefix) "○ "))
+      (goto-char (point-min))
+      (forward-line)
+      (should (equal (get-text-property (point) 'line-prefix) "│ ")))))
 
-(ert-deftest majutsu-log-render-heading-lines-with-auxiliary-heading-fields ()
-  "Heading rendering should include additional heading fields in order."
+(ert-deftest majutsu-log-insert-entry-with-auxiliary-heading-fields ()
+  "Real section headings include additional heading fields in order."
   (let* ((compiled (majutsu-log-test--heading-aux-compiled))
          (entry (list :columns '((change-id . "chg")
                                  (id . "id-123")
                                  (description . "Title")
                                  (author . "Very\nLong")
                                  (timestamp . "2m"))
-                      :heading-prefixes '("" "")))
-         (heading (mapconcat #'substring-no-properties
-                             (majutsu-row-render-heading-lines entry compiled)
-                             "\n")))
-    (should (equal heading "chg Title Very\nLong 2m"))))
+                      :heading-prefixes '("○ " "│ "))))
+    (with-temp-buffer
+      (magit-section-mode)
+      (let ((inhibit-read-only t))
+        (majutsu-row-insert-entry entry compiled))
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     "chg Title Very\nLong 2m\n"))
+      (should (equal (get-text-property (point-min) 'line-prefix) "○ "))
+      (goto-char (point-min))
+      (forward-line)
+      (should (equal (get-text-property (point) 'line-prefix) "│ ")))))
 
 (ert-deftest majutsu-log-insert-entry-renders-tail-on-anchor-line ()
   "Tail rendering should stay on the anchor line and use align-to spacing."
@@ -581,21 +551,21 @@
         (should (equal (substring-no-properties prefix) "│ "))))))
 
 (ert-deftest majutsu-log-tail-spacer-display-uses-pixels-on-gui ()
-  "Tail spacer display should use absolute pixel targets on GUI."
+  "Tail spacer display should use window-relative pixel targets on GUI."
   (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _display) t))
             ((symbol-function 'string-pixel-width) (lambda (_string &optional _buffer) 37))
             ((symbol-function 'window-body-width) (lambda (&optional _window pixelwise) (if pixelwise 200 80))))
     (with-temp-buffer
-      (should (equal (majutsu-row-tail-spacer-display "tail" 'fake-window)
-                     '(space :align-to (163)))))))
+      (should (equal (majutsu-row-tail-spacer-display "tail")
+                     '(space :align-to (- right (37))))))))
 
 (ert-deftest majutsu-log-tail-spacer-display-uses-columns-on-terminal ()
-  "Tail spacer display should use absolute columns on terminal frames."
+  "Tail spacer display should use window-relative columns on terminals."
   (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _display) nil))
             ((symbol-function 'window-body-width) (lambda (&optional _window &rest _args) 80)))
     (with-temp-buffer
-      (should (equal (majutsu-row-tail-spacer-display "tail" 'fake-window)
-                     '(space :align-to 75))))))
+      (should (equal (majutsu-row-tail-spacer-display "tail")
+                     '(space :align-to (- right 5)))))))
 
 (ert-deftest majutsu-log-refresh-tail-spacers-recomputes-display ()
   "Refreshing tail spacers should recompute their align-to display specs."
@@ -624,18 +594,11 @@
         (setq buffer-read-only t)
         (cl-letf (((symbol-function 'display-graphic-p)
                    (lambda (&optional _display) t))
-                  ((symbol-function 'get-buffer-window)
-                   (lambda (&rest _args) 'fake-window))
-                  ((symbol-function 'window-body-width)
-                   (lambda (&optional _window pixelwise)
-                     (if pixelwise 200 80)))
-                  ((symbol-function 'window-text-pixel-size)
-                   (lambda (_window _from _to
-                                    &optional _x-limit _y-limit _mode-lines _ignore-line-at-end)
-                     '(61 . 1))))
+                  ((symbol-function 'string-pixel-width)
+                   (lambda (_string &optional _buffer) 31)))
           (majutsu-row-refresh-tail-spacers))
         (should (equal (get-text-property spacer-pos 'display)
-                       '(space :align-to (139))))))))
+                       '(space :align-to (- right (31)))))))))
 
 (ert-deftest majutsu-log-refresh-tail-spacers-uses-terminal-columns ()
   "Refreshing tail spacers should use column targets on terminal frames."
@@ -666,52 +629,59 @@
                    (lambda (&optional _window &rest _args) 80)))
           (majutsu-row-refresh-tail-spacers))
         (should (equal (get-text-property spacer-pos 'display)
-                       '(space :align-to 71)))))))
+                       '(space :align-to (- right 9))))))))
 
-(ert-deftest majutsu-log-refresh-tail-spacers-prefers-explicit-window ()
-  "Refreshing tail spacers should use the explicitly provided window."
-  (let* ((compiled (majutsu-log-test--tail-compiled))
-         (entry (list :id "id-123"
-                      :columns '((change-id . "chg")
-                                 (id . "id-123")
-                                 (description . "Title")
-                                 (author . "Alice")
-                                 (timestamp . "2m"))
-                      :heading-prefixes '("○ ")))
-         seen)
+(ert-deftest majutsu-log-tail-alignment-is-shared-safely-by-unequal-windows ()
+  "Resizing either log window must not impose its width on the other one."
+  (save-window-excursion
+    (delete-other-windows)
     (with-temp-buffer
-      (require 'magit-section)
+      (switch-to-buffer (current-buffer))
       (majutsu-log-mode)
-      (setq buffer-read-only nil)
-      (cl-letf (((symbol-function 'display-graphic-p)
-                 (lambda (&optional _display) t))
-                ((symbol-function 'string-pixel-width)
-                 (lambda (_string &optional _buffer) 25)))
-        (majutsu-row-insert-entry entry compiled))
-      (cl-letf (((symbol-function 'display-graphic-p)
-                 (lambda (&optional _display) t))
-                ((symbol-function 'majutsu-row--tail-owner-window)
-                 (lambda ()
-                   (error "should not resolve tail owner when WINDOW is explicit")))
-                ((symbol-function 'window-body-width)
-                 (lambda (&optional window pixelwise)
-                   (setq seen window)
-                   (if pixelwise 200 80)))
-                ((symbol-function 'window-text-pixel-size)
-                 (lambda (window _from _to
-                                 &optional _x-limit _y-limit _mode-lines _ignore-line-at-end)
-                   (setq seen window)
-                   '(61 . 1))))
-        (majutsu-row-refresh-tail-spacers nil nil 'explicit-window))
-      (should (eq seen 'explicit-window)))))
+      (let* ((first (selected-window))
+             (second (split-window first 30 'right))
+             (compiled (majutsu-log-test--tail-compiled))
+             (entry (list :id "id-123"
+                          :columns '((change-id . "chg")
+                                     (id . "id-123")
+                                     (description . "Title")
+                                     (author . "Alice")
+                                     (timestamp . "2m"))
+                          :heading-prefixes '("○ "))))
+        (set-window-buffer second (current-buffer))
+        (should-not (= (window-body-width first) (window-body-width second)))
+        (cl-letf (((symbol-function 'display-graphic-p)
+                   (lambda (&optional _) nil)))
+          (let ((inhibit-read-only t))
+            (majutsu-row-insert-entry entry compiled))
+          (let ((spacer (text-property-any (point-min) (point-max)
+                                           'majutsu-row-tail-spacer t)))
+            (should spacer)
+            (majutsu-log--after-window-size-change first)
+            (let ((display (get-text-property spacer 'display)))
+              (should (equal display '(space :align-to (- right 9))))
+              (majutsu-log--after-window-size-change second)
+              (should (equal (get-text-property spacer 'display) display)))))))))
 
-(ert-deftest majutsu-log-mode-installs-tail-refresh-hooks ()
-  "Log mode should install local refresh hooks for scale and window changes."
-  (with-temp-buffer
-    (majutsu-log-mode)
-    (should (memq #'majutsu-log--after-text-scale-change text-scale-mode-hook))
-    (should (memq #'majutsu-log--after-window-size-change window-size-change-functions))))
-
+(ert-deftest majutsu-log-window-size-change-refreshes-resized-log-window ()
+  "The buffer-local resize hook should refresh the window it receives."
+  (let (refreshed)
+    (with-temp-buffer
+      (majutsu-log-mode)
+      (cl-letf (((symbol-function 'window-buffer)
+                 (lambda (_window) (current-buffer)))
+                ((symbol-function 'majutsu-log--refresh-tail-window)
+                 (lambda (window) (setq refreshed window))))
+        (majutsu-log--after-window-size-change 'resized-log-window))
+      (should (eq refreshed 'resized-log-window))
+      ;; Unrelated windows (showing a different buffer) should be ignored.
+      (cl-letf (((symbol-function 'window-buffer)
+                 (lambda (_window) (get-buffer-create "majutsu-log-test-unrelated")))
+                ((symbol-function 'majutsu-log--refresh-tail-window)
+                 (lambda (window) (setq refreshed window))))
+        (setq refreshed nil)
+        (majutsu-log--after-window-size-change 'resized-log-window))
+      (should (null refreshed)))))
 (ert-deftest majutsu-log-filter-buffer-substring-drops-tail-when-heading-present ()
   "Copying mixed heading+tail text should drop the tail by default."
   (let* ((compiled (majutsu-log-test--tail-compiled))
@@ -795,6 +765,7 @@
 (ert-deftest majutsu-row-copy-field-copies-log-field-value-at-point ()
   "`majutsu-row-copy-field' should copy the rendered log field value at point."
   (let* ((compiled (majutsu-log-test--tail-compiled))
+         (majutsu-log-commit-columns nil)
          (majutsu-log--compiled-template-cache compiled)
          (entry (list :id "id-123"
                       :columns '((change-id . "chg")
@@ -824,6 +795,7 @@
 (ert-deftest majutsu-row-copy-module-copies-log-heading-content-without-decoration ()
   "`majutsu-row-copy-module' should copy log heading content without graph/tail decoration."
   (let* ((compiled (majutsu-log-test--tail-compiled))
+         (majutsu-log-commit-columns nil)
          (majutsu-log--compiled-template-cache compiled)
          (entry (list :id "id-123"
                       :columns '((change-id . "chg")
@@ -852,6 +824,7 @@
 (ert-deftest majutsu-row-copy-entry-field-copies-log-hidden-metadata ()
   "`majutsu-row-copy-entry-field' should copy hidden log canonical metadata fields."
   (let* ((compiled (majutsu-log-test--tail-compiled))
+         (majutsu-log-commit-columns nil)
          (majutsu-log--compiled-template-cache compiled)
          (entry (list :id "id-123"
                       :commit-id "230dd059e1b059aefcda37d0a668f2f08f6e5a13"
@@ -892,38 +865,6 @@
         (majutsu-row-copy-entry-field))
       (should (equal copied "230dd059e1b059aefcda37d0a668f2f08f6e5a13")))))
 
-(ert-deftest majutsu-repository-config-id/reads-jj-config-id-file ()
-  "Repository identity should use jj's secure repo config id."
-  (let* ((root (file-name-as-directory (make-temp-file "majutsu-repo" t)))
-         (config-id "0123456789abcdefabcd")
-         (config-file (expand-file-name ".jj/repo/config-id" root)))
-    (unwind-protect
-        (progn
-          (make-directory (file-name-directory config-file) t)
-          (write-region config-id nil config-file nil 'silent)
-          (cl-letf (((symbol-function 'majutsu-toplevel)
-                     (lambda (&optional _directory) root)))
-            (should (equal (majutsu-repository-config-id) config-id))))
-      (delete-directory root t))))
-
-(ert-deftest majutsu-repository-config-id/create-delegates-to-jj ()
-  "Creating repository identity should ask jj, then read config-id."
-  (let* ((dir (file-name-as-directory (make-temp-file "majutsu-repo" t)))
-         (file (expand-file-name "config-id" dir))
-         (config-id "fedcba9876543210abcd")
-         seen-command)
-    (unwind-protect
-        (cl-letf (((symbol-function 'majutsu-repository-config-id-file)
-                   (lambda (&optional _root) file))
-                  ((symbol-function 'majutsu-jj-string)
-                   (lambda (&rest args)
-                     (setq seen-command args)
-                     (write-region config-id nil file nil 'silent)
-                     "/tmp/unused/config.toml")))
-          (should (equal (majutsu-repository-config-id t) config-id))
-          (should (equal seen-command '("config" "path" "--repo"))))
-      (delete-directory dir t))))
-
 (ert-deftest majutsu-filesets-split-transient-value/splits-structured-args ()
   "Transient fileset helpers should keep args and filesets separate."
   (dolist (case '(((("--" "src/a.el") "--from=A" "--to=B")
@@ -945,60 +886,6 @@
                   '("--from=A" "--to=B") '("src/a.el"))
                  '("--from=A" "--to=B" "--" "src/a.el"))))
 
-(ert-deftest majutsu-transient-default-value/prefers-repository-defaults ()
-  "Generic transient defaults should prefer repo-local values."
-  (let ((transient-values nil)
-        (config-id "0123456789abcdefabcd")
-        (mode (make-symbol "majutsu-test-mode")))
-    (unwind-protect
-        (cl-letf (((symbol-function 'majutsu-repository-config-id)
-                   (lambda (&optional _create) config-id)))
-          (put mode 'majutsu-test-default-arguments '("default"))
-          (put mode 'majutsu-test-current-arguments '("global-session"))
-          (setf (alist-get (majutsu-transient-global-default-key 'majutsu-test mode)
-                           transient-values)
-                '("global-saved"))
-          (setf (alist-get (majutsu-transient-repository-default-key 'majutsu-test mode)
-                           transient-values)
-                '("repo-saved"))
-          (should (equal (majutsu-transient-default-value
-                          'majutsu-test mode
-                          'majutsu-test-current-arguments
-                          'majutsu-test-default-arguments)
-                         '("repo-saved")))
-          (majutsu-transient-put-repository-current-value
-           'majutsu-test mode '("repo-session") config-id)
-          (should (equal (majutsu-transient-default-value
-                          'majutsu-test mode
-                          'majutsu-test-current-arguments
-                          'majutsu-test-default-arguments)
-                         '("repo-session"))))
-      (put mode 'majutsu-test-current-repository-values nil)
-      (put mode 'majutsu-test-current-arguments nil)
-      (put mode 'majutsu-test-default-arguments nil))))
-
-(ert-deftest majutsu-transient-save-repository-value/persists-under-repo-key ()
-  "Repository-local transient saves should use the generic repo key."
-  (let ((transient-values nil)
-        (config-id "0123456789abcdefabcd")
-        (mode (make-symbol "majutsu-test-mode"))
-        saved)
-    (unwind-protect
-        (cl-letf (((symbol-function 'majutsu-repository-config-id)
-                   (lambda (&optional _create) config-id))
-                  ((symbol-function 'transient-save-values)
-                   (lambda () (setq saved t))))
-          (majutsu-transient-save-repository-value
-           'majutsu-test mode '("--revision=mine()"))
-          (let ((key (majutsu-transient-repository-default-key 'majutsu-test mode)))
-            (should (equal (cdr (assq key transient-values))
-                           '("--revision=mine()")))
-            (should (equal (majutsu-transient-repository-current-value
-                            'majutsu-test mode config-id)
-                           '("--revision=mine()")))))
-      (put mode 'majutsu-test-current-repository-values nil))
-    (should saved)))
-
 (ert-deftest majutsu-log-transient-read-revset/prefills-current-value ()
   "Log -r should prefill the current value and let empty input clear it."
   (let (seen-reader
@@ -1018,19 +905,49 @@
       (should (equal seen-reader
                      '("Revisions: " t "old()" history ("log" "-r")))))))
 
-(ert-deftest majutsu-log-build-args/uses-revision-argument-directly ()
-  "Log -r should live in ARGS, with filesets after --."
-  (let ((majutsu-log--compiled-template-cache '(:template "TPL")))
-    (cl-letf (((symbol-function 'majutsu-repository-config-id) #'ignore)
-              ((symbol-plist 'majutsu-log-mode)
-               (copy-tree (symbol-plist 'majutsu-log-mode))))
+(ert-deftest majutsu-log-filesets/stay-in-originating-buffer ()
+  "Reusing log options must not copy another buffer's one-off file filter."
+  (with-temp-buffer
+    (majutsu-log-mode)
+    (majutsu-log--set-value
+     'majutsu-log-mode '("--no-graph") '("src/one.el"))
+    (should (equal (majutsu-log--get-value 'majutsu-log-mode 'current)
+                   '(("--no-graph") ("src/one.el"))))
+    (let ((source (current-buffer)))
       (with-temp-buffer
-        (majutsu-log--set-value
-         'majutsu-log-mode '("--revision=mine()" "--no-graph") '("src"))
-        (should (equal (majutsu-log--build-args)
-                       '("--config=ui.log-word-wrap=false"
-                         "log" "--revision=mine()" "--no-graph"
-                         "-T" "TPL" "--" "src")))))))
+        (cl-letf (((symbol-function 'majutsu--get-mode-buffer)
+                   (lambda (&rest _) source)))
+          (should (equal (majutsu-log--get-value 'majutsu-log-mode 'always)
+                         '(("--no-graph") nil))))))))
+
+(ert-deftest majutsu-log-reset/leaves-saved-defaults-alone ()
+  "The real reset key clears buffer and popup, not stored defaults."
+  (let ((transient-values '((majutsu-log:majutsu-log-mode "--no-graph")))
+        (transient-history nil)
+        (majutsu-prefix-use-buffer-arguments 'current))
+    (save-window-excursion
+      (with-temp-buffer
+        (majutsu-log-mode)
+        (let ((inhibit-read-only t))
+          (magit-insert-section (root)
+            (insert "Log\n")))
+        (setq-local majutsu-buffer-log-args '("--no-graph"))
+        (setq-local majutsu-buffer-log-filesets '("src/one.el"))
+        (switch-to-buffer (current-buffer))
+        (cl-letf (((symbol-function 'transient-save-values)
+                   (lambda () (ert-fail "Reset tried to save defaults")))
+                  ((symbol-function 'majutsu-refresh-buffer) #'ignore))
+          (unwind-protect
+              (progn
+                (call-interactively #'majutsu-log-transient)
+                (execute-kbd-macro "0")
+                (should-not (transient-get-value))
+                (should-not majutsu-buffer-log-args)
+                (should-not majutsu-buffer-log-filesets)
+                (should (equal transient-values
+                               '((majutsu-log:majutsu-log-mode "--no-graph")))))
+            (when transient--prefix
+              (execute-kbd-macro (kbd "C-g")))))))))
 
 (ert-deftest majutsu-log-transient-read-revset/empty-input-clears ()
   "Empty log -r input should clear the ordinary revision argument."
@@ -1065,6 +982,7 @@
                 '((id . "id-2")))
                majutsu-row-end-token "\n"))
          (majutsu--default-directory "/tmp/test-repo/")
+         (majutsu-log-commit-columns nil)
          (majutsu-log--compiled-template-cache compiled))
     (with-temp-buffer
       (require 'magit-section)
@@ -1087,6 +1005,7 @@
                       (majutsu-log-test--raw-entry "parent-a" "Parent A")
                       (majutsu-log-test--raw-entry "parent-b" "Parent B")))
          (majutsu--default-directory "/tmp/test-repo/")
+         (majutsu-log-commit-columns nil)
          (majutsu-log--compiled-template-cache compiled))
     (with-temp-buffer
       (require 'magit-section)
@@ -1120,6 +1039,7 @@
                       (majutsu-log-test--raw-entry "child-b" "Child B" '("parent"))
                       (majutsu-log-test--raw-entry "parent" "Parent")))
          (majutsu--default-directory "/tmp/test-repo/")
+         (majutsu-log-commit-columns nil)
          (majutsu-log--compiled-template-cache compiled))
     (with-temp-buffer
       (require 'magit-section)
@@ -1145,5 +1065,173 @@
                    "child-b")))
         (majutsu-log-goto-child))
       (should (equal (magit-section-value-if 'jj-commit) "child-b")))))
+
+(ert-deftest majutsu-log/real-jj-reserved-bytes-cannot-retarget-rows ()
+  "Descriptions, names and custom columns cannot inject actionable row framing."
+  (majutsu-jj-integration-with-repo repo
+    (let* ((payload (concat "Title\nbody" majutsu-row-meta-token "@"
+                            majutsu-row-end-token
+                            majutsu-row-start-token
+                            majutsu-row-tail-token
+                            majutsu-row-body-token
+                            "\x1e\x1f\"\\\t\rX\n"))
+           (author (concat "Author" "\u001dM@\u001dE\u001e\u001f!"))
+           (custom (concat "\"Custom\\" "\u001dS\u001dT\u001dB\u001dM@\u001dE\u001e\u001f"))
+           (shown-author "Author\\u001dM@\\u001dE\\u001e\\u001f!")
+           (shown-custom
+            (concat "\"Custom\\"
+                    "\\u001dS\\u001dT\\u001dB\\u001dM@\\u001dE\\u001e\\u001f"))
+           (shown-description
+            (concat "Title\nbody\\u001dM@\\u001dE\\u001dS\\u001dT\\u001dB"
+                    "\\u001e\\u001f\"\\\t\rX\n"))
+           (process-environment
+            (cons (concat "JJ_USER=" author) process-environment)))
+      ;; Create the revision under JJ_USER rather than rewriting its author:
+      ;; describe's author flags are version-dependent.  Keep controls inside
+      ;; the name, with no NUL or newline and no trailing whitespace.
+      (majutsu-jj-integration-call repo "new")
+      (majutsu-jj-integration-commit repo payload)
+      (let* ((id (majutsu-jj-integration-output
+                  repo "log" "--no-graph" "-r" "@-" "-T" "change_id"))
+             (description (majutsu-jj-integration-output
+                           repo "log" "--no-graph" "-r" "@-" "-T" "description"))
+             (compiled
+              (majutsu-log-test--compile-columns
+               `((:field change-id :module heading :face t)
+                 (:field description :module heading :template [:description] :face t)
+                 (:field custom :module heading
+                  :template [:label "row-test" ,custom] :face t)
+                 (:field author :module tail :template [:author :name] :face nil)
+                 (:field long-desc :module body :face t)
+                 (:field description :module metadata
+                  :template [:description] :face nil)
+                 (:field author :module metadata
+                  :template [:author :name] :face nil)
+                 (:field custom :module metadata :template ,custom :face nil))))
+             (majutsu-log-commit-columns nil)
+             (majutsu-log--compiled-template-cache compiled))
+        (dolist (graph-args '(nil ("--no-graph")))
+          (let ((output (apply #'majutsu-jj-integration-output repo
+                               (append
+                                majutsu-row-protocol-global-args
+                                '("--color=always" "--config=colors.row-test=\"red\""
+                                  "log" "-r" "@ | @-")
+                                graph-args
+                                (list "-T" (plist-get compiled :template))))))
+            (with-temp-buffer
+              (majutsu-log-mode)
+              (let ((inhibit-read-only t))
+                (magit-insert-section (lograph)
+                  (insert output)
+                  (let ((ansi-color-apply-face-function
+                         #'ansi-color-apply-text-property-face))
+                    (ansi-color-apply-on-region (point-min) (point-max)))
+                  (goto-char (point-min))
+                  (majutsu-log--wash-logs nil)))
+              (should (= (length majutsu-row-cached-entries) 2))
+              (should (majutsu--goto-log-entry id))
+              (should (equal (majutsu-revision-at-point) id))
+              (should (equal (magit-section-value-if 'jj-commit) id))
+              (let ((entry (majutsu-row-entry-at-point)))
+                (should (equal (majutsu-row-column entry 'description) description))
+                (should (equal (majutsu-row-column entry 'author) author))
+                (should (equal (majutsu-row-column entry 'custom) custom))
+                (should (equal
+                         (majutsu-row-column-value
+                          entry (majutsu-log-test--column compiled 'author 'tail))
+                         shown-author))
+                (should (equal
+                         (majutsu-row-column-value
+                          entry (majutsu-log-test--column compiled 'description 'heading))
+                         shown-description))
+                (should (equal
+                         (majutsu-row-render-body entry compiled)
+                         (string-join (cdr (split-string
+                                           (string-remove-suffix "\n" shown-description)
+                                           "\n"))
+                                      "\n")))
+                (let ((visible (majutsu-row-column-value
+                                entry (majutsu-log-test--column
+                                       compiled 'custom 'heading))))
+                  (should (equal visible shown-custom))
+                  ;; Ordinary punctuation and text retain their native labels.
+                  (should (get-text-property 0 'font-lock-face visible))
+                  (should (equal (get-text-property 0 'font-lock-face visible)
+                                 (get-text-property 1 'font-lock-face visible)))))
+              (search-forward "Title")
+              (should (equal (majutsu-revision-at-point) id))
+              (should (equal (magit-section-value-if 'jj-commit) id)))))))))
+
+(ert-deftest majutsu-log/real-jj-multiline-body-retains-merge-geometry ()
+  "Physical body lines survive template transport and washing with jj's graph."
+  (majutsu-jj-integration-with-repo repo
+    (majutsu-jj-integration-call repo "describe" "-m" "Left")
+    (let ((left (majutsu-jj-integration-output
+                 repo "log" "--no-graph" "-r" "@" "-T" "commit_id")))
+      (majutsu-jj-integration-call repo "new" "root()" "-m" "Right")
+      (majutsu-jj-integration-call repo "new" left "@" "-m" "Merge"))
+    (let* ((body "BODY one\n\nBODY three\nBODY four")
+           (compiled
+            (majutsu-log-test--compile-columns
+             '((:field description :module heading :face nil)
+               (:field long-desc :module body
+                :template "BODY one\n\nBODY three" :face nil)
+               (:field blank :module body :template " \t\n " :face nil)
+               (:field last :module body :template "BODY four" :face nil))))
+           (majutsu-log-commit-columns nil)
+           (majutsu-log--compiled-template-cache compiled)
+           (id (majutsu-jj-integration-output
+                repo "log" "--no-graph" "-r" "@" "-T" "change_id"))
+           (raw (apply #'majutsu-jj-integration-output repo
+                       (append majutsu-row-protocol-global-args
+                               (list "--color=never" "log" "-r" "ancestors(@)"
+                                     "-T" (plist-get compiled :template)))))
+           expected-prefixes)
+      ;; Read prefixes directly from jj's physical output, independently of
+      ;; row parsing, so a renderer that guesses a carry prefix cannot pass.
+      (with-temp-buffer
+        (insert raw)
+        (goto-char (point-min))
+        (search-forward majutsu-row-body-token)
+        (forward-line)
+        (dolist (text (split-string body "\n" nil))
+          (let ((beg (point)))
+            (if (string-empty-p text)
+                (end-of-line)
+              (search-forward text (line-end-position))
+              (backward-char (length text)))
+            (push (buffer-substring-no-properties beg (point))
+                  expected-prefixes))
+          (forward-line)))
+      (setq expected-prefixes (nreverse expected-prefixes))
+      (should (> (length (delete-dups
+                         (mapcar #'string-trim-right expected-prefixes)))
+                 1))
+      (with-temp-buffer
+        (majutsu-log-mode)
+        (let ((inhibit-read-only t))
+          (magit-insert-section (lograph)
+            (insert raw)
+            (goto-char (point-min))
+            (majutsu-log--wash-logs nil)))
+        (should (majutsu--goto-log-entry id))
+        (let* ((entry (majutsu-row-entry-at-point))
+               (section (magit-current-section)))
+          (should (equal (plist-get entry :body-prefixes) expected-prefixes))
+          (should (equal (majutsu-row-render-body entry compiled) body))
+          (goto-char (oref section content))
+          (dolist (prefix expected-prefixes)
+            (let ((display (get-text-property (point) 'line-prefix)))
+              (should (equal (string-trim-right display)
+                             (string-trim-right prefix)))
+              (should (= (string-width display)
+                         (string-width (car (plist-get entry :heading-prefixes))))))
+            (forward-line))
+          (let ((copied (filter-buffer-substring
+                         (oref section content) (oref section end))))
+            (should (equal copied (concat body "\n")))
+            (should-not (text-property-not-all
+                         0 (length copied) 'line-prefix nil copied))))
+        (should (equal (length majutsu-row-cached-entries) 4))))))
 
 ;;; majutsu-log-test.el ends here

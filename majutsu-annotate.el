@@ -502,8 +502,10 @@ that has a parent revision, then recursively annotate the parent."
                         majutsu-buffer-blob-path)
                    (file-relative-name buffer-file-name root)))
          (rev (or revision
-                  (and (bound-and-true-p majutsu-buffer-blob-revision)
-                       majutsu-buffer-blob-revision)
+                  ;; The commit id stays unambiguous when the blob's
+                  ;; change is divergent.
+                  (and (bound-and-true-p majutsu-buffer-blob-commit-id)
+                       majutsu-buffer-blob-commit-id)
                   "@"))
          (default-directory root))
     (message "Annotating...")

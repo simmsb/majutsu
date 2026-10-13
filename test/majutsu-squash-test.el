@@ -21,20 +21,32 @@
                (lambda () '("--from=point"))))
       (should-not (majutsu-squash-arguments)))))
 
-(ert-deftest majutsu-squash-default-args/from-diff-revisions ()
-  "Use diff --revisions context as default squash source."
-  (with-temp-buffer
-    (majutsu-diff-mode)
-    (setq-local majutsu-buffer-diff-range '("--revisions=B::D"))
-    (should (equal (majutsu-squash--default-args)
-                   '("--from=B::D")))))
+(ert-deftest majutsu-squash-source-values/accepts-separate-arguments ()
+  "Parse repeated --from options without consuming fileset values."
+  (should (equal (majutsu-squash--source-values
+                  '("--from" "B" "--from=C" "-f=D" "--" "--from=E"))
+                 '("B" "C" "D"))))
+
+(ert-deftest majutsu-squash-default-args/from-diff-revision-spellings ()
+  "Keep all accepted diff revision spellings when seeding squash."
+  (dolist (range '(("--revisions=B::D")
+                   ("-r" "B::D")
+                   ("--revisions" "B::D")
+                   ("-rB::D")))
+    (with-temp-buffer
+      (majutsu-diff-mode)
+      (setq-local majutsu-buffer-diff-range range)
+      (should (equal (majutsu-squash--default-args)
+                     '("--from=B::D"))))))
 
 (ert-deftest majutsu-squash-default-args/does-not-inherit-diff-from-to ()
   "Do not inherit arbitrary diff --from/--to range for squash."
-  (with-temp-buffer
-    (majutsu-diff-mode)
-    (setq-local majutsu-buffer-diff-range '("--from=A" "--to=D"))
-    (should-not (majutsu-squash--default-args))))
+  (dolist (range '(("--from=A" "--to=D")
+                   ("-f=@" "-t=@-")))
+    (with-temp-buffer
+      (majutsu-diff-mode)
+      (setq-local majutsu-buffer-diff-range range)
+      (should-not (majutsu-squash--default-args)))))
 
 (ert-deftest majutsu-squash-default-args/from-log-region ()
   "Use selected log commits as default sources."
@@ -43,33 +55,292 @@
     (should (equal (majutsu-squash--default-args)
                    '("--from=B" "--from=C")))))
 
-(ert-deftest majutsu-squash-default-args/from-log-point ()
-  "Use commit at point as default source."
-  (cl-letf (((symbol-function 'majutsu-revisions-at-point)
-             (lambda () '("B"))))
-    (should (equal (majutsu-squash--default-args)
-                   '("--from=B")))))
-
-(ert-deftest majutsu-squash-patch-source/rejects-arbitrary-from-to-diff ()
-  "Squash patch selection is unavailable for arbitrary from/to diff buffers."
+(ert-deftest majutsu-squash-execute/rejects-range-patch-selection ()
+  "Never replay one aggregate patch for each commit in a squash range."
   (with-temp-buffer
     (majutsu-diff-mode)
-    (setq-local majutsu-buffer-diff-range '("--from=A" "--to=B"))
-    (should-not (majutsu-squash--patch-source-revset (current-buffer)))))
+    (setq-local majutsu-buffer-diff-range '("--revisions=B::C"))
+    (let (applied)
+      (cl-letf (((symbol-function 'majutsu-jj-string)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'majutsu-interactive-build-replay-plan-if-selected)
+                 (lambda (&rest _) '(:base left :payload-root right :patch "PATCH" :file-ops nil)))
+                ((symbol-function 'majutsu-interactive-run-replay-plan)
+                 (lambda (&rest _)
+                   (setq applied t))))
+        (should-error (majutsu-squash-execute nil) :type 'user-error)
+        (should-not applied)))))
 
-(ert-deftest majutsu-squash-execute/runs-jj-squash-with-inferred-destination ()
-  "Execute non-patch squash through `majutsu-run-jj-with-editor'."
-  (let (called)
-    (cl-letf (((symbol-function 'majutsu-interactive-build-replay-plan-if-selected)
-               (lambda (&rest _) nil))
-              ((symbol-function 'majutsu-run-jj-with-editor)
-               (lambda (&rest args)
-                 (setq called args)))
-              ((symbol-function 'majutsu-squash--point-revision)
-               (lambda () nil)))
-      (majutsu-squash-execute '("--from=B"))
-      (should (equal called
-                     '(("squash" "--from=B" "--into=parents(roots((B)))")))))))
+(defun majutsu-squash-test--jj-call (program directory &rest args)
+  "Run PROGRAM with ARGS in DIRECTORY, returning its standard output.
+Signal an ERT failure if the command exits unsuccessfully."
+  (with-temp-buffer
+    (let* ((default-directory (file-name-as-directory directory))
+           (exit (apply #'call-process
+                        program nil t nil
+                        (append '("--no-pager" "--color=never"
+                                  "--config" "user.name=\"Majutsu Test\""
+                                  "--config" "user.email=\"majutsu@example.invalid\"")
+                                args))))
+      (unless (zerop exit)
+        (ert-fail (format "jj failed (%d): %s\n%s"
+                          exit (string-join args " ") (buffer-string))))
+      (buffer-string))))
+
+(ert-deftest majutsu-squash/integration-configured-editor-runs-on-each-range-source ()
+  "A configured native jj editor must run once for every range source."
+  (let ((jj (or (let ((configured (getenv "MAJUTSU_TEST_JJ")))
+                  (and configured (file-executable-p configured) configured))
+                (executable-find "jj"))))
+    (skip-unless jj)
+    (let* ((parent (make-temp-file "majutsu-squash-integration-" t))
+           (repo (expand-file-name "repo" parent))
+           (tool (expand-file-name "count-tool" parent))
+           (calls (expand-file-name "tool-calls" parent))
+           (process-environment
+            (append '("JJ_CONFIG=" "JJ_USER=Majutsu Test"
+                      "JJ_EMAIL=majutsu@example.invalid")
+                    process-environment))
+           (destination nil)
+           (session nil)
+           (process nil)
+           (majutsu-process--interactive-sessions (make-hash-table :test 'equal)))
+      (unwind-protect
+          (progn
+            (majutsu-squash-test--jj-call jj parent "git" "init" repo)
+            (with-temp-file tool
+              (insert "#!/bin/sh\n"
+                      "if test -e \"$2/c.txt\"; then\n"
+                      "  printf 'C\\n'\n"
+                      "else\n"
+                      "  printf 'B\\n'\n"
+                      "fi >> "
+                      (shell-quote-argument calls)
+                      "\nexit 0\n"))
+            (set-file-modes tool #o755)
+            (let ((default-directory (file-name-as-directory repo)))
+              (with-temp-file (expand-file-name "base.txt" repo)
+                (insert "base\n"))
+              (majutsu-squash-test--jj-call jj repo "describe" "-m" "A")
+              (setq destination
+                    (string-trim
+                     (majutsu-squash-test--jj-call
+                      jj repo "log" "-r" "@" "--no-graph" "-T" "change_id")))
+              (majutsu-squash-test--jj-call jj repo "new" "-m" "B")
+              (with-temp-file (expand-file-name "b.txt" repo)
+                (insert "B\n"))
+              (majutsu-squash-test--jj-call jj repo "new" "-m" "C")
+              (let ((source-b (string-trim
+                               (majutsu-squash-test--jj-call
+                                jj repo "log" "-r" "@-" "--no-graph"
+                                "-T" "change_id"))))
+                (with-temp-file (expand-file-name "c.txt" repo)
+                  (insert "C\n"))
+                (majutsu-squash-test--jj-call jj repo "new" "-m" "D")
+                (let ((source-c (string-trim
+                                 (majutsu-squash-test--jj-call
+                                  jj repo "log" "-r" "@-" "--no-graph"
+                                  "-T" "change_id"))))
+                  (with-temp-buffer
+                    (setq-local default-directory (file-name-as-directory repo))
+                    (majutsu-diff-mode)
+                    (setq-local majutsu-buffer-diff-range
+                                (list "-r" (format "%s::%s"
+                                                   source-b source-c)))
+                    (let* ((majutsu-jj-executable jj)
+                           (majutsu-jj-global-arguments
+                            (list "--no-pager" "--color=never"
+                                  "--config" "user.name=\"Majutsu Test\""
+                                  "--config" "user.email=\"majutsu@example.invalid\""
+                                  "--config"
+                                  (format "ui.diff-editor=%S" "count")
+                                  "--config"
+                                  (format "merge-tools.count.program=%S" tool)
+                                  "--config"
+                                  "merge-tools.count.edit-args=[\"$left\", \"$right\"]"
+                                  "--config"
+                                  "merge-tools.count.edit-invocation-mode=\"dir\""))
+                           (majutsu-diff-editor-host 'process)
+                           (majutsu-process-popup-time -1))
+                      (should-not
+                       (majutsu-diff-single-source-commit))
+                      (cl-letf
+                          (((symbol-function
+                             'majutsu-interactive-build-replay-plan-if-selected)
+                            (lambda (&rest _) nil))
+                           ((symbol-function 'majutsu--process-display-buffer)
+                            (lambda (&rest _) nil))
+                           ((symbol-function 'majutsu-refresh)
+                            (lambda (&rest _) nil)))
+                        (let ((deadline (+ (float-time) 10)))
+                          (setq session
+                                (majutsu-squash-execute
+                                 (list "-i" "--message" "range"
+                                       (concat "--into=" destination))))
+                          (setq process
+                                (majutsu-diff-editor-session-process session))
+                          (let ((root
+                                 (majutsu-diff-editor-session-repository-root
+                                  session)))
+                            (should (equal root (file-name-as-directory repo)))
+                            (should (processp process))
+                            (while (and (process-live-p process)
+                                        (< (float-time) deadline))
+                              (accept-process-output process 0.05))
+                            (when (process-live-p process)
+                              (ignore-errors (delete-process process))
+                              (ert-fail "Timed out waiting for range squash"))
+                            (should (zerop (process-exit-status process)))
+                            ;; Session completion is deferred out of the process
+                            ;; sentinel; keep the UI stubs active until it frees
+                            ;; the per-repository slot.
+                            (while (and (gethash root majutsu-process--interactive-sessions)
+                                        (< (float-time) deadline))
+                              (sit-for 0.01))
+                            (should-not (gethash root
+                                                 majutsu-process--interactive-sessions))))))))
+            (should (file-exists-p calls))
+            (with-temp-buffer
+              (insert-file-contents calls)
+              (should (equal (sort (split-string (buffer-string) "\n" t)
+                                   #'string<)
+                             '("B" "C"))))
+            (should (equal (majutsu-squash-test--jj-call
+                            jj repo "file" "show" "-r" "@" "b.txt")
+                           "B\n"))
+            (should (equal (majutsu-squash-test--jj-call
+                            jj repo "file" "show" "-r" "@" "c.txt")
+                           "C\n"))
+            (should (equal
+                     (string-trim
+                      (majutsu-squash-test--jj-call
+                       jj repo "log" "-r" destination "--no-graph"
+                       "-T" "description"))
+                     "range")))
+        (when (and (processp process) (process-live-p process))
+          (ignore-errors (delete-process process)))
+        (when session
+          (ignore-errors (majutsu-process-unregister-interactive-session
+           (majutsu-terminal-session-repository-root session) session)))
+        (when (file-directory-p parent)
+          (delete-directory parent t))))))))
+
+(ert-deftest majutsu-squash/integration-squashes-selected-added-region ()
+  "Squash one selected added line from a non-working-copy source."
+  (let ((jj (or (let ((configured (getenv "MAJUTSU_TEST_JJ")))
+                  (and configured (file-executable-p configured) configured))
+                (executable-find "jj"))))
+    (skip-unless jj)
+    (let* ((parent (make-temp-file "majutsu-squash-region-" t))
+           (repo (expand-file-name "repo" parent))
+           (process-environment
+            (append '("JJ_CONFIG=" "JJ_USER=Majutsu Test"
+                      "JJ_EMAIL=majutsu@example.invalid")
+                    process-environment))
+           source destination process)
+      (unwind-protect
+          (progn
+            (majutsu-squash-test--jj-call jj parent "git" "init" repo)
+            (let ((default-directory (file-name-as-directory repo)))
+              (with-temp-file (expand-file-name "notes.txt" repo)
+                (insert "base\n"))
+              (majutsu-squash-test--jj-call jj repo "describe" "-m" "A")
+              (setq destination
+                    (string-trim
+                     (majutsu-squash-test--jj-call
+                      jj repo "log" "-r" "@" "--no-graph" "-T" "change_id")))
+              (majutsu-squash-test--jj-call jj repo "new" "-m" "B")
+              (with-temp-file (expand-file-name "notes.txt" repo)
+                (insert "base\nselected addition\nunselected addition\n"))
+              (setq source
+                    (string-trim
+                     (majutsu-squash-test--jj-call
+                      jj repo "log" "-r" "@" "--no-graph" "-T" "change_id")))
+              ;; Keep the working copy distinct from the rendered source.  An
+              ;; explicit destination must still preserve SOURCE as --from.
+              (majutsu-squash-test--jj-call jj repo "new" "-m" "C")
+              (with-temp-buffer
+                (setq-local default-directory (file-name-as-directory repo))
+                (majutsu-diff-mode)
+                (setq-local majutsu-buffer-diff-range
+                            (list "--revisions" source))
+                (let ((inhibit-read-only t)
+                      (magit-section-inhibit-markers t))
+                  (magit-insert-section (root)
+                    (insert (majutsu-squash-test--jj-call
+                             jj repo "diff" "--git" "-r" source))
+                    (save-restriction
+                      (narrow-to-region (point-min) (point-max))
+                      (majutsu-diff-wash-diffs '("--git")))))
+                (let* ((file (majutsu-interactive--file-section-for-file
+                              "notes.txt"))
+                       (hunk (car (majutsu-interactive--file-section-hunks file)))
+                       (beg (save-excursion
+                              (goto-char (oref hunk content))
+                              (forward-line 1)
+                              (point)))
+                       (end (save-excursion
+                              (goto-char beg)
+                              (forward-line 1)
+                              (point))))
+                  (should file)
+                  (should hunk)
+                  (let ((transient-current-command 'majutsu-squash)
+                        (transient-mark-mode t))
+                    (goto-char beg)
+                    (set-mark end)
+                    (setq mark-active t)
+                    (majutsu-interactive-toggle-region))
+                  (should (eq majutsu-interactive--selection-operation
+                              'majutsu-squash))
+                  (let ((origin (current-buffer))
+                        (majutsu-jj-executable jj)
+                        (majutsu-jj-global-arguments
+                         '("--no-pager" "--color=never"
+                           "--config" "user.name=Majutsu Test"
+                           "--config" "user.email=majutsu@example.invalid"))
+                        (majutsu-process-popup-time -1)
+                        (deadline (+ (float-time) 10)))
+                    (cl-letf (((symbol-function 'majutsu--process-display-buffer)
+                               (lambda (&rest _) nil))
+                              ((symbol-function 'majutsu-refresh)
+                               (lambda () nil))
+                              ((symbol-function 'majutsu-mode-get-buffers)
+                               (lambda (&rest _) (list origin))))
+                      (setq process
+                            (majutsu-squash-execute
+                             (list (concat "--into=" destination)
+                                   "--use-destination-message")))
+                      (should (processp process))
+                      (while (and (process-live-p process)
+                                  (< (float-time) deadline))
+                        (accept-process-output process 0.05))
+                      (when (process-live-p process)
+                        (ignore-errors (delete-process process))
+                        (ert-fail "Timed out waiting for region squash"))
+                      (unless (zerop (process-exit-status process))
+                        (ert-fail
+                         (with-current-buffer (process-buffer process)
+                           (buffer-string))))
+                      ;; Completion is deferred out of the process sentinel.
+                      (while (and (majutsu-interactive-has-selections-p)
+                                  (< (float-time) deadline))
+                        (sit-for 0.01))
+                      (should-not
+                       (majutsu-interactive-has-selections-p)))))))
+            (should (equal (majutsu-squash-test--jj-call
+                            jj repo "file" "show" "-r" destination "notes.txt")
+                           "base\nselected addition\n"))
+            ;; SOURCE inherits the selected line from its rewritten parent;
+            ;; only the unselected line remains in SOURCE's own diff.
+            (let ((source-diff (majutsu-squash-test--jj-call
+                                jj repo "diff" "--git" "-r" source)))
+              (should (string-match-p "^+unselected addition$" source-diff))
+              (should-not (string-match-p "^+selected addition$" source-diff))))
+        (when (and (processp process) (process-live-p process))
+          (ignore-errors (delete-process process)))
+        (when (file-directory-p parent)
+          (delete-directory parent t))))))
 
 (ert-deftest majutsu-squash-execute/defaults-to-working-copy-parent ()
   "No source defaults to @ and its external parent."
@@ -103,6 +374,23 @@
       (should (equal called
                      '(("squash" "--from=B" "--into=parents(roots((B)))")))))))
 
+(ert-deftest majutsu-squash-execute/keeps-diff-range-with-explicit-destination ()
+  "An explicit destination must not replace a diff range source with @."
+  (with-temp-buffer
+    (majutsu-diff-mode)
+    (setq-local majutsu-buffer-diff-range '("--revisions=B::C"))
+    (let ((origin (current-buffer)) called)
+      (cl-letf (((symbol-function 'majutsu-interactive-build-replay-plan-if-selected)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'majutsu-diff-editor-start)
+                 (lambda (&rest args)
+                   (setq called args))))
+        (majutsu-squash-execute '("--into=A" "--tool=count"))
+        (should (equal called
+                       (list "squash"
+                             '("--into=A" "--tool=count" "--from=B::C")
+                             nil :origin-buffer origin)))))))
+
 (ert-deftest majutsu-squash-execute/keeps-explicit-destination ()
   "Do not infer destination when user selected one."
   (let (called)
@@ -116,6 +404,23 @@
       (majutsu-squash-execute '("--from=C" "--into=A"))
       (should (equal called
                      '(("squash" "--from=C" "--into=A")))))))
+
+(ert-deftest majutsu-squash-execute/log-explicit-destination-uses-commit-at-point ()
+  "In a log buffer an explicit destination squashes from the commit at point."
+  (with-temp-buffer
+    (let (called)
+      (cl-letf (((symbol-function 'majutsu-interactive-build-replay-plan-if-selected)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'majutsu-run-jj-with-editor)
+                 (lambda (&rest args)
+                   (setq called args)))
+                ((symbol-function 'magit-region-values)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'magit-section-value-if)
+                 (lambda (_) "Y")))
+        (majutsu-squash-execute '("--into=X"))
+        (should (equal called
+                       '(("squash" "--into=X" "--from=Y"))))))))
 
 (ert-deftest majutsu-squash-execute/keeps-literal-none-source-for-jj-noop ()
   "Do not add --into for literal --from=none(); let jj keep no-op behavior."
@@ -146,17 +451,71 @@
                      '(("squash" "--from=B" "--into=parents(roots((B)))"
                         "--" "majutsu-squash.el")))))))
 
-(ert-deftest majutsu-squash-execute/patch-removes-native-interactive-tool-args ()
-  "Patch mode injects Majutsu's tool and strips native tool args."
-  (let (called cleared)
+(ert-deftest majutsu-squash-execute/routes-jj-editor-flags-to-diff-editor ()
+  "Preserve jj editor flags and canonical squash arguments in the session."
+  (let ((origin (current-buffer)))
+    (dolist (editor-args '(("-i")
+                           ("--interactive")
+                           ("--tool" "meld")
+                           ("--tool=meld")))
+      (let (called)
+        (cl-letf (((symbol-function 'majutsu-interactive-build-replay-plan-if-selected)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'majutsu-squash--point-revision)
+                   (lambda () nil))
+                  ((symbol-function 'majutsu-diff-editor-start)
+                   (lambda (&rest args)
+                     (setq called args))))
+          (majutsu-squash-execute
+           (append '(("--" "src/a.el") "--from=B") editor-args))
+          (should (equal (cl-subseq called 0 4)
+                         (list "squash"
+                               (append '("--from=B")
+                                       editor-args
+                                       '("--into=parents(roots((B)))"))
+                               '("src/a.el")
+                               :origin-buffer)))
+          (should (eq (nth 4 called) origin)))))))
+
+(ert-deftest majutsu-squash-execute/explicit-jj-editor-wins-over-patch-selection ()
+  "A requested jj editor bypasses patch-source validation and keeps selection."
+  (let ((origin (current-buffer)) called cleared)
     (cl-letf (((symbol-function 'majutsu-interactive-build-replay-plan-if-selected)
+               (lambda (&rest _) '(:base left :payload-root right :patch "PATCH" :file-ops nil)))
+              ((symbol-function 'majutsu-diff-single-source-commit)
+               (lambda (&rest _) nil))
+              ((symbol-function 'majutsu-squash--point-revision)
+               (lambda () nil))
+              ((symbol-function 'majutsu-diff-editor-start)
+               (lambda (&rest args)
+                 (setq called args)))
+              ((symbol-function 'majutsu-interactive-run-replay-plan)
                (lambda (&rest _)
-                 (list :base 'left :payload-root 'right
-                       :patch "PATCH"
-                       :file-ops
-                       '((:action modify :path "image.bin")))))
-              ((symbol-function 'majutsu-squash--patch-source-revset)
-               (lambda (&rest _) "B"))
+                 (ert-fail "Should not replace an explicit jj editor")))
+              ((symbol-function 'majutsu-interactive-clear)
+               (lambda () (setq cleared t))))
+      (majutsu-squash-execute '("--from=B" "--tool" "meld"))
+      (should (equal (cl-subseq called 0 4)
+                     '("squash"
+                       ("--from=B" "--tool" "meld"
+                        "--into=parents(roots((B)))")
+                       nil :origin-buffer)))
+      (should (eq (nth 4 called) origin))
+      (should-not cleared))))
+
+(ert-deftest majutsu-squash-execute/patch-pins-inferred-source-and-destination ()
+  "Patch mode executes with the canonical source and inferred destination."
+  (let (called cleared stripped)
+    (cl-letf (((symbol-function 'majutsu-interactive-build-replay-plan-if-selected)
+               (lambda (&rest _) '(:base left :payload-root right :patch "PATCH" :file-ops nil)))
+              ((symbol-function 'majutsu-diff-single-source-commit)
+               (lambda (&rest _) "commit-id"))
+              ((symbol-function 'majutsu-jj-resolve-single-commit)
+               (lambda (&rest _) "commit-id"))
+              ((symbol-function 'majutsu-diff-editor-strip-interactive-arguments)
+               (lambda (args)
+                 (setq stripped args)
+                 args))
               ((symbol-function 'majutsu-interactive-run-replay-plan)
                (lambda (&rest args)
                  (setq called args)))
@@ -164,25 +523,67 @@
                (lambda () (setq cleared t)))
               ((symbol-function 'majutsu-squash--point-revision)
                (lambda () nil)))
-      (majutsu-squash-execute '("--from=B" "--interactive" "--tool=meld" "--tool" "vimdiff"))
+      (majutsu-squash-execute '("--from=B"))
       (should (equal called
                      '("squash"
-                       ("--from=B" "--into=parents(roots((B)))")
-                       nil
-                       (:base left :payload-root right
-                        :patch "PATCH"
-                        :file-ops
-                        ((:action modify :path "image.bin"))))))
-      (should cleared))))
+                       ("--from=commit-id" "--into=commit-id")
+                       nil (:base left :payload-root right :patch "PATCH" :file-ops nil))))
+      (should (equal stripped
+                     '("--from=commit-id" "--into=commit-id")))
+      (should-not cleared))))
+
+(ert-deftest majutsu-squash-execute/patch-allows-equivalent-source-revset ()
+  "Canonical comparison allows a revset naming the rendered source commit."
+  (let (called resolved)
+    (cl-letf (((symbol-function 'majutsu-interactive-build-replay-plan-if-selected)
+               (lambda (&rest _) '(:base left :payload-root right :patch "PATCH" :file-ops nil)))
+              ((symbol-function 'majutsu-diff-single-source-commit)
+               (lambda (&rest _) "commit-id"))
+              ((symbol-function 'majutsu-jj-resolve-single-commit)
+               (lambda (revset)
+                 (setq resolved revset)
+                 "commit-id"))
+              ((symbol-function 'majutsu-interactive-run-replay-plan)
+               (lambda (&rest args) (setq called args))))
+      (majutsu-squash-execute
+       '("--from=bookmarks(exact:topic)" "--into=destination"))
+      (should (equal resolved "(bookmarks(exact:topic))"))
+      (should (equal called
+                     '("squash"
+                       ("--into=destination" "--from=commit-id")
+                       nil (:base left :payload-root right :patch "PATCH" :file-ops nil)))))))
+
+(ert-deftest majutsu-squash-execute/patch-keeps-diff-source-with-destination ()
+  "An explicit destination still validates and uses the rendered diff source."
+  (let (called resolved)
+    (cl-letf (((symbol-function 'majutsu-interactive-build-replay-plan-if-selected)
+               (lambda (&rest _) '(:base left :payload-root right :patch "PATCH" :file-ops nil)))
+              ((symbol-function 'majutsu-diff-single-source-commit)
+               (lambda (&rest _) "commit-id"))
+              ((symbol-function 'majutsu-squash--default-args)
+               (lambda () '("--from=rendered")))
+              ((symbol-function 'majutsu-jj-resolve-single-commit)
+               (lambda (revset)
+                 (setq resolved revset)
+                 "commit-id"))
+              ((symbol-function 'majutsu-interactive-run-replay-plan)
+               (lambda (&rest args) (setq called args))))
+      (majutsu-squash-execute '("--into=destination"))
+      (should (equal resolved "(rendered)"))
+      (should (equal called
+                     '("squash"
+                       ("--into=destination" "--from=commit-id")
+                       nil (:base left :payload-root right :patch "PATCH" :file-ops nil)))))))
 
 (ert-deftest majutsu-squash-execute/patch-rejects-different-source ()
   "Patch mode should not apply the current diff patch to another source."
   (let (cleared)
     (cl-letf (((symbol-function 'majutsu-interactive-build-replay-plan-if-selected)
-               (lambda (&rest _)
-                 '(:base left :payload-root right :patch "PATCH" :file-ops nil)))
-              ((symbol-function 'majutsu-squash--patch-source-revset)
-               (lambda (&rest _) "B"))
+               (lambda (&rest _) '(:base left :payload-root right :patch "PATCH" :file-ops nil)))
+              ((symbol-function 'majutsu-diff-single-source-commit)
+               (lambda (&rest _) "rendered-id"))
+              ((symbol-function 'majutsu-jj-resolve-single-commit)
+               (lambda (&rest _) "different-id"))
               ((symbol-function 'majutsu-interactive-clear)
                (lambda () (setq cleared t))))
       (should-error (majutsu-squash-execute '("--from=C")) :type 'user-error)

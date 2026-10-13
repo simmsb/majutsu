@@ -52,6 +52,80 @@
                (insert "\nsecond line") 0)))
     (should (equal (majutsu-jj-string "log" "-r" "@") ""))))
 
+(ert-deftest majutsu-jj-option-values/accepts-all-option-spellings ()
+  "Parse long, separate, and short option values before a fileset separator."
+  (should (equal (majutsu-jj-option-values
+                  '("--revisions=A" "-r" "B" "-rC" "-r=D"
+                    "--" "--revisions=E")
+                  "--revisions" "-r")
+                 '("A" "B" "C" "D"))))
+
+(ert-deftest majutsu-jj-option-values/strips-attached-short-equals ()
+  "Treat the equals in -r=@ and -f=@ as option syntax."
+  (should (equal (majutsu-jj-option-values
+                  '("-r=@" "-r@-" "-r=" "--" "-r=ignored")
+                  "--revisions" "-r")
+                 '("@" "@-" "")))
+  (should (equal (majutsu-jj-option-values
+                  '("-f=@" "-fmain") "--from" "-f")
+                 '("@" "main"))))
+
+(ert-deftest majutsu-jj-set-option-value/replaces-spellings-before-filesets ()
+  "Canonical options replace long, short, attached, and repeated spellings."
+  (should
+   (equal (majutsu-jj-set-option-value
+           '("--message=x" "--from" "A" "-fB" "--from=C"
+             "--" "--from=fileset")
+           "--from" "commit-id" "-f")
+          '("--message=x" "--from=commit-id"
+            "--" "--from=fileset")))
+  (should
+   (equal (majutsu-jj-set-option-value
+           '("--from=A" "--to=B") "--from" nil "-f")
+          '("--to=B"))))
+
+(ert-deftest majutsu-jj-operation-id/uses-directory-and-no-snapshot-query ()
+  "Read the newest operation in the requested repository directory."
+  (let (called-directory called-args)
+    (cl-letf (((symbol-function 'majutsu-jj-string)
+               (lambda (&rest args)
+                 (setq called-directory default-directory
+                       called-args args)
+                 "operation-id")))
+      (should (equal (majutsu-jj-operation-id "/tmp/repository/")
+                     "operation-id"))
+      (should (equal called-directory "/tmp/repository/"))
+      (should (equal called-args
+                     '("--ignore-working-copy" "operation" "log"
+                       "--no-graph" "-n" "1" "-T" "id")))
+      (should (equal (majutsu-jj-operation-id "/tmp/repository/" t)
+                     "operation-id"))
+      (should (equal called-args
+                     '(nil "operation" "log"
+                       "--no-graph" "-n" "1" "-T" "id"))))))
+
+(ert-deftest majutsu-jj-operation-id/returns-nil-on-empty-or-error ()
+  "An unavailable operation ID is an unknown result, represented by nil."
+  (cl-letf (((symbol-function 'majutsu-jj-string)
+             (lambda (&rest _) "")))
+    (should-not (majutsu-jj-operation-id)))
+  (cl-letf (((symbol-function 'majutsu-jj-string)
+             (lambda (&rest _) (error "unavailable"))))
+    (should-not (majutsu-jj-operation-id))))
+
+(ert-deftest majutsu-jj-resolve-single-commit/requires-exact-cardinality ()
+  "A singleton probe must not use `latest' or otherwise reduce a range."
+  (let (called)
+    (cl-letf (((symbol-function 'majutsu-jj-string)
+               (lambda (&rest args)
+                 (setq called args)
+                 "deadbeef")))
+      (should (equal (majutsu-jj-resolve-single-commit "B::C") "deadbeef"))
+      (should (equal called
+                     '("--ignore-working-copy" "log" "-r"
+                       "exactly((B::C), 1)"
+                       "--no-graph" "--limit" "1" "-T" "commit_id"))))))
+
 
 
 ;; Tests for majutsu-jj-lines
@@ -106,44 +180,47 @@
 
 (ert-deftest majutsu-jj-conflicted-files/parses-structured-records ()
   "Conflicted files should retain exact paths and conflict side counts."
-  (let (captured)
-    (cl-letf (((symbol-function 'majutsu-jj-items)
-               (lambda (&rest args)
-                 (setq captured args)
-                 (list (concat "2" (string 31) "dir with spaces/file name.txt")
-                       (concat "3" (string 31) "other.txt")))))
-      (should (equal (majutsu-jj-conflicted-files)
-                     '((:path "dir with spaces/file name.txt" :sides 2)
-                       (:path "other.txt" :sides 3))))
-      (should (equal (seq-take captured 4)
-                     '("file" "list" "-r" "@")))
-      (should (equal (nth 4 captured) "-T"))
-      (should (equal (nth 5 captured)
-                     majutsu-jj--conflicted-files-template)))))
+  (cl-letf (((symbol-function 'majutsu--jj-insert)
+             (lambda (_return-error &rest _args)
+               (insert (concat "2" (string 31) "dir with spaces/file name.txt\0"
+                               "3" (string 31) "other.txt\0"))
+               0)))
+    (should (equal (majutsu-jj-conflicted-files)
+                   '((:path "dir with spaces/file name.txt" :sides 2)
+                     (:path "other.txt" :sides 3))))))
 
-(ert-deftest majutsu-jj-conflicted-files/appends-filesets-and-drops-malformed ()
-  "Structured conflict queries should accept filesets and ignore bad records."
-  (let (captured)
-    (cl-letf (((symbol-function 'majutsu-jj-items)
-               (lambda (&rest args)
-                 (setq captured args)
-                 (list (concat "4" (string 31) "good.txt")
-                       (concat (string 31) "missing-sides")
-                       (concat "2" (string 31))))))
-      (should (equal (majutsu-jj-conflicted-files
-                      "abc" '("file:\"a b.txt\"" "glob:src/**"))
-                     '((:path "good.txt" :sides 4))))
-      (should (equal (seq-drop captured 6)
-                     '("--" "file:\"a b.txt\"" "glob:src/**"))))))
+(ert-deftest majutsu-jj-conflicted-files/drops-malformed-records ()
+  "Malformed records must not invent conflicted repository paths."
+  (cl-letf (((symbol-function 'majutsu--jj-insert)
+             (lambda (_return-error &rest _args)
+               (insert (concat "4" (string 31) "good.txt\0"
+                               (string 31) "missing-sides\0"
+                               "2" (string 31) "\0"))
+               0)))
+    (should (equal (majutsu-jj-conflicted-files
+                    "abc" '("file:\"a b.txt\"" "glob:src/**"))
+                   '((:path "good.txt" :sides 4))))))
 
 (ert-deftest majutsu-jj-conflicted-files/preserves-field-separator-in-path ()
   "The machine-field separator should remain valid inside repository paths."
   (let ((path (concat "dir" (string 31) "name.txt")))
-    (cl-letf (((symbol-function 'majutsu-jj-items)
-               (lambda (&rest _args)
-                 (list (concat "2" (string 31) path)))))
+    (cl-letf (((symbol-function 'majutsu--jj-insert)
+               (lambda (_return-error &rest _args)
+                 (insert (concat "2" (string 31) path "\0"))
+                 0)))
       (should (equal (majutsu-jj-conflicted-files)
                      `((:path ,path :sides 2)))))))
+
+(ert-deftest majutsu-jj-conflicted-files/rejects-failed-and-partial-queries ()
+  "Neither missing nor partial stdout can establish the conflict state."
+  (dolist (result '(1 "Error: revision does not exist"))
+    (dolist (stdout (list "" (concat "2" (string 31) "partial.txt\0")))
+      (cl-letf (((symbol-function 'majutsu--jj-insert)
+                 (lambda (_return-error &rest _args)
+                   (insert stdout)
+                   result)))
+        (should-error (majutsu-jj-conflicted-files "missing")
+                      :type 'user-error)))))
 
 ;; Tests for majutsu-jj-insert
 
@@ -240,10 +317,10 @@
                  1)))
       (with-temp-buffer
         (should (= 1 (majutsu-jj-wash
-                         (lambda (&rest _)
-                           (setq washed (buffer-string))
-                           (goto-char (point-max)))
-                         'wash-anyway
+                       (lambda (&rest _)
+                         (setq washed (buffer-string))
+                         (goto-char (point-max)))
+                       'wash-anyway
                        "diff")))
         (should (equal washed "diff output\n"))
         (should (string-prefix-p washed (buffer-string)))

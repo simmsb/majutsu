@@ -219,69 +219,6 @@
                     :value (append base summary))
             (list :type 'raw-line :text colored-line)))))))
 
-(defun majutsu-op--parse-diff-output (output)
-  "Parse colored jj op diff OUTPUT into renderable nodes."
-  (let (nodes group-title group-text group-kind group-children ref-name ref-text ref-children)
-    (cl-labels
-        ((finish-ref
-           ()
-           (when ref-name
-             (push (list :type 'ref
-                         :name ref-name
-                         :text ref-text
-                         :children (nreverse ref-children))
-                   group-children)
-             (setq ref-name nil
-                   ref-text nil
-                   ref-children nil)))
-         (finish-group
-           ()
-           (finish-ref)
-           (when group-title
-             (push (list :type 'group
-                         :title group-title
-                         :text group-text
-                         :kind group-kind
-                         :children (nreverse group-children))
-                   nodes)
-             (setq group-title nil
-                   group-text nil
-                   group-kind nil
-                   group-children nil)))
-         (add-node
-           (node)
-           (cond
-            (ref-name (push node ref-children))
-            (group-title (push node group-children))
-            (t (push node nodes)))))
-      (dolist (colored-line (split-string (or output "") "\n"))
-        (let* ((plain-line (substring-no-properties colored-line))
-               (trimmed (string-trim plain-line)))
-          (cond
-           ((string-empty-p trimmed))
-           ((majutsu-op--diff-operation-header-p plain-line))
-           ((majutsu-op--diff-group-kind plain-line)
-            (finish-group)
-            (setq group-title trimmed
-                  group-text colored-line
-                  group-kind (majutsu-op--diff-group-kind plain-line)))
-           ((majutsu-op--diff-warning-line-p plain-line)
-            (add-node (list :type 'warning :text colored-line)))
-           ((majutsu-op--diff-elision-line-p plain-line)
-            (add-node (list :type 'elision :text colored-line)))
-           ((majutsu-op--diff-ref-header-p plain-line group-kind)
-            (finish-ref)
-            (setq ref-name (string-remove-suffix ":" trimmed)
-                  ref-text colored-line))
-           ((majutsu-op--parse-diff-marker-line
-             plain-line colored-line group-kind ref-name)
-            (add-node (majutsu-op--parse-diff-marker-line
-                       plain-line colored-line group-kind ref-name)))
-           (t
-            (add-node (list :type 'raw-line :text colored-line))))))
-      (finish-group)
-      (nreverse nodes))))
-
 (defun majutsu-op--commit-summary-config-arg ()
   "Return a jj --config argument for operation commit summaries."
   (concat "templates.commit_summary=" majutsu-op--commit-summary-template))
@@ -443,8 +380,7 @@ PROMPT, INITIAL-INPUT, and HISTORY follow transient reader conventions."
     (:field attributes :module body
      :template [:if [:root]
                    ""
-                 [:label "attributes"
-                         [:method [:attributes] :replace "\n" "\x1f"]]]
+                 [:label "attributes" [:attributes]]]
      :face t)
     (:field op-id :module metadata :template [:id]
      :face nil :post majutsu-op--row-machine-field)
@@ -470,7 +406,7 @@ PROMPT, INITIAL-INPUT, and HISTORY follow transient reader conventions."
     (:field description :module metadata
      :template [:method [:description] :first_line] :face nil)
     (:field attributes :module metadata
-     :template [:method [:attributes] :replace "\n" "\x1f"] :face nil))
+     :template [:attributes] :face nil))
   "Flat columns for a native compact operation row.
 The visible modules mirror jj's compact formatter.  Canonical metadata is
 transported separately, with complete encoded attributes as the last field."
@@ -520,10 +456,12 @@ transported separately, with complete encoded attributes as the last field."
             (majutsu-op-log--compile-columns))))
 
 (defun majutsu-op-log-arguments ()
-  "Return operation log arguments from the active transient, if any."
+  "Return active transient arguments or scoped operation log defaults."
   (if (eq transient-current-command 'majutsu-op-log-transient)
       (transient-args 'majutsu-op-log-transient)
-    '()))
+    (majutsu-transient-default-value
+     'majutsu-op-log 'majutsu-op-log-mode
+     'majutsu-op-log-default-arguments)))
 
 (defun majutsu-op-log--validate-args (args)
   "Return normalized safe operation log ARGS or signal `user-error'.
@@ -632,39 +570,16 @@ switch, and graph switch are allowed."
 (put 'majutsu-op-log-mode 'majutsu-op-log-default-arguments
      '("--limit=64"))
 
-(defclass majutsu-op-log-prefix (transient-prefix)
-  ((major-mode :initform 'majutsu-op-log-mode)))
+(defclass majutsu-op-log-prefix (majutsu-defaults-prefix)
+  ((defaults-namespace :initform 'majutsu-op-log)
+   (defaults-filter :initform #'majutsu-op-log--validate-args)
+   (major-mode :initform 'majutsu-op-log-mode)))
 
-(cl-defmethod transient-init-value ((obj majutsu-op-log-prefix))
-  (oset obj value
-        (majutsu-transient-default-value
-         'majutsu-op-log
-         (oref obj major-mode)
-         'majutsu-op-log-current-arguments
-         'majutsu-op-log-default-arguments)))
-
-(cl-defmethod transient-set-value ((obj majutsu-op-log-prefix))
-  (let* ((obj (oref obj prototype))
-         (mode (or (oref obj major-mode) major-mode))
-         (args (transient-args (oref obj command))))
-    (put mode 'majutsu-op-log-current-arguments args)
-    (transient--history-push obj)
-    (when (eq major-mode mode)
-      (setq-local majutsu-op-log--args args))))
-
-(cl-defmethod transient-save-value ((obj majutsu-op-log-prefix))
-  (let* ((obj (oref obj prototype))
-         (mode (or (oref obj major-mode) major-mode))
-         (args (transient-args (oref obj command))))
-    (put mode 'majutsu-op-log-current-arguments args)
-    (setf (alist-get (majutsu-transient-global-default-key
-                      'majutsu-op-log mode)
-                     transient-values)
-          args)
-    (transient-save-values)
-    (transient--history-push obj)
-    (when (eq major-mode mode)
-      (setq-local majutsu-op-log--args args))))
+(cl-defmethod majutsu-transient-apply-value
+  ((obj majutsu-op-log-prefix) value)
+  (when (eq major-mode (oref obj major-mode))
+    (setq-local majutsu-op-log--args value)
+    (majutsu-refresh-buffer)))
 
 (transient-define-argument majutsu-op-log:--limit ()
   :description "Limit"
@@ -700,17 +615,16 @@ switch, and graph switch are allowed."
    ["Actions"
     ("l" "Open log" majutsu-op-log)
     ("RET" "Open log" majutsu-op-log)
-    ("s" "Save as default" transient-save-and-exit)]])
+    ("s" "Set workspace defaults" transient-set-and-exit)
+    ("w" "Save defaults..." majutsu-transient-defaults-menu)]])
 
 ;;;###autoload
-(defun majutsu-op-log (&optional args)
-  "Open the Majutsu operation log with ARGS."
-  (interactive (list (or (majutsu-op-log-arguments)
-                         (get 'majutsu-op-log-mode
-                              'majutsu-op-log-default-arguments))))
-  (let* ((args (majutsu-op-log--validate-args
-                (or args (get 'majutsu-op-log-mode
-                              'majutsu-op-log-default-arguments))))
+(cl-defun majutsu-op-log (&optional (args (majutsu-op-log-arguments)))
+  "Open the Majutsu operation log with ARGS.
+When ARGS is omitted, use the active transient or scoped defaults.
+An explicitly nil ARGS means no options."
+  (interactive (list (majutsu-op-log-arguments)))
+  (let* ((args (majutsu-op-log--validate-args args))
          (root (majutsu--toplevel-safe))
          (repo (file-name-nondirectory (directory-file-name root))))
     (majutsu-setup-buffer #'majutsu-op-log-mode nil
@@ -826,8 +740,9 @@ switch, and graph switch are allowed."
         (user-error "Failed to parse operation metadata for %s" operation))))
 
 (defun majutsu-op--diff-command-args (args)
-  "Return jj arguments for operation diff ARGS."
+  "Return line-safe jj arguments for operation diff ARGS."
   (append majutsu-op--read-only-global-args
+          majutsu-row-protocol-global-args
           (list "--config" (majutsu-op--commit-summary-config-arg)
                 "op" "diff" "--no-graph")
           args))
@@ -868,17 +783,6 @@ switch, and graph switch are allowed."
 (defun majutsu-op--insert-diff-node (node)
   "Insert one parsed operation diff NODE."
   (pcase (plist-get node :type)
-    ('group
-     (magit-insert-section (jj-op-group (list :kind (plist-get node :kind)
-                                              :title (plist-get node :title)))
-       (magit-insert-heading (majutsu-op--node-display-text node))
-       (dolist (child (plist-get node :children))
-         (majutsu-op--insert-diff-node child))))
-    ('ref
-     (magit-insert-section (jj-op-ref (plist-get node :name))
-       (magit-insert-heading (majutsu-op--node-display-text node))
-       (dolist (child (plist-get node :children))
-         (majutsu-op--insert-diff-node child))))
     ('commit-line
      (let ((value (plist-get node :value)))
        (magit-insert-section (jj-op-commit-line value)

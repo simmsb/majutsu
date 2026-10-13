@@ -40,10 +40,28 @@
   ((locate-fn :initform (##majutsu-selection-find-section %))
    (targets-fn :initform #'majutsu-revisions-at-point))
   "Selection option for JJ revisions and their visible revision sections.")
+
 (cl-defstruct (majutsu-selection-session
                (:constructor majutsu-selection-session-create))
   buffer
   overlays)
+
+(defun majutsu--transient-with-selection-buffer (fn &rest args)
+  "Call FN with ARGS in the active selection session buffer.
+
+Majutsu transients store their originating buffer in `transient-scope'.
+Running default action suffixes in that buffer keeps repository context,
+`default-directory', and buffer-local selection state consistent even if the
+transient UI or another callback changes the current buffer.  If no Majutsu
+  selection session is active, call FN in the current buffer."
+  (let ((scope (transient-scope)))
+    (if (majutsu-selection-session-p scope)
+        (let ((buffer (majutsu-selection-session-buffer scope)))
+          (unless (buffer-live-p buffer)
+            (user-error "Selection buffer is no longer live"))
+          (with-current-buffer buffer
+            (apply fn args)))
+      (apply fn args))))
 
 (defvar majutsu-selection--overlay-buffers
   (make-hash-table :test 'eq :weakness 'key)
@@ -256,6 +274,35 @@ Exact matches are preferred; otherwise choose the nearest prefix match."
                       session id (car data) locate-fn)))
                  active-ids)))))
 
+(defun majutsu-selection-highlight-tree (root state-function selected-face partial-face)
+  "Highlight selected headings under ROOT and return the created overlays.
+STATE-FUNCTION returns `all', `partial', or nil for each leaf section.
+Parent state is derived from its children, including hidden children.
+The caller owns the overlays and must remove them when selection changes."
+  (let (overlays)
+    (cl-labels
+        ((visit
+           (section)
+           (let* ((children (oref section children))
+                  (states (mapcar #'visit children))
+                  (state (if children
+                             (cond ((cl-every (lambda (s) (eq s 'all)) states)
+                                    'all)
+                                   ((seq-some #'identity states) 'partial))
+                           (funcall state-function section))))
+             (when state
+               (let ((overlay (make-overlay
+                               (oref section start)
+                               (or (oref section content) (oref section end)))))
+                 (overlay-put overlay 'face
+                              (if (eq state 'all) selected-face partial-face))
+                 (overlay-put overlay 'priority '(nil . 50))
+                 (overlay-put overlay 'evaporate t)
+                 (push overlay overlays)))
+             state)))
+      (visit root))
+    overlays))
+
 (defun majutsu-selection-clear (&optional id)
   "Clear selections.
 If ID is non-nil, clear only that selection category."
@@ -324,9 +371,6 @@ If ID is non-nil, clear only that selection category."
       (cond
        ((null value) nil)
        ((listp value) value)
-       ((and (eq (oref obj multi-value) 'repeat)
-             (stringp value))
-        (split-string value crm-separator t))
        (t (list value))))))
 
 (add-hook 'transient-setup-buffer-hook #'majutsu-selection--transient-setup-buffer)

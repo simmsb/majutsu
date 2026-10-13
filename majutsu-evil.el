@@ -30,11 +30,8 @@
 (declare-function evil-normalize-keymaps "evil-core" (&optional state))
 (declare-function evil-insert-state "evil-states" (&optional count vcount skip-hook))
 
-(eval-when-compile
-  ;; Silence byte-compile when Evil isn't installed at build time.
-  (unless (require 'evil nil t)
-    (defun evil-define-key* (&rest _args) nil)
-    (defun evil-set-initial-state (&rest _args) nil)))
+(declare-function evil-define-key* "evil-core" (state keymap key def &rest bindings))
+(declare-function evil-set-initial-state "evil-core" (mode state))
 
 (defgroup majutsu-evil nil
   "Customization group for Majutsu's Evil integration."
@@ -89,7 +86,10 @@ When BEFORE is non-nil, keep the before side."
 (majutsu-evil--bind-conflict-side-keys majutsu-conflict-evil-before-map t)
 
 (defvar-keymap majutsu-conflict-evil-resolve-map
-  :doc "Keymap for JJ conflict actions under Evil.")
+  :doc "Keymap for JJ conflict actions under Evil."
+  "RET" #'majutsu-conflict-keep-current
+  "a" #'majutsu-conflict-keep-all
+  "s" #'majutsu-conflict-restyle)
 
 (majutsu-evil--bind-conflict-side-keys majutsu-conflict-evil-resolve-map nil)
 
@@ -99,7 +99,7 @@ STATES can be a symbol or list.  KEYMAP should be a symbol.
 If KEYMAP is not yet bound, defer binding until it becomes available."
   (declare (indent 2))
   (when (and (featurep 'evil) (fboundp 'evil-define-key*))
-    (let ((states (if (listp states) states (list states))))
+    (let ((states (if (and states (listp states)) states (list states))))
       (cond
        ;; Keymap already available - bind immediately
        ((and (symbolp keymap) (boundp keymap) (keymapp (symbol-value keymap)))
@@ -166,7 +166,7 @@ This mirrors `evil-collection-magit-adjust-section-bindings'."
     (kbd "c") #'majutsu-describe
     (kbd "C") #'majutsu-commit
     (kbd "o") #'majutsu-new
-    (kbd "e") #'majutsu-edit-changeset
+    (kbd "e") #'majutsu-edit
     (kbd "u") #'majutsu-undo
     (kbd "C-r") #'majutsu-redo
     (kbd "a") #'majutsu-absorb
@@ -183,6 +183,7 @@ This mirrors `evil-collection-magit-adjust-section-bindings'."
     (kbd "X") #'majutsu-op-transient
     (kbd "*") #'majutsu-workspace
     (kbd "E") #'majutsu-ediff
+    (kbd "M") #'majutsu-resolve
     (kbd "?") #'majutsu-dispatch
     (kbd ">") #'majutsu-sparse
     (kbd "RET") #'majutsu-visit-thing)
@@ -193,6 +194,10 @@ This mirrors `evil-collection-magit-adjust-section-bindings'."
     (kbd "~") #'majutsu-diff-default-context
     (kbd "g d") #'majutsu-jump-to-diffstat-or-diff
     (kbd "C-<return>") #'majutsu-diff-visit-workspace-file)
+
+  (majutsu-evil--define-keys '(normal visual motion) 'majutsu-resolve-mode-map
+    (kbd "RET") #'majutsu-resolve-visit-file
+    (kbd "?") #'majutsu-resolve-dispatch)
 
   (majutsu-evil--define-keys '(normal visual motion) 'majutsu-evolog-mode-map
     [remap majutsu-visit-thing] #'majutsu-evolog-diff-at-point)
@@ -228,7 +233,7 @@ This mirrors `evil-collection-magit-adjust-section-bindings'."
     (kbd "i") #'majutsu-evil-blob-insert-dwim
     (kbd "q") #'majutsu-bury-or-kill-buffer
     ;; RET visits the revision (edit)
-    (kbd "RET") #'majutsu-edit-changeset)
+    (kbd "RET") #'majutsu-edit)
 
   ;; Editable blob mode mirrors wdired-like finish/abort flow.
   (add-hook 'majutsu-blob-edit-mode-hook #'evil-normalize-keymaps)

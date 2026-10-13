@@ -51,8 +51,10 @@ Majutsu stands on the shoulders of giants. We are grateful to:
 - =magit= 4.4.0 or later (for section management).
 - =consult= 1.0 or later and =plz= 0.9.1 or later (for native Gerrit
   completion).
-- =transient= 0.7.0 or later (popup menus).
+- =transient= 0.13.0 or later (popup menus).
 - =with-editor= (for descriptive message editing).
+- =ghostel= (optional, but required for terminal TUIs such as =jj arrange=
+  and jj's built-in diff editor).
 
 ** Installing from Git
 Majutsu is currently available via GitHub. You can install it using your
@@ -233,10 +235,11 @@ marks the remainder of the buffer as comment. You can customize
 ~global-majutsu-jjdescription-mode~. Jujutsu currently does not support
 changing the comment prefix; the option exists for future compatibility.
 
-Descriptions are also stored in a ring that lives for the duration of the
-Emacs session. Majutsu saves the current description when an edit session
-starts, and again when it finishes or is canceled, so older descriptions can
-be recovered easily.
+Majutsu keeps single-commit descriptions in an in-session ring, recording the
+text when editing starts and when it finishes or is canceled. Recalling a
+message replaces all editable description text, including text separated by
+JJ comments, while preserving comment blocks and the ignored diff preview.
+Single-message history commands are unavailable in bulk-description buffers.
 
 #+attr_reference: :kind command-binding :interface "JJ description buffer" :mode majutsu-jjdescription-mode
 - Key: C-c M-s (majutsu-jjdescription-save-message) ::
@@ -282,12 +285,38 @@ also use ~majutsu-transient-default-action~ (default ~RET~). When a primary
 action has its own command-specific key, the transient displays the command key
 and the default action key on the same row and either key invokes the action.
 
-Some transients support saved defaults. Global defaults follow Transient's
-normal storage; repository-local defaults use jj's secure repo =config-id= as
-the stable project key, so they survive moving the workspace. Where available,
-~W~ saves the current transient arguments as defaults for the current jj
-repository only. This is intended for project-shaped UI policy such as log
-filters, diff format, and Git sync remotes, not for one-off destructive targets.
+Log, Diff, operation log, Git Fetch/Push, and Gerrit Upload support scoped
+defaults. Press ~w~ to open the defaults menu, then ~u~ (user), ~r~
+(repository), or ~w~ (workspace) to save. The corresponding uppercase keys
+~U~, ~R~, and ~W~ clear that layer's override, restoring inheritance.
+~C-g~ returns to the parent menu with its unsaved options intact.
+
+Defaults are resolved as workspace session, workspace saved, repository
+saved, user saved, then built-in defaults. Each layer replaces the entire
+argument list; an explicitly empty list overrides less-specific defaults.
+Existing view arguments may take precedence according to
+~majutsu-prefix-use-buffer-arguments~ and ~majutsu-direct-use-buffer-arguments~,
+but only within the same workspace.
+
+~s~ in view menus (or Transient's ~C-x s~) sets workspace-local defaults for
+the current Emacs session. ~C-x C-s~ saves user defaults; ~C-x C-k~ clears user
+defaults and the current workspace's session override, retaining repository
+and workspace saved overrides. The defaults menu can clear those separately.
+The log menu's ~0~ only clears its current options and buffer, not defaults.
+
+Saving updates the originating view, without executing Push, Fetch, or Upload.
+A more-specific saved override is not deleted when saving a broader layer;
+the save message reports that it still takes precedence. Clearing an override
+also clears the current workspace's session value but leaves existing buffer
+options unchanged. One-off diff ranges, filesets, and command-specific targets
+are not saved.
+
+These are Majutsu UI preferences stored in ~transient-values-file~, not jj
+TOML settings. Repository and workspace keys use jj's secure =config-id= and
+=workspace-config-id= respectively. Additional workspaces share repository
+defaults but have independent workspace defaults. Existing user and repository
+records remain valid. Reading defaults never creates a jj identity; explicitly
+saving a local layer creates one when necessary.
 
 ** Visual Selection System
 For commands like Rebase, Squash, or Absorb, Majutsu uses a visual selection
@@ -342,13 +371,29 @@ custom template DSL that mirrors the =jj log= output but adds interactivity.
 Each revision in the log is a section. The visible anchor line is built from
 fields assigned to the ~heading~ module plus any auxiliary fields assigned to
 the ~tail~ module in ~majutsu-log-commit-columns~ (for example, author and
-timestamp). Graph prefixes and graph-related indentation are rendered as
-display-only prefix decoration rather than real buffer text, so they do not get
-copied accidentally and point does not land on them as editable text. When a
-revision has ~body~ module content (for example, continuation lines from a long
-description), that content forms the foldable section body; its current
-visibility follows the section state instead of being forced closed on every
-refresh.
+timestamp). Graph prefixes, indentation, and inter-record graph lines are
+display-only decoration, so copying text does not include them. Both heading
+and body lines participate in jj's graph rendering. Folding hides the body
+text but preserves its graph-only structure, collapsing consecutive identical
+prefixes without rerunning jj. Empty body lines retain the record's text
+column: missing alignment spaces are restored without adding graph edges.
+Visibility survives refresh. Graph decorations retain jj's colors and styles,
+using the default face for unspecified attributes instead of inheriting
+adjacent revision text's foreground, weight, or highlighting.
+
+The jjosh build includes a separate ~touched-projects~ heading column, for
+example =[appkit, chidu]=. It summarizes changed paths using the loaded
+operation's project layout; it does not change the revision ID or description.
+Empty summaries show no brackets. The upstream jj build omits the column and
+its template definition at compile time.
+Customize ~majutsu-log-template-touched-projects~ in the jjosh build to change
+its template, or remove the column from ~majutsu-log-commit-columns~ to disable
+it. Custom jjosh column lists can add ~(:field touched-projects :module heading
+:template majutsu-log-template-touched-projects :face font-lock-type-face)~.
+
+#+attr_reference: :kind command-binding :interface "Log buffer" :mode majutsu-log-mode :scope Vanilla
+- Key: n (majutsu-goto-next-revision) :: Move to the next revision in display order.
+- Key: p (majutsu-goto-prev-revision) :: Move to the previous revision in display order.
 
 Press =[= to jump to a visible parent and =]= to jump to a visible child. When
 more than one target is visible, completion returns the canonical revision id
@@ -386,40 +431,37 @@ When no explicit value is selected, each command applies its own documented
 fallback.
 
 *** Log Output Protocol (Sequential Markers)
-Majutsu's log parser uses an ordered marker protocol embedded in jj template
-output:
+Rows keep display formatting separate from the metadata used by revision
+actions. Templates supply ordinary field values; the compiler owns framing.
 
-- Entry start: =\x1dS=
-- Tail start: =\x1dT=
-- Body start: =\x1dB=
-- Metadata start: =\x1dM=
-- Entry end: =\x1dE=
+Each record has ordered =\x1dS= (heading), =\x1dT= (tail), =\x1dB= (body),
+=\x1dM= (metadata), and =\x1dE= (end) markers. Fields within a module are
+separated by =\x1e=.
 
-Within each module payload, fields are separated by =\x1e=.
+- *Heading fields* retain jj labels and physical newlines.
+- *Body fields* also retain labels and physical newlines, so jj draws each
+  body's graph. The compiler prefixes each nonblank field with one boundary
+  newline, removed when decoding the field. Empty or whitespace-only fields
+  occupy no body lines; intentional blank lines within other fields survive.
+- *Tail fields* carry logical newlines as =\x1f=; these become newlines again
+  before column postprocessing.
+- *Metadata fields* are JSON strings, decoded without display properties.
+  Their declared template values remain lossless and are the only source of
+  canonical entry fields.
 
-Protocol control bytes are reserved:
+In display fields, literal =\x1d=, =\x1e=, and =\x1f= are rendered as the
+printable escapes =\u001d=, =\u001e=, and =\u001f=. This is intentional display
+normalization, not a lossless control-character round trip. Ordinary quotes,
+backslashes, colors, and multiline headings and bodies remain display text.
 
-- =\x1d= for module markers
-- =\x1e= for field boundaries
-- =\x1f= for encoded logical newlines
-
-Avoid emitting these bytes literally in user templates unless intentionally
-participating in the protocol.
-
-Newline rules:
-
-- *heading module*: may contain real physical newlines.
-- *tail/body/metadata modules*: stay in the trailing payload; encode logical
-  newlines as =\x1f= and decode them in postprocessing.
-
-Parsing is strictly sequential and positional (not key/value based):
-
-1. Detect =\x1dS= and lock the entry indent column.
-2. Collect heading lines until =\x1dT= is found.
-3. Parse =T -> B -> M -> E= payload segments in order on the final heading line
-   (no extra physical line breaks between these module markers).
-4. Keep lines between current entry =E= and next entry =S= attached to the
-   current section heading area (graph continuation lines).
+Parsing requires the declared field counts, valid string metadata, and a
+complete record ending on its last physical line. Invalid records do not
+create actionable sections. Lines between records, including
+=(elided revisions)= and graph connections, are rendered as display-only
+overlays, not buffer text or sections. Cursor movement skips them, and mouse
+clicks on them do not select or toggle a section. They remain visible when
+an adjacent revision is folded, without inheriting its identity. They are
+excluded from text search and copying.
 
 *** ~majutsu-log-commit-columns~
 ~majutsu-log-commit-columns~ is a flat list of column plists.  Each plist
@@ -489,6 +531,11 @@ spec.
 Postprocessors run per column instance, so the same field can appear in
 multiple modules and project to different values. Transport decoding (for
 example, turning =\x1f= back into =\n=) happens before ~:post~ runs.
+
+Body postprocessors must preserve the displayed line count and whether a field
+is empty. Put layout-changing transformations in the template instead: jj must
+see every displayed body line to draw its graph. A violation rejects the row
+with a parser diagnostic rather than attaching incorrect graph prefixes.
 
 When you provide a function or function list in ~:post~, Majutsu appends it
 after the field's default postprocessors.
@@ -700,6 +747,17 @@ Commands:
 - Command: majutsu-find-file-other-frame :: Like ~majutsu-find-file~, but
   display the blob in another frame.
 
+Opening a file resolves its revset once and identifies the blob by workspace,
+full commit ID, and path. Different versions of one change have separate
+buffers. Revision actions, including Restore and Ediff, use the displayed
+commit, not a newer version of the same change.
+
+Explicit refresh resolves the original revset again. Missing files,
+unsupported tree values, and warning-only reads leave the previous contents,
+commit pin, and refresh target intact. Regular files and text file conflicts
+are supported, including empty files; symlinks, submodules, and structural
+conflicts are not blob-editing inputs.
+
 Blob buffers are read-only snapshots with history-aware navigation:
 #+attr_reference: :kind command-binding :interface "Blob buffer" :mode majutsu-blob-mode
 - Key: p / n (majutsu-blob-previous / majutsu-blob-next) :: Jump to the previous
@@ -753,7 +811,7 @@ the annotate-mode keys:
 - Key: gf (majutsu-blob-visit-file) :: Visit the workspace version of the file.
 - Key: gr :: Revert or reload the blob content.
 - Key: q :: Bury the blob buffer.
-- Key: RET (majutsu-edit-changeset) :: Edit the blob's revision.
+- Key: RET (majutsu-edit) :: Edit the blob's revision.
 
 *** Annotate (Blame)
 Majutsu annotate is implemented by =majutsu-annotate= and uses
@@ -858,8 +916,9 @@ commands:
   visit behavior.
 - Command: majutsu-op-diff-transient / majutsu-op-diff :: Compare repository
   changes by operation, =--from=, or =--to= in a sectionized changed commit/ref
-  view.
-  Explicit =--from= / =--to= ranges show lightweight metadata for both endpoint
+  view. The internal summary format disables =ui.log-word-wrap= so line breaks
+  cannot split changed-commit records. Explicit =--from= / =--to= ranges show
+  lightweight metadata for both endpoint
   operations, including their full ids, user, workspace, end time, and
   description. Changed lines keep full commit/change IDs internally. Press =RET=
   or =v= on a changed line to open its evolution log; elsewhere =RET= keeps
@@ -917,7 +976,7 @@ Runs: =jj commit=
 
 ** Editing Changes
 #+attr_reference: :kind command-binding :interface "Majutsu buffer" :mode majutsu-mode
-- Key: e (majutsu-edit-changeset) :: Move the working copy (@) to the revision
+- Key: e (majutsu-edit) :: Move the working copy (@) to the revision
   at point. Supports =--ignore-immutable= for immutable revisions.
 Runs: =jj edit REV=
 
@@ -930,12 +989,18 @@ Transient arguments:
 #+attr_reference: :kind transient-argument :interface "Squash transient"
 - Key: -f :: Source revisions (=--from=).
 - Key: -t :: Destination revision (=--into=).
+- Key: -i :: Open jj's configured diff editor for partial selection.
+- Key: ~=t~ :: Choose jj's diff editor with =--tool=NAME=.
 - Key: -o :: Onto destination.
 - Key: -A / -B :: Insert after or before constraints.
 - Key: -- :: Limit squash to specific filesets.
 - Key: -k :: Keep commits that become empty after squashing.
 - Key: -u :: Use the destination revision's description and discard source
   descriptions (=--use-destination-message=).
+When opened from a log buffer, the source defaults to the selected revision(s)
+at point or in the active region.  This default is retained when =-i= or
+=--tool= starts jj's diff editor.
+
 Runs: =jj squash --from SRC --into DEST [FILESETS...]=
 
 ** Absorbing
@@ -946,8 +1011,22 @@ Transient arguments:
 #+attr_reference: :kind transient-argument :interface "Absorb transient"
 - Key: -f :: Source revision (=--from=, default =@=).
 - Key: -t :: Destination revset filters (=--into=, repeatable, default =mutable()=).
+- Key: -i :: Open jj's configured diff editor for partial selection.
+- Key: ~=t~ :: Choose jj's diff editor with =--tool=NAME= (implies interactive).
 - Key: -- :: Limit absorb to specific filesets.
 Runs: =jj absorb --from REV --into REVSETS... [FILESETS...]=
+
+From a single-revision Diff buffer, use ~H~ to select a hunk, ~F~ for a file
+or directory, and ~R~ for a region within a hunk; ~C~ clears these selections.
+Press ~a~ or ~RET~ to absorb the selection using Majutsu's patch tool, without
+enabling =-i=.  The selection can span files; opening the transient at a file
+does not narrow it to that file.  Existing diff fileset limits still apply.
+
+Only selected changes are considered for absorption.  jj assigns them to the
+closest eligible ancestors, restricted by =--into=.  Unselected changes and
+changes jj cannot assign remain in the source revision.  Explicit =-i= or
+=--tool= requests instead use jj's diff editor, as described under
+[[#interactive-patching][Interactive Patching]].
 
 ** Rebasing
 #+attr_reference: :kind command-binding :interface "Majutsu buffer" :mode majutsu-mode
@@ -1008,10 +1087,15 @@ Transient arguments:
 #+attr_reference: :kind transient-argument :interface "Split transient"
 - Key: -r :: Specify the revision to split.
 - Key: -o :: Specify the destination (=--onto=).
+- Key: -i :: Open jj's configured diff editor for partial selection.
+- Key: ~=t~ :: Choose jj's diff editor with =--tool=NAME=.
 - Key: -A / -B :: Insert after or before constraints.
 - Key: -m :: Set a message for the first part.
 - Key: -p :: Parallel split mode.
 - Key: -- :: Limit split to selected files or filesets.
+When opened from a log buffer, =-r= defaults to the revision at point before
+the jj diff editor is started.
+
 Runs: =jj split -r REV [FILESETS...]=
 
 ** Restoring
@@ -1022,9 +1106,14 @@ Transient arguments:
 #+attr_reference: :kind transient-argument :interface "Restore transient"
 - Key: -f :: Restore from a specific revision (=--from=).
 - Key: -t :: Restore to a specific revision (=--to=).
+- Key: -i :: Open jj's configured diff editor for partial selection.
+- Key: ~=t~ :: Choose jj's diff editor with =--tool=NAME=.
 - Key: -c :: Undo changes introduced by a revision (=--changes-in=).
-- Key: -d :: Restore descendants as well.
+- Key: -d :: Preserve descendant content while rebasing (=--restore-descendants=).
 - Key: -- :: Limit restore to selected files or filesets.
+When opened from a log buffer, =-c= defaults to the revision at point before
+the jj diff editor is started.
+
 Runs: =jj restore --from REV [FILESETS...]= or
 =jj restore --changes-in REV [FILESETS...]=
 
@@ -1063,45 +1152,77 @@ Notes:
 - Pattern completion includes current directories/files from =@=.
 - Default "all files" state is represented by single pattern =.=.
 
+** File Trees
+:PROPERTIES:
+:CUSTOM_ID: file-trees
+:END:
+Diffstats and the log buffer's =Unresolved Conflicts= section use collapsible
+directory trees. Single-directory chains are compacted; ~TAB~ folds or unfolds
+a directory. File sections retain their complete repository-relative paths
+for navigation and actions, independently of their displayed names.
+
+The conflict tree lists the working copy's actual conflicts and their side
+counts, including conflicts inherited by merges with an empty changes-in diff.
+Directory headings group files; they do not choose a conflict resolution.
+Control characters in directory and file labels are escaped to keep headings
+on one line without changing the underlying paths.
+
 ** Interactive Patching
 :PROPERTIES:
 :CUSTOM_ID: interactive-patching
 :END:
 Majutsu provides transient-scoped partial patch selection for Jujutsu
 operations. This allows you to select specific hunks, files, or even regions
-within hunks to include in Split, Squash, or Restore operations.  The selection
-overlays belong to the current transient session and are cleared when that
-session ends; they are not a persistent staging area.
+within hunks to include in Split, Squash, Absorb, or Restore operations.  The
+selection overlays belong to the current transient session and are cleared
+when that session ends; they are not a persistent staging area.
 
 *** How It Works
-Interactive selection is integrated into the Split (~S~), Squash (~s~), and
-Restore (~R~) transients. When you open one of these transients from a Diff
-buffer, a "Patch Selection" group appears with the following commands:
+Interactive selection is integrated into the Split (~S~), Squash (~s~),
+Absorb (~a~), and Restore (~R~) transients. When you open one of these
+transients from a compatible Diff buffer, a "Patch Selection" group appears
+with the following commands:
 
 | Key | Command                           | Description                                                     |
 |-----+-----------------------------------+-----------------------------------------------------------------|
 | ~H~   | majutsu-interactive-toggle-hunk   | Toggle selection of hunk at point                               |
-| ~F~   | majutsu-interactive-toggle-file   | Toggle all file hunks or a whole-file change with no text hunks |
+| ~F~   | majutsu-interactive-toggle-file   | Toggle all changes in a file or diffstat directory              |
 | ~R~   | majutsu-interactive-toggle-region | Toggle selection of active region                               |
 | ~C~   | majutsu-interactive-clear         | Clear all patch selections                                      |
 
-The =-i= argument is a separate, jj-native workflow.  When no H/F/R patch
-selection is active, Majutsu forwards =--interactive= (and Split/Squash's
-=--tool= argument) to jj; =--interactive= therefore uses the user's configured
-=ui.diff-editor=.  Majutsu does not silently replace that editor with Ediff.
-The H/F/R workflow instead supplies Majutsu's own temporary patch tool when the
-operation is executed.
+Renames appear under the destination directory.  The source path is in the
+file section's body, collapsed by default.  ~TAB~ toggles these details without
+widening the statistics column.  On a directory, ~F~ selects all descendant
+file changes, including hidden files.  A partially selected directory becomes
+fully selected; a fully selected one is cleared.  Files outside that directory
+are unaffected.
+
+The =-i= and =--tool= arguments are a separate, jj-native workflow.  Explicit
+editor requests take precedence over H/F/R selections and use jj's configured
+=ui.diff-editor= or the named tool.  Majutsu does not silently replace that
+editor with Ediff.  The H/F/R workflow instead supplies Majutsu's own temporary
+patch tool when the operation is executed without an explicit editor request.
 
 *** Diff Context Inheritance
-When opening Split, Squash, or Restore from a Diff buffer, each transient maps
-the compatible part of the diff context to its own command:
-- Split converts a single =--revisions= source to =--revision=.
-- Squash converts =--revisions= sources to repeatable =--from= arguments.
-- Restore converts =--revisions= to =--changes-in= and also inherits explicit
-  =--from= / =--to= ranges.
+When opening Split, Squash, Absorb, or Restore from a Diff buffer, each
+transient maps the compatible part of the diff context to its own command:
+- Split inherits exactly one resolvable =--revisions= source as =--revision=; it
+  never passes a diff's arbitrary =--from= / =--to= range to =jj split=.
+- Squash turns =--revisions= into =--from= sources and retains those sources
+  when you choose an explicit destination. An arbitrary =--from= / =--to= tree
+  diff is not treated as a Squash source.
+- Absorb uses =--revisions= as =--from=.  Patch selection requires a single
+  source commit and refuses a different =--from= or an aggregate diff.
+- Restore turns exactly one resolvable =--revisions= source into
+  =--changes-in= and inherits explicit =--from= / =--to= endpoints. An
+  aggregate revision diff is not inferred as a Restore operation; choose an
+  explicit Restore context before using either Majutsu patch selection or
+  jj's own diff editor.
 
-Use a revision diff for Split or Squash. An arbitrary =--from= / =--to= range
-is meaningful as inherited context only for Restore.
+Use a single-revision diff for Split or Absorb patch selection. Squash also
+requires a single revision for patch selection, but can pass a source range
+to jj's editor. An arbitrary =--from= / =--to= range is a compatible patch
+context only for Restore.
 
 This means you can:
 1. View a diff with specific =--from= / =--to= revisions
@@ -1115,9 +1236,89 @@ face (green background by default). Selected regions within hunks use the
 =majutsu-interactive-selected-region= face (purple background). Selected file
 changes with no text hunks use the
 =majutsu-interactive-selected-file= face.
+The diffstat mirrors these selections: fully selected files and directory
+headings use =majutsu-interactive-selected-file=; partial selections use
+=majutsu-interactive-partially-selected-file=.  Directory state is derived from
+its descendant files, not stored separately.
+
+*** jj Diff Editors and Terminal Hosts
+Majutsu patch selection and jj's own diff-editor selection are separate
+workflows.  The =-i= / =--interactive= and =--tool=NAME= infixes start jj's
+configured diff editor without replacing it with Majutsu's patch helper.  This
+uses =--tool= exactly as jj defines it; =-t= remains a destination option for
+Squash, Absorb, and Restore, not a tool abbreviation.
+
+If an Emacs patch selection is active and you explicitly request a jj editor,
+the jj editor wins and the Emacs selection is retained.  With no explicit jj
+editor flag, =RET= applies the active Majutsu patch selection as before.  A
+selection is retained when an editor ends without changing the repository,
+including an unchanged failure.  Each selection is bound to the operation id,
+source context, and generation of the rendered diff.  A changed or unverifiable
+repository state invalidates selections in every diff buffer for that
+workspace before refresh, so raw positions cannot be applied to another tree.
+Patch execution also replaces validated dynamic source/default revsets with
+their canonical commit ids before jj starts, closing the gap between validation
+and command execution.
+
+The default jj editor, =:builtin=, is a terminal TUI.  Customize
+=majutsu-diff-editor-host= to choose how Majutsu hosts it:
+
+- =auto= (the default) uses Ghostel when available.  Local commands which may
+  open a later description editor also need a working =emacsclient=; Absorb
+  and Restore do not.  Ghostel-supported TRAMP sessions use with-editor's
+  remote sleeping-editor bridge instead.
+- =ghostel= requires Ghostel and supports jj's built-in TUI and external
+  terminal editors.
+- =process= is for external non-terminal tools only; Majutsu rejects
+  =:builtin= rather than trying to render it in a process buffer.
+
+Ghostel is optional.  A local Split or Squash session needs a working
+=emacsclient= only when its arguments can lead to a description editor;
+explicit message options avoid that phase unless =--editor= is also set.
+Absorb and Restore have no description-editing phase.  On a Ghostel-supported
+POSIX TRAMP remote, Ghostel starts a remote PTY and with-editor uses its sleeping-editor
+protocol, so no local =emacsclient= is needed.  Majutsu associates jj's remote
+temporary description file with its workspace before it is visited, keeping
+description-buffer commands in the right workspace.  A =WITH-EDITOR= control
+line may remain visible in the Ghostel transcript.
+
+Ghostel's remote PTY path needs a POSIX remote reachable by a supported TRAMP
+method; Windows remotes are not supported.  The ordinary external-editor
+fallback is used when Ghostel is unavailable, or locally when no usable
+=emacsclient= is configured.
+
+*** Native Arrange TUI
+~majutsu-arrange-tui~ hosts jj's own full-screen =arrange= command in Ghostel.
+It is available from the top-level dispatcher with =? A= or directly with
+=M-x majutsu-arrange-tui=.  The direct =A= binding in a log buffer remains
+~majutsu-new-with-after~; Arrange's =A= belongs to the dispatcher.
+
+With no prefix argument, Majutsu runs exactly =jj arrange= and leaves target
+selection to jj's =revsets.arrange= configuration.  With a prefix argument,
+Majutsu prompts for one revset.  Lisp callers may pass several revsets, which
+remain separate positional arguments and are combined by jj.
+
+Arrange is not a diff-editor session: it has no =-i=, =--tool=, or
+description-editor phase.  It always requires a PTY, so Majutsu requires
+Ghostel and never falls back to the ordinary process buffer or installs
+=JJ_EDITOR=.  Local repositories and Ghostel-supported POSIX TRAMP repositories
+use the same terminal-session lifecycle.
+
+Majutsu compares jj operation ids after every exit, including =q= cancellation,
+startup errors, and no-op confirmation.  This is necessary because jj may
+snapshot the working copy while starting Arrange even when no arrange plan is
+confirmed.  A changed or unreadable operation invalidates stale patch
+selections before refreshing the originating Majutsu buffer; an unchanged
+operation preserves them.  The Ghostel transcript remains available after the
+TUI exits.
 
 *** Selection Semantics
 The meaning of "selected" differs by operation:
+
+A Majutsu patch selection belongs to the Split, Squash, Absorb, or Restore
+transient where it was first made.  It cannot silently be reused by a different command:
+clear it first.  Explicit jj editor requests are independent and do not inspect
+or consume that selection.
 
 **** Split and Squash
 For Split and Squash, *selected content is what gets moved*:
@@ -1133,6 +1334,12 @@ squash only the changes to file A into the parent:
 2. Open Squash transient (~s~)
 3. Press ~F~ on file A to select all its hunks
 4. Execute squash - file A's changes go to parent, B and C stay
+
+**** Absorb
+For Absorb, selected hunks/regions are candidates for jj's automatic
+assignment to ancestors.  Unlike Squash, =--into= filters eligible ancestors
+rather than choosing one destination for the entire patch.  Unselected
+changes and selected changes jj cannot absorb remain in the source revision.
 
 **** Restore
 For Restore, selected content is what gets *restored* (undone):
@@ -1150,15 +1357,21 @@ operation with selections:
    hunks and whole-file changes.  Hunkless whole-file changes are represented
    by structured jj metadata rather than inferred from rendered Git headers.
 
-2. *Tool Invocation*: Jujutsu's =-i --tool= mechanism is used with a custom
-   =majutsu-applypatch= tool.
+2. *Tool Invocation*: On the Majutsu patch-selection path, Jujutsu's
+   =-i --tool= mechanism is used with a custom =majutsu-applypatch= tool.
+   An explicitly requested user =--tool= instead takes the jj diff-editor path
+   described above.
 
    Each operation stores its patch file and helper script in a separate
    temporary directory, so overlapping asynchronous operations do not share
    input files.
+   Patch replay, terminal editor sessions, and blob saves reserve the same
+   workspace writer slot. A second managed writer is rejected until the
+   current session completes or is cancelled; read-only commands are not
+   locked.
 
 3. *Patch Application*:
-  - For *Split/Squash*: The tool resets =$right= (current state) to =$left=
+  - For *Split/Squash/Absorb*: The tool resets =$right= (current state) to =$left=
     (parent state), then applies the patch forward. This results in =$right=
     containing only the selected changes.
    - For *Restore*: =$right= starts at the source state.  The tool applies the
@@ -1191,9 +1404,15 @@ hunkless whole-file selection, which handles file changes that have no text
 hunks.
 
 **** Renamed/Copied Files
-Renamed and copied files are handled correctly:
-- Text-hunk patches preserve rename/copy information
-- You can select specific hunks within renamed files just like regular modifications
+Text-hunk patches preserve rename/copy information, and hunks within renamed
+files can be selected like regular modifications. Executable-bit changes are
+independent of content when the resulting file exists.
+
+For a rename, a mode-only selection applies to the surviving original path.
+For a copy, the target's mode change must not be applied to the source file.
+Majutsu therefore rejects a replay that would keep the copy's mode change
+without its destination. Select the copy itself when moving its mode change;
+when restoring the copy's creation, include its mode change as well.
 
 **** Changes Without Text Hunks
 In a Git-format diff buffer, Split, Squash, and Restore can select a file
@@ -1207,7 +1426,7 @@ so the selected file change is restored as a unit.
 *** Workflow Example
 1. Open a diff with ~D~ or ~d~
 2. Open Split (~S~), Squash (~s~), or Restore (~R~) transient
-3. Use ~H~ to select individual hunks, or ~F~ to select all hunks in a file
+3. Use ~H~ to select individual hunks, or ~F~ to select a file or diffstat directory
 4. For fine-grained control, mark a region and press ~R~ to select only those lines
 5. Press ~C~ to clear selections if needed
 6. Execute the operation - only selected changes will be affected
@@ -1215,7 +1434,8 @@ so the selected file change is restored as a unit.
 *** Customization
 - Face: majutsu-interactive-selected-hunk :: Face for selected hunks.
 - Face: majutsu-interactive-selected-region :: Face for selected regions.
-- Face: majutsu-interactive-selected-file :: Face for selected file changes with no text hunks.
+- Face: majutsu-interactive-selected-file :: Face for whole-file changes and fully selected diffstat entries.
+- Face: majutsu-interactive-partially-selected-file :: Face for partially selected diffstat files and directories.
 
 ** Metaediting
 #+attr_reference: :kind command-binding :interface "Majutsu dispatcher"
@@ -1276,20 +1496,86 @@ Runs: =jj simplify-parents [--source REVSET] [--revision REVSET]=
 JJ marks conflicts in the log with a "conflict" label. Expanding the revision
 shows each exact conflicted path together with its conflict side count.
 
+** Text Conflict Workbench
+#+attr_reference: :kind command-binding :interface "Majutsu dispatcher"
+- Key: ? M (majutsu-resolve) :: Open a directory-tree workbench for the revision
+  at point, or =@=. Evil users can press ~M~ directly. With a prefix argument,
+  choose a revision explicitly.
+
+The workbench pins an exact commit, including historical revisions and
+inherited multi-sided conflicts with no changes-in diff. The main view keeps
+the revision identity and conflict tree, without a permanent command legend.
+File headings distinguish jj's conflict state from pending or applied drafts;
+unopened and unchanged drafts need no extra label. Refresh never redirects the
+pin or overwrites drafts.
+
+Each file expands into its parsed conflict blocks. Within a block, the tree
+preserves jj's snapshot/change grouping rather than listing positive and
+negative terms as independent versions. A Change contains Before (-) and
+After (+) snapshots; jj diff markers also supply the native diff. Snapshot
+and Change previews start folded; ~TAB~ expands them. Side numbers match
+conflict-mode side selection, not necessarily commit parents. Inspecting
+the tree does not create a draft.
+
+#+attr_reference: :kind command-binding :interface "Conflict workbench" :mode majutsu-resolve-mode
+- Key: ? (majutsu-resolve-dispatch) :: Show workbench actions on demand, in both
+  Emacs and Evil. ~a~ applies and ~k~ discards the current file or directory;
+  ~A~ and ~K~ act on all drafts. Discard still asks for confirmation.
+  ~g~ refreshes the workbench, and ~m~ opens the general Majutsu dispatcher.
+- Key: RET (majutsu-resolve-visit-file) :: Open the file's private UTF-8 draft
+  in its usual major mode with =majutsu-conflict-mode= enabled. On a conflict
+  or term, jump to its marker; a Change jumps to its After term. If the draft
+  changed since parsing, refresh the tree and ask for a new selection instead
+  of following stale positions.
+- Key: C-c C-c (majutsu-resolve-apply) :: Apply pending drafts in the current
+  file or directory, including folded descendants. In a draft editor, apply
+  that file. On a conflict or term, the scope is the entire containing file,
+  not a single side or block. A prefix argument applies all pending drafts.
+- Key: C-c C-k (majutsu-resolve-discard) :: Discard pending drafts in scope;
+  a prefix argument discards all. A conflict or term selects its containing
+  file. This never undoes an existing jj operation.
+- Key: C-c C-n (majutsu-resolve-next-file) :: Visit the next file that jj still
+  reports as conflicted.
+
+The draft editor's header identifies its private path. ~C-c ?~ opens the same
+action menu without taking over the ~?~ character in editable text.
+~C-x C-s~ saves only the private draft, not the repository.
+~C-c C-o~ returns to the workbench and refreshes its tree, including unsaved
+edits. Ordinary workbench refresh also reparses drafts. Closing a draft editor
+retains its text while the workbench lives; killing the workbench with ~C-x k~
+confirms pending changes and removes its private files. This is not a persistent
+session store.
+
+Applying rewrites the fixed commit once and verifies the resulting revision,
+file contents, and remaining conflicts. A hidden target, unsaved real workspace
+buffer, or unverified result prevents further unsafe writes. After an unverified
+apply, inspect jj's result, preserve any wanted draft text, then kill the
+workbench and open the desired revision again; ~q~ only buries the buffer.
+
+Only existing UTF-8 text-marker files are editable here. Binary/invalid UTF-8
+and non-text structural conflicts are refused. Empty text creates an empty
+file, not a deletion. Choosing an entire file side, deletion, renaming, and
+new paths are not supported. Marker-only changes that jj does not store are
+conservatively reported as unverified. Existing Ediff and direct-file workflows
+remain available.
+
 ** Entering Conflict Mode
 You can enter conflict handling from multiple places:
 #+attr_reference: :kind command-binding :interface "Ediff transient"
 - Key: m in the Ediff transient (majutsu-ediff-resolve) :: Use the automatic
   resolve strategy.
 - Key: M in the Ediff transient (majutsu-ediff-resolve-with-conflict) :: Force
-  the conflict workflow. This opens the working-copy file (or a revision blob
-  buffer for non-working-copy revisions), enables =majutsu-conflict-mode=, and
-  jumps to the first conflict.
-- Command: majutsu-conflict-ensure-mode :: Enable conflict handling in a file with conflict markers.
+  the conflict workflow. This opens the working-copy file, or an editable
+  revision blob for a non-working-copy revision, enables
+  =majutsu-conflict-mode=, and jumps to the first conflict. Saving an editable
+  blob applies the resolution to that revision.
+- Command: majutsu-conflict-ensure-mode :: Enable conflict handling in a file
+  with conflict markers.
 
 =majutsu-conflict= auto-detects marker styles:
 - JJ conflict markers (=%%%%%%%= / =+++++++= / =-------= ) -> enable
-  =majutsu-conflict-mode=.
+  =majutsu-conflict-mode=. All jj layouts are recognized, including the
+  snapshot-first rendering of =ui.conflict-marker-style "diff-experimental"=.
 - JJ long conflict markers (e.g., 15-char marker runs) are treated the same as
   normal markers.
 - JJ conflicts with missing terminating newline markers are parsed with jj's
@@ -1298,29 +1584,62 @@ You can enter conflict handling from multiple places:
 
 ** majutsu-conflict-mode Commands
 #+attr_keymap: :scope Vanilla
-Vanilla bindings use the prefix ~C-c ^~:
+Emacs bindings use the prefix ~C-c ^~:
 #+attr_keymap: :scope Vanilla
 #+attr_reference: :kind command-binding :interface "Conflict buffer" :mode majutsu-conflict-mode :scope Vanilla :prefix "C-c ^"
-- Key: n / p (majutsu-conflict-next / majutsu-conflict-prev) :: Jump to the next
-  or previous conflict.
-- Key: b (majutsu-conflict-keep-base) :: Keep the conflict base (snapshot /
-  rebase destination section).
-- Key: 1..9 (majutsu-conflict-keep-side) :: Keep side N (the "after" side in JJ
-  diff blocks).
-- Key: M-1..M-9 (majutsu-conflict-keep-side) :: Keep side N's "before" variant.
+- Key: n / p (majutsu-conflict-next / majutsu-conflict-prev) :: Jump to the
+  next or previous conflict.
+- Key: RET (majutsu-conflict-keep-current) :: Keep the term at point, side or
+  base.
+- Key: b (majutsu-conflict-keep-base) :: Keep the conflict base (the merge
+  ancestor: jj's first =-------= / "diff from" term).
+- Key: a (majutsu-conflict-keep-all) :: Concatenate every complete side
+  snapshot in side order. Shared context is duplicated; conflicts with a
+  nonempty base require confirmation.
+- Key: s (majutsu-conflict-restyle) :: Re-render the conflict with different
+  markers (diff -> snapshot, and snapshot <-> git for 2-sided conflicts). jj
+  detects the marker style per conflict when parsing, so this only changes the
+  presentation.
+- Key: 1..9 (majutsu-conflict-keep-side) :: Keep side N, matching jj's "side
+  #N" labels.
+- Key: M-1..M-9 (majutsu-conflict-keep-side) :: Keep base N (bases in
+  materialization order; they are not paired with side numbers).
 - Key: R (majutsu-conflict-refine) :: Refine conflict regions with word-level
   highlighting.
 
 #+attr_keymap: :scope Evil
-Evil bindings are available in Normal state:
+Evil bindings are available in normal state:
 #+attr_keymap: :scope Evil
 #+attr_reference: :kind command-binding :interface "Conflict buffer" :mode majutsu-conflict-mode :scope Evil :state Normal
 - Key: ]] / gj (majutsu-conflict-next) :: Jump to the next conflict.
 - Key: [[ / gk (majutsu-conflict-prev) :: Jump to the previous conflict.
-- Key: gb (majutsu-conflict-keep-base) :: Keep the base.
-- Key: gr 1..9 (majutsu-conflict-keep-side) :: Keep side N (the "after" side).
-- Key: gR 1..9 (majutsu-conflict-keep-side) :: Keep side N's "before" variant.
+- Key: gb (majutsu-conflict-keep-base) :: Keep the base (the merge ancestor).
+- Key: gr RET (majutsu-conflict-keep-current) :: Keep the term at point.
+- Key: gr a (majutsu-conflict-keep-all) :: Concatenate all complete side
+  snapshots, confirming when the base is nonempty.
+- Key: gr s (majutsu-conflict-restyle) :: Re-render with different markers.
+- Key: gr 1..9 (majutsu-conflict-keep-side) :: Keep side N.
+- Key: gR 1..9 (majutsu-conflict-keep-side) :: Keep base N.
 - Key: ge (majutsu-conflict-refine) :: Refine the conflict.
+
+*** Highlighting and Context Help
+Conflict regions are highlighted like smerge-mode, generalized to
+n-sided conflicts:
+- Each side snapshot gets a distinct background face, cycling through
+  ~majutsu-conflict-side-faces~ (=majutsu-conflict-side-1-face= inherits
+  =smerge-upper=, =side-2= inherits =smerge-lower=).
+- Base snapshots use =majutsu-conflict-base-face= (inherits =smerge-base=).
+- Git-style (diff3) regions in mixed buffers (for example produced by
+  ~majutsu-conflict-restyle~) are colored the same way. Buffers that contain
+  only git-style conflicts are still handed to =smerge-mode= by
+  ~majutsu-conflict-ensure-mode~; the two modes stay mutually exclusive.
+- Eldoc describes the term at point ("jj conflict side 2/3: ...").
+- =mouse-3= on a conflict pops up a resolution menu listing every side and
+  base with its revision label. With =context-menu-mode= enabled, the entries
+  join the standard context menu instead of replacing it.
+- User Option: majutsu-conflict-auto-leave :: When non-nil (the default),
+  resolving the last conflict in the buffer turns off
+  =majutsu-conflict-mode=; undo re-enables it.
 
 * Bookmarks
 :PROPERTIES:
@@ -1345,11 +1664,19 @@ show =No bookmarks=.  On a remote heading, =r= opens remote management,
 when empty.  Git's special =@git= references appear separately under
 =Git tracking bookmarks= when present.
 
-Remote rows show their tracking state.  For tracked bookmarks, =synced=
-means there are no commits ahead or behind the local bookmark; =+N/-N=
-counts are relative to the local bookmark, from the remote's perspective.
-Deleted local bookmarks remain visible, and their tracked remote rows say
-=local deleted=.  Conflict targets appear beneath their own bookmark.
+Remote rows show their relationship immediately after the bookmark name,
+before revision descriptions:
+- =≡= means the tracked reference is synchronized with the local bookmark.
+- =○= means the reference is not tracked.
+- =↑N= counts commits only in the local bookmark; =↓N= counts commits only
+  in the remote reference.  Zero counts are omitted.  A lower bound is
+  shown as =↑≥N= or =↓≥N= rather than an exact count.
+- =× local= means the tracked local bookmark has been deleted while the
+  remote reference remains.  The deleted local bookmark stays visible too.
+
+Synchronized and untracked states use a muted color; local-only and
+remote-only counts use distinct colors.  Hover over a remote row for the
+symbol legend.  Conflict targets appear beneath their own bookmark.
 Sections initially open and retain their folding state on refresh.
 
 ** Embark Actions
@@ -1358,13 +1685,14 @@ completion candidates.  No additional Majutsu key binding is installed;
 use your configured Embark key in either Emacs or Evil.
 
 Local bookmarks offer inspect, edit, move, rename, delete and forget actions.
-Remote bookmarks offer inspection and exactly scoped tracking actions: =t=
-tracks an untracked reference and =u= untracks a tracked reference.  The
-special =@git= records offer revision inspection without local bookmark
-mutation actions.  Conflict children target their own commit, not their
-parent bookmark.  Remote headings offer fetch, rename and remove, including
-remotes with no bookmarks.  Copying remains available through Embark's
-standard actions.
+Remote bookmarks offer inspection, exactly scoped tracking, and forget: =t=
+tracks an untracked reference, =u= untracks a tracked reference, and =f=
+forgets that remote bookmark until the next fetch.  The special =@git=
+records offer revision inspection and forget, without local bookmark mutation
+actions such as rename or delete.  Conflict children target their own commit,
+not their parent bookmark.  Remote headings offer fetch, rename and remove,
+including remotes with no bookmarks.  Copying remains available through
+Embark's standard actions.
 
 The default bookmark/revision action shows its diff; =e= explicitly edits the
 working copy.  Commands such as move may still prompt for their remaining
@@ -1395,10 +1723,19 @@ Transient actions:
 - Key: d (majutsu-bookmark-delete) :: Delete a bookmark locally and record the
   deletion for propagation on a later push; this command does not contact a
   remote itself.
-- Key: f (majutsu-bookmark-forget) :: Forget a bookmark locally without
-  affecting remotes.
+- Key: f (majutsu-bookmark-forget) :: Forget a bookmark without recording a
+  deletion to push. A local name untracks corresponding remotes. In the
+  jjosh build, an exact =NAME@REMOTE= forgets that remote bookmark until the
+  next fetch, without forgetting the local bookmark. Git-tracking =NAME@git=
+  is also supported in that build; its recreation depends on Git
+  import/export and colocation.
 - Key: t (majutsu-bookmark-track) :: Track a remote bookmark to create a local one.
 - Key: u (majutsu-bookmark-untrack) :: Untrack a remote bookmark.
+
+Remote forget is not an upstream jj capability. Only the jjosh build includes
+remote refs in Forget completion, the remote Embark =f= action, and
+~majutsu-bookmark-forget-ref~. The upstream build does not define that command.
+Local Forget remains available in both builds.
 
 Bookmark lists nest tracked remote bookmarks under their local bookmark.
 When a bookmark target is conflicted, its removed and added targets appear as
@@ -1652,11 +1989,12 @@ newlines or other control characters are preserved as complete values.
 
 ** Confirmation Settings
 - User Option: majutsu-confirm-critical-actions :: If non-nil, prompt for
-  confirmation before critical operations like abandon, undo, redo, rebase.
+  confirmation before critical operations like abandon, undo, redo, rebase, and
+  a bare restore of the whole working copy.
 - User Option: majutsu-no-confirm :: A list of symbols for actions Majutsu
   should not confirm, or =t= to never confirm. Valid symbols: =undo=, =redo=,
   =abandon=, =bookmark-delete=, =tag-delete=, =git-remote-remove=, =rebase=,
-  =workspace-forget=, and =workspace-trash=.
+  =restore=, =workspace-forget=, and =workspace-trash=.
 - User Option: majutsu-slow-confirm :: A list from the same action set that
   should use =yes-or-no-p= instead of =y-or-n-p=, or =t= for all of them.
 
@@ -1751,6 +2089,69 @@ When Evil integration is enabled, the dispatcher displays and accepts the same
 Evil-facing top-level keys used in Majutsu buffers, including =x=, =L=, =_=,
 =*=, =u=, =C-r=, and =`=. The global Evil =v= binding remains Visual state;
 open evolog from the dispatcher with =? v=.
+
+** jjosh Extensions
+Majutsu has two fixed build variants: upstream ~jj~ (the default) and ~jjosh~.
+The build parameter decides which code is included; the executable's name,
+version, and capabilities do not select or change the variant at runtime.
+
+*** Building a variant
+Compile Majutsu directly with your Emacs package manager or build system; no
+package-specific make step is required. Set ~MAJUTSU_BACKEND~ to ~jj~ or
+~jjosh~ in the compiler environment before any Majutsu library is loaded.
+An unset value selects upstream ~jj~; invalid values are rejected. Use the
+same setting for byte and native compilation.
+
+The builder owns dependency ~load-path~ entries and output directories.
+Keep generated files outside the source checkout and separate the variants.
+For a direct byte-compilation invocation, start a fresh Emacs process in a
+clean, builder-owned staging directory containing the Majutsu sources. With
+dependencies installed through package.el:
+#+begin_src sh
+MAJUTSU_BACKEND=jjosh emacs -Q --batch \
+  --eval '(package-initialize)' \
+  -L . -l majutsu-jjosh.el -f batch-byte-compile majutsu*.el
+#+end_src
+
+Use ~MAJUTSU_BACKEND=jj~ for the upstream variant. For dependencies supplied
+by another build system, replace ~package-initialize~ with its dependency
+~load-path~ setup. Put only the selected build directory on the runtime
+~load-path~, ahead of the source checkout or an installed copy.
+For source-only development, set ~MAJUTSU_BACKEND~ before the first Majutsu
+load.
+
+~majutsu-build-backend~ records the selected variant in bytecode. It is not a
+runtime customization option: changing the environment or setting the variable
+after compilation does not change the generated code. Rebuild the entire
+package and restart Emacs when switching variants; do not mix their libraries.
+
+Executable paths remain separate configuration:
+~majutsu-jj-executable~ selects the local program and
+~majutsu-remote-jj-executable~ selects the program on remote hosts. One build
+applies to both. The jjosh build requires executables implementing its jjosh
+extensions, including ~touched_projects()~ and remote bookmark forget; there is
+no older-version fallback or automatic capability probing. The upstream build
+can use a jjosh executable, but still exposes only upstream functionality.
+
+*** Marking fork-specific code
+Wrap jjosh-specific definitions or expressions in ~majutsu-jjosh~:
+#+begin_src emacs-lisp
+(majutsu-jjosh
+  (keymap-set majutsu-embark-git-bookmark-map "f"
+              #'majutsu-bookmark-forget-ref))
+#+end_src
+
+The macro expands to a ~progn~ containing its body in the jjosh build and to
+~nil~ in the upstream build. It works for commands, parameters, UI bindings,
+templates, and ordinary expressions; it is not part of the template DSL.
+Conditional expressions can use ~(if (majutsu-jjosh t) FORK COMMON)~: the
+byte compiler eliminates the unused branch. Lists such as the default log
+columns use ~eval-when-compile~ and splice optional declarations into a constant
+layout, keeping the transport template and parser schema aligned.
+
+No runtime backend checks, subprocess probes, binary timestamp checks, or
+capability caches are generated. The upstream build omits the project column
+and remote Forget command/action rather than defining disabled placeholders.
 
 * Template DSL
 :PROPERTIES:

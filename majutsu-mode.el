@@ -78,7 +78,7 @@ afterward."
   "S"   'majutsu-split
   "d"   'majutsu-diff
   "v"   'majutsu-evolog
-  "e"   'majutsu-edit-changeset
+  "e"   'majutsu-edit
   "r"   'majutsu-rebase
   "V"   'majutsu-revert
   "b"   'majutsu-bookmark
@@ -91,26 +91,7 @@ afterward."
   ">"   'majutsu-sparse
   "C-/" 'majutsu-undo
   "C-?" 'majutsu-redo
-  "R"   'majutsu-restore
-  "<remap> <magit-section-show>" #'majutsu-section-show
-  "<remap> <magit-section-hide>" #'majutsu-section-hide
-  "<remap> <magit-section-toggle>" #'majutsu-section-toggle
-  "<remap> <magit-section-toggle-children>" #'majutsu-section-toggle-children
-  "<remap> <magit-section-show-children>" #'majutsu-section-show-children
-  "<remap> <magit-section-hide-children>" #'majutsu-section-hide-children
-  "<remap> <magit-section-show-headings>" #'majutsu-section-show-headings
-  "<remap> <magit-section-cycle>" #'majutsu-section-cycle
-  "<remap> <magit-section-cycle-global>" #'majutsu-section-cycle-global
-  "<remap> <magit-section-show-level>" #'majutsu-section-show-level
-  "<remap> <magit-section-show-level-1>" #'majutsu-section-show-level-1
-  "<remap> <magit-section-show-level-1-all>" #'majutsu-section-show-level-1-all
-  "<remap> <magit-section-show-level-2>" #'majutsu-section-show-level-2
-  "<remap> <magit-section-show-level-2-all>" #'majutsu-section-show-level-2-all
-  "<remap> <magit-section-show-level-3>" #'majutsu-section-show-level-3
-  "<remap> <magit-section-show-level-3-all>" #'majutsu-section-show-level-3-all
-  "<remap> <magit-section-show-level-4>" #'majutsu-section-show-level-4
-  "<remap> <magit-section-show-level-4-all>" #'majutsu-section-show-level-4-all
-  "<remap> <magit-mouse-toggle-section>" #'majutsu-mouse-toggle-section)
+  "R"   'majutsu-restore)
 
 ;;; Window Management
 
@@ -272,9 +253,11 @@ tricking buffer reuse logic into thinking a buffer belongs to a
 repository that it doesn't.")
 (put 'majutsu--default-directory 'permanent-local t)
 
-(defun majutsu-mode-get-buffers ()
-  "Return Majutsu buffers belonging to the current repository."
-  (let ((topdir (majutsu--toplevel-safe)))
+(defun majutsu-mode-get-buffers (&optional root)
+  "Return Majutsu buffers belonging to ROOT.
+When ROOT is nil, use the current repository."
+  (let ((topdir (file-name-as-directory
+                 (or root (majutsu--toplevel-safe)))))
     (seq-filter (lambda (buf)
                   (with-current-buffer buf
                     (and (derived-mode-p 'majutsu-mode)
@@ -482,36 +465,71 @@ The returned value is a list of entries of the form:
       (let ((magit-section-movement-hook nil))
         (magit-section-goto-successor section line char)))))
 
+(defvar-local majutsu--refreshing nil
+  "Non-nil while `majutsu-refresh-buffer-internal' rebuilds this buffer.")
+
+(defvar-local majutsu--refresh-pending nil
+  "Non-nil when a refresh arrived while this buffer was already refreshing.")
+
 (cl-defun majutsu-refresh-buffer-internal (&optional created &key initial-section select-section)
   "Refresh the current Majutsu buffer.
 
 CREATED, INITIAL-SECTION, and SELECT-SECTION are for internal use."
-  (when-let* ((refresh (majutsu--refresh-buffer-function)))
-    (let ((action (if created "Creating" "Refreshing")))
-      (when (eq major-mode 'majutsu-mode)
-        (majutsu--debug "%s buffer `%s'..." action (buffer-name)))
-      (cond
-       (created
-        (funcall refresh)
-        (cond (initial-section (funcall initial-section))
-              (select-section (funcall select-section))))
-       (t
-        (deactivate-mark)
-        (setq magit-section-pre-command-section nil)
-        (setq magit-section-highlight-overlays nil)
-        (setq magit-section-selection-overlays nil)
-        (setq magit-section-highlighted-sections nil)
-        (setq magit-section-focused-sections nil)
-        (let ((positions (majutsu--refresh-buffer-get-positions)))
-          (funcall refresh)
-          (cond (select-section (funcall select-section))
-                ((majutsu--refresh-buffer-set-positions positions))))))
-      (let ((magit-section-cache-visibility nil))
-        (when (bound-and-true-p magit-root-section)
-          (majutsu-section-show magit-root-section)))
-      (run-hooks 'majutsu-refresh-buffer-hook)
-      (magit-section-update-highlight)
-      (set-buffer-modified-p nil))))
+  ;; The synchronous jj waits inside a rebuild service other processes'
+  ;; sentinels, whose refreshes may target this very buffer.  Rebuilding
+  ;; it out from under the ongoing wash would corrupt the section tree,
+  ;; so defer such requests until the current rebuild finishes.
+  (if majutsu--refreshing
+      (setq majutsu--refresh-pending t)
+    (when-let* ((refresh (majutsu--refresh-buffer-function)))
+      ;; Diff-buffer patch selections store rendered buffer positions.  They
+      ;; cannot safely survive the rebuild below, so invalidate them before the
+      ;; old sections and text disappear.  Keep this dynamic to avoid making the
+      ;; base mode depend on the optional interactive-selection feature.
+      (when (fboundp 'majutsu-interactive-invalidate)
+        (majutsu-interactive-invalidate t))
+      (let ((action (if created "Creating" "Refreshing")))
+        (when (eq major-mode 'majutsu-mode)
+          (majutsu--debug "%s buffer `%s'..." action (buffer-name)))
+        (setq majutsu--refreshing t)
+        (let (rerun)
+          (unwind-protect
+              (progn
+                (cond
+                 (created
+                  (funcall refresh)
+                  (cond (initial-section (funcall initial-section))
+                        (select-section (funcall select-section))))
+                 (t
+                  (deactivate-mark)
+                  (setq magit-section-pre-command-section nil)
+                  (setq magit-section-highlight-overlays nil)
+                  (setq magit-section-selection-overlays nil)
+                  (setq magit-section-highlighted-sections nil)
+                  (setq magit-section-focused-sections nil)
+                  (let ((positions (majutsu--refresh-buffer-get-positions)))
+                    (funcall refresh)
+                    (cond (select-section (funcall select-section))
+                          ((majutsu--refresh-buffer-set-positions positions))))))
+                (let ((magit-section-cache-visibility nil))
+                  (when (bound-and-true-p magit-root-section)
+                    (majutsu-section-show magit-root-section)))
+                (when (fboundp 'majutsu-interactive-record-render-context)
+                  (majutsu-interactive-record-render-context))
+                ;; User hooks may modify the working copy or perform another jj
+                ;; operation.  Bind the context to the tree just rendered before
+                ;; giving those hooks control, so the next selection detects such
+                ;; changes.
+                (run-hooks 'majutsu-refresh-buffer-hook)
+                (magit-section-update-highlight)
+                (set-buffer-modified-p nil))
+            ;; Always drop both flags: a deferred request must not leak
+            ;; into an unrelated later refresh when this one fails.
+            (setq majutsu--refreshing nil)
+            (setq rerun majutsu--refresh-pending)
+            (setq majutsu--refresh-pending nil))
+          (when rerun
+            (majutsu-refresh-buffer-internal)))))))
 
 (defun majutsu-refresh-buffer (&optional _ignore-auto _noconfirm)
   "Refresh the current Majutsu buffer.

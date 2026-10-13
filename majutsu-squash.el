@@ -18,6 +18,7 @@
 ;;; Code:
 
 (require 'majutsu)
+(require 'majutsu-diff-editor)
 
 (defvar majutsu-buffer-diff-range)
 
@@ -25,22 +26,7 @@
 
 (defun majutsu-squash--source-values (args)
   "Return --from values in ARGS."
-  (seq-keep (lambda (arg) (transient-arg-value "--from=" (list arg)))
-            args))
-
-(defun majutsu-squash--remove-interactive-tool-args (args)
-  "Remove native interactive/tool arguments from ARGS."
-  (let (out)
-    (while args
-      (let ((arg (pop args)))
-        (cond
-         ((member arg '("-i" "--interactive")))
-         ((transient-arg-value "--tool=" (list arg)))
-         ((equal arg "--tool")
-          (when args (pop args)))
-         (t
-          (push arg out)))))
-    (nreverse out)))
+  (majutsu-jj-option-values args "--from" "-f"))
 
 (defun majutsu-squash--source-revset (sources)
   "Return a revset union expression for SOURCES."
@@ -66,11 +52,10 @@ The resulting revset is intentionally left for jj to resolve."
 (defun majutsu-squash--diff-default-args ()
   "Return default squash args from a diff buffer context."
   (let* ((range majutsu-buffer-diff-range)
-         (from (transient-arg-value "--from=" range))
-         (to (transient-arg-value "--to=" range))
-         (revisions (seq-keep (lambda (arg)
-                                (transient-arg-value "--revisions=" (list arg)))
-                              range)))
+         (from (majutsu-jj-option-values range "--from" "-f"))
+         (to (majutsu-jj-option-values range "--to" "-t"))
+         (revisions
+          (majutsu-jj-option-values range "--revisions" "-r")))
     (cond
      ;; Arbitrary --from/--to diff buffers do not describe a squash source.
      ((or from to) nil)
@@ -98,35 +83,16 @@ return the same context defaults that execution would use."
 
 ;;; Patch selection safety
 
-(defun majutsu-squash--patch-source-revset (&optional buffer)
-  "Return a source revset when BUFFER is a safe squash patch-selection buffer."
-  (with-current-buffer (or buffer (current-buffer))
-    (when (derived-mode-p 'majutsu-diff-mode)
-      (let* ((range majutsu-buffer-diff-range)
-             (from (transient-arg-value "--from=" range))
-             (to (transient-arg-value "--to=" range))
-             (revisions (seq-keep (lambda (arg)
-                                    (transient-arg-value "--revisions=" (list arg)))
-                                  range)))
-        (cond
-         ((or from to) nil)
-         ((null range) "@")
-         ((= (length revisions) 1) (car revisions)))))))
-
-(defun majutsu-squash-interactive-selection-available-p ()
-  "Return non-nil when squash patch selection is available."
-  (and (majutsu-interactive-selection-available-p)
-       (majutsu-squash--patch-source-revset)))
-
 (defun majutsu-squash--check-patch-source (args patch-source)
   "Signal if ARGS select a source incompatible with PATCH-SOURCE."
   (let ((sources (majutsu-squash--source-values args)))
     (unless patch-source
-      (user-error "Patch selection for squash requires a revision diff"))
-    (unless (or (null sources)
-                (and (= (length sources) 1)
-                     (equal (car sources) patch-source)))
-      (user-error "Patch selection for squash requires the diff source"))))
+      (user-error "Patch selection for squash requires a diff for exactly one commit"))
+    (when sources
+      (let ((source (majutsu-jj-resolve-single-commit
+                     (majutsu-squash--source-revset sources))))
+        (unless (and source (equal source patch-source))
+          (user-error "Patch selection for squash requires the diff source"))))))
 
 ;;; Execution
 
@@ -135,41 +101,63 @@ return the same context defaults that execution would use."
   :description "Execute squash"
   :class 'majutsu-transient-default-action-suffix
   (interactive (list (majutsu-squash-arguments)))
-  (pcase-let* ((`(,args ,filesets) (majutsu-filesets-split-transient-value args))
-               ;; Text hunks and whole-file changes both move into the destination.
-               (plan (majutsu-interactive-build-replay-plan-if-selected))
-               (patch-source (and plan (majutsu-squash--patch-source-revset))))
-    (when plan
-      (majutsu-squash--check-patch-source args patch-source)
-      (setq args (majutsu-squash--remove-interactive-tool-args args)))
-    (let* ((explicit-sources (majutsu-squash--source-values args))
-           (explicit-destination
-            (seq-some (lambda (arg) (transient-arg-value arg args))
-                      '("--into=" "--to=" "--onto=" "--destination="
-                        "--insert-after=" "--after="
-                        "--insert-before=" "--before=")))
-           (source-default (if explicit-destination
-                               '("--from=@")
-                             (or (majutsu-squash--default-args) '("--from=@")))))
-      (unless explicit-sources
-        (setq args (append args source-default)))
-      (let ((sources (majutsu-squash--source-values args)))
-        (unless (or explicit-destination
-                    (majutsu-squash--none-source-p sources))
-          (setq args (append
-                      args
-                      (list (concat
-                             "--into="
-                             (majutsu-squash--destination-revset
-                              (majutsu-squash--source-revset sources)
-                              explicit-sources))))))))
-    (if plan
-        (progn
-          ;; The selected plan rebuilds right from left, then applies forward.
-          (majutsu-interactive-run-replay-plan "squash" args filesets plan)
-          (majutsu-interactive-clear))
-      (majutsu-run-jj-with-editor
-       (cons "squash" (majutsu-jj-append-filesets args filesets))))))
+  (pcase-let ((`(,args ,filesets) (majutsu-filesets-split-transient-value args)))
+    (let* ((jj-editor-p (majutsu-diff-editor-interactive-arguments-p args))
+           ;; Text hunks and whole-file changes both move into the destination.
+           ;; A jj editor leaves an existing selection untouched, including
+           ;; one owned by another command.
+           (plan (and (not jj-editor-p)
+                      (majutsu-interactive-build-replay-plan-if-selected
+                       nil nil 'majutsu-squash)))
+           (patch-source (and plan (majutsu-diff-single-source-commit)))
+           inferred-destination)
+      (let* ((explicit-sources (majutsu-squash--source-values args))
+             (explicit-destination
+              (seq-some (lambda (arg) (transient-arg-value arg args))
+                        '("--into=" "--to=" "--onto=" "--destination="
+                          "--insert-after=" "--after="
+                          "--insert-before=" "--before=")))
+             (source-default (or (majutsu-squash--default-args) '("--from=@"))))
+        (unless explicit-sources
+          (setq args (append args source-default)))
+        (let ((sources (majutsu-squash--source-values args)))
+          (unless (or explicit-destination
+                      (majutsu-squash--none-source-p sources))
+            (setq inferred-destination
+                  (majutsu-squash--destination-revset
+                   (majutsu-squash--source-revset sources)
+                   explicit-sources))
+            (setq args (append args
+                               (list (concat "--into="
+                                             inferred-destination)))))))
+      ;; Validate after adding the diff-context default.  This both preserves
+      ;; that source when a destination is explicit and detects a dynamic
+      ;; revset that moved since the diff was rendered.
+      (when (and plan (not jj-editor-p))
+        (majutsu-squash--check-patch-source args patch-source)
+        (setq args (majutsu-jj-set-option-value
+                    args "--from" patch-source "-f"))
+        (when inferred-destination
+          (if-let* ((destination
+                     (majutsu-jj-resolve-single-commit inferred-destination)))
+              (setq args (majutsu-jj-set-option-value
+                          args "--into" destination "-t"))
+            (user-error "Patch squash destination must resolve to one commit"))))
+      (cond
+       ;; Do not replace a user's configured jj editor with Majutsu's patch
+       ;; tool.  The selection remains available after the session starts.
+       (jj-editor-p
+        (majutsu-diff-editor-start
+         "squash" args filesets :origin-buffer (current-buffer)))
+       (plan
+        ;; The selected plan rebuilds right from left, then applies forward.
+        (majutsu-interactive-run-replay-plan
+         "squash"
+         (majutsu-diff-editor-strip-interactive-arguments args)
+         filesets plan))
+       (t
+        (majutsu-run-jj-with-editor
+         (cons "squash" (majutsu-jj-append-filesets args filesets))))))))
 
 ;;;; Infix Commands
 
@@ -179,7 +167,7 @@ return the same context defaults that execution would use."
   :selection-label "[FROM]"
   :selection-face '(:background "dark orange" :foreground "black")
   :selection-toggle-key "f"
-  :selection-toggle-if-not #'majutsu-squash-interactive-selection-available-p
+  :selection-toggle-if-not #'majutsu-diff-single-source-commit
   :shortarg "-f"
   :argument "--from="
   :multi-value 'repeat
@@ -191,7 +179,7 @@ return the same context defaults that execution would use."
   :selection-label "[INTO]"
   :selection-face '(:background "dark cyan" :foreground "white")
   :selection-toggle-key "t"
-  :selection-toggle-if-not #'majutsu-squash-interactive-selection-available-p
+  :selection-toggle-if-not #'majutsu-diff-single-source-commit
   :shortarg "-t"
   :argument "--into="
   :reader #'majutsu-transient-read-revset)
@@ -202,7 +190,7 @@ return the same context defaults that execution would use."
   :selection-label "[ONTO]"
   :selection-face '(:background "dark green" :foreground "white")
   :selection-toggle-key "o"
-  :selection-toggle-if-not #'majutsu-squash-interactive-selection-available-p
+  :selection-toggle-if-not #'majutsu-diff-single-source-commit
   :shortarg "-o"
   :argument "--onto="
   :multi-value 'repeat
@@ -214,7 +202,7 @@ return the same context defaults that execution would use."
   :selection-label "[AFTER]"
   :selection-face '(:background "dark blue" :foreground "white")
   :selection-toggle-key "a"
-  :selection-toggle-if-not #'majutsu-squash-interactive-selection-available-p
+  :selection-toggle-if-not #'majutsu-diff-single-source-commit
   :shortarg "-A"
   :argument "--insert-after="
   :multi-value 'repeat
@@ -226,7 +214,7 @@ return the same context defaults that execution would use."
   :selection-label "[BEFORE]"
   :selection-face '(:background "dark magenta" :foreground "white")
   :selection-toggle-key "b"
-  :selection-toggle-if-not #'majutsu-squash-interactive-selection-available-p
+  :selection-toggle-if-not #'majutsu-diff-single-source-commit
   :shortarg "-B"
   :argument "--insert-before="
   :multi-value 'repeat
@@ -263,14 +251,16 @@ return the same context defaults that execution would use."
     (majutsu-squash:--insert-after)
     (majutsu-squash:--insert-before)
     ("c" "Clear selections" majutsu-selection-clear :transient t)]
-   ["Patch Selection" :if majutsu-squash-interactive-selection-available-p
+   ["Patch Selection" :if majutsu-diff-single-source-commit
     (majutsu-interactive:select-hunk)
     (majutsu-interactive:select-file)
     (majutsu-interactive:select-region)
     ("C" "Clear patch selections" majutsu-interactive-clear :transient t)]
-   ["Paths" :if-not majutsu-squash-interactive-selection-available-p
+   ["Paths" :if-not majutsu-diff-single-source-commit
     (majutsu-squash:--)]
    ["Options"
+    ("-i" "Interactive" ("-i" "--interactive"))
+    ("=t" "Tool" "--tool=")
     ("-k" "Keep emptied commit" ("-k" "--keep-emptied"))
     ("-u" "Use destination message" ("-u" "--use-destination-message"))
     (majutsu-transient-arg-ignore-immutable)]

@@ -10,6 +10,7 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'majutsu-jj-integration)
 
 (defconst majutsu-ediff-test--root
   (file-name-directory
@@ -45,10 +46,28 @@
     (should (equal (cdr result) "@"))))
 
 (ert-deftest majutsu-ediff-test-parse-diff-range-to-only ()
-  "Test parsing --to only."
+  "A lone --to defaults the source revision to @."
   (let ((result (majutsu-jj--parse-diff-range '("--to=bar"))))
     (should (equal (car result) "@"))
     (should (equal (cdr result) "bar"))))
+
+(ert-deftest majutsu-ediff/integration-to-only-range-matches-jj ()
+  "Match jj's working-copy default for an omitted --from."
+  (majutsu-jj-integration-with-repo repo
+    (let ((file (majutsu-jj-integration-file repo "file.txt")))
+      (majutsu-jj-integration-write-text file "base\n")
+      (majutsu-jj-integration-commit repo "base")
+      (majutsu-jj-integration-write-text file "working\n")
+      (let* ((range (majutsu-jj--parse-diff-range '("--to=@-")))
+             (implicit (majutsu-jj-integration-output
+                        repo "diff" "--git" "--to=@-"))
+             (explicit (majutsu-jj-integration-output
+                        repo "diff" "--git"
+                        (concat "--from=" (car range))
+                        (concat "--to=" (cdr range)))))
+        (should (equal range '("@" . "@-")))
+        (should (> (length implicit) 0))
+        (should (equal explicit implicit))))))
 
 (ert-deftest majutsu-ediff-test-parse-diff-range-nil ()
   "Test parsing nil range."
@@ -754,8 +773,8 @@ This mirrors with-editor's kill guard so cleanup cannot abort quit hooks."
         (should gotoed)))))
 
 (ert-deftest majutsu-ediff-test-resolve-with-conflict-uses-blob-buffer-for-non-wc ()
-  "Resolve-with-conflict should open blob buffer when rev is not working copy."
-  (let (seen-rev seen-file)
+  "Resolve-with-conflict should make a non-working-copy blob editable."
+  (let (seen-rev seen-file edit-started ensured gotoed)
     (cl-letf (((symbol-function 'majutsu-revision-at-point)
                (lambda () "abc123"))
               ((symbol-function 'majutsu-ediff--resolve-file-dwim)
@@ -767,20 +786,30 @@ This mirrors with-editor's kill guard so cleanup cannot abort quit hooks."
                  (ert-fail "should not open filesystem file for non-working-copy rev")))
               ((symbol-function 'majutsu-find-file-noselect)
                (lambda (rev file &optional _revert)
-                 (setq seen-rev rev)
-                 (setq seen-file file)
+                 (setq seen-rev rev
+                       seen-file file
+                       majutsu-buffer-blob-path file)
                  (current-buffer)))
               ((symbol-function 'pop-to-buffer)
                (lambda (buffer-or-name &rest _)
                  buffer-or-name))
+              ((symbol-function 'majutsu-blob-edit-start)
+               (lambda ()
+                 (setq edit-started t)))
               ((symbol-function 'majutsu-conflict-ensure-mode)
-               (lambda ()))
+               (lambda ()
+                 (should edit-started)
+                 (setq ensured t)))
               ((symbol-function 'majutsu-conflict-goto-nearest)
-               (lambda ())))
+               (lambda ()
+                 (setq gotoed t))))
       (with-temp-buffer
         (majutsu-ediff-resolve-with-conflict)
         (should (equal seen-rev "abc123"))
-        (should (equal seen-file "conflicted.txt"))))))
+        (should (equal seen-file "conflicted.txt"))
+        (should edit-started)
+        (should ensured)
+        (should gotoed)))))
 
 (ert-deftest majutsu-ediff-test-resolve-runs-jj-resolve ()
   "Resolve command should invoke jj resolve with built args."

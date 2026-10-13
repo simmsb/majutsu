@@ -5,8 +5,23 @@
 
 ** Breaking changes
 
+- Revision command names ::
+  The edit-at-point command is now ~majutsu-edit~. Sequential log navigation
+  uses ~majutsu-goto-next-revision~ and ~majutsu-goto-prev-revision~.
+  Update custom bindings; the old command names were removed without aliases.
+  Built-in keys are unchanged. Prompts and help now follow jj's terminology:
+  ~change~ for a new change, ~revision~ for a selected history node.
+
+- Scoped transient defaults ::
+  ~w~ now opens a menu: ~w u~ saves user defaults, ~w r~ repository defaults,
+  and ~w w~ workspace defaults, replacing the old standalone ~w~ / ~W~ actions.
+  Uppercase scope keys in that menu clear overrides. Session defaults are
+  workspace-local; existing user/repository saved values remain readable.
+  Buffer option reuse no longer crosses workspace boundaries. Log ~0~ resets
+  only current options, without deleting saved defaults.
+
 - Updated dependencies ::
-  Majutsu requires Jujutsu 0.41.0, Magit 4.4.0, and Transient 0.8.7 or later.
+  Majutsu requires Jujutsu 0.41.0, Magit 4.4.0, and Transient 0.13.0 or later.
   New package dependencies are Compat 31.0.0.1, Consult 1.0, and plz 0.9.1.
 
 - Custom log columns use a new format ::
@@ -14,6 +29,8 @@
   with ~heading~, ~tail~, ~body~, or ~metadata~ instead of ~:align~ / ~:visible~.
   Columns support ~:template~, ~:face~, and ~:post~; move settings from the
   removed ~majutsu-log-field-faces~ option into each column's ~:face~.
+  Body postprocessors must now preserve the displayed line count and whether a
+  field is empty; move layout-changing transformations into ~:template~.
 
 - Diffedit option renamed ::
   Rename ~majutsu-edit-finish-on-save~ to ~majutsu-diffedit-finish-on-save~
@@ -24,6 +41,31 @@
   The =-r/--revision= shortcut was removed.  Use =-f/--from= instead.
 
 ** Added
+
+- Text conflict workbench ::
+  ~? M~ (Evil ~M~) opens a pinned directory tree with private UTF-8 drafts.
+  Saving a draft leaves jj untouched; explicit apply writes a file or folded
+  directory in one operation, including inherited multi-sided conflicts.
+  Files expand into conflict blocks with jj's snapshot/change grouping,
+  native diff previews, and paired Before/After snapshots. RET jumps to the
+  corresponding draft term; child-node apply/discard remains file-scoped.
+  The main view shows only revision identity, concise file state, and the tree.
+  ~?~ opens workbench actions on demand (also in Evil); drafts use ~C-c ?~.
+  The menu includes scoped/all-draft apply and confirmed discard. Draft
+  headers show the private path instead of a permanent command legend.
+  Failed or unverified writes retain drafts and block blind retries. Existing
+  Ediff commands remain available; structural and cross-path edits are not supported.
+
+- Compile-time jjosh declarations ::
+  ~majutsu-jjosh~ marks arbitrary fork-specific definitions and expressions,
+  including the project-summary column and remote bookmark Forget. Set
+  ~MAJUTSU_BACKEND~ to ~jj~ (default) or ~jjosh~ in the package builder's
+  environment. Builders compile Lisp directly and manage their own output
+  directories; the package-specific Makefile has been removed.
+  The selected backend is fixed in bytecode and applies to local and remote
+  executables alike.
+  There are no runtime capability probes, backend checks, or support caches.
+  Switching variants requires a full rebuild and an Emacs restart.
 
 - Tag management ::
   The ~t~ dispatcher entry opens ~majutsu-tag~ to list, create, move, and
@@ -78,8 +120,9 @@
 - Optional Embark actions ::
   Embark acts on bookmark and workspace completion candidates, bookmark
   and revision sections, and remote headings.  Actions include inspecting
-  revisions, tracking remote bookmarks, visiting workspaces, and opening Dired.
-  Revision inspection defaults to a diff; editing remains an explicit action.
+  revisions, tracking or forgetting remote bookmarks, visiting workspaces,
+  and opening Dired.  Revision inspection defaults to a diff; editing remains
+  an explicit action.
 
 - Gerrit uploads ::
   The Git dispatcher provides =jj gerrit upload= with revision and remote
@@ -89,6 +132,27 @@
 - Whole-file patch selections ::
   Use ~F~ to select whole-file changes, including binary and other hunkless
   changes, for Split, Squash, and Restore.
+
+- Absorb patch selections ::
+  Absorb supports ~H~/~F~/~R~ selections from a single-revision diff through
+  the =majutsu-applypatch= tool.  jj assigns selected changes to eligible
+  ancestors; unselected and unassignable changes remain in the source.
+
+- Configured jj diff editors ::
+  Split, Squash, Absorb, and Restore honor =--interactive= and =--tool= using jj's
+  configured diff editor.  An explicit editor request takes precedence over
+  an Emacs patch selection.  Split also opens the editor when neither a patch
+  selection nor a fileset is supplied.
+
+- Terminal diff editors through Ghostel ::
+  Optional Ghostel integration hosts jj's built-in terminal diff editor,
+  locally and over supported POSIX TRAMP connections.  ~majutsu-diff-editor-host~
+  selects the host; external non-terminal tools can also run without Ghostel.
+
+- jj's Arrange TUI ::
+  ~majutsu-arrange-tui~ (~? A~) runs =jj arrange= in Ghostel.  Without explicit
+  revisions it uses jj's =revsets.arrange= setting; a prefix argument prompts
+  for a revset.
 
 - Revision information in diff buffers ::
   Single-revision change diffs show collapsible commit metadata and the full
@@ -127,16 +191,36 @@
 
 ** Changed
 
-- Bookmark and remote lists ::
-  Local bookmarks and remote bookmarks now have separate sections, with
-  remote references grouped by remote and =@git= references in their own
-  section.  Conflicted targets remain expandable children of each bookmark.
-  The remote list command opens this view, including remotes before their
-  first fetch; remote headings offer management and fetch actions.
+- Log graph rendering ::
+  Multiline descriptions now participate directly in jj's graph rendering.
+  Folding preserves graph structure while hiding body text, without rerunning
+  jj. Blank body lines retain the record's gutter width, avoiding ragged
+  highlight boundaries. Elided-revision and other inter-record graph lines
+  are display-only overlays, not buffer text or sections: cursor movement
+  skips them, and clicks do not select or toggle a section. Decorations cannot
+  target or fold the enclosing log graph and remain outside revision folding,
+  text search, and copying. Native graph colors and styles are preserved
+  without inheriting the adjacent revision's foreground, weight, or highlight.
+  Native Magit visibility commands share Majutsu's fold bounds, including rows
+  requiring no folded graph projection. Terminal decorations do not duplicate
+  or suppress the prefixes of subsequently inserted sections.
 
-- Repository-local defaults and revision prompts ::
-  Log, Diff, Fetch, and Push can save defaults for the current repository
-  with ~W~.  The log revset filter is an ordinary =-r= argument and empty
+- Conflict file trees ::
+  The log's unresolved conflicts are grouped into collapsible directories,
+  sharing the diffstat tree layout. File targets and conflict side counts are
+  retained, including conflicts inherited by merges with no changes-in diff.
+  Directory and file labels escape control characters without altering paths.
+
+- Bookmark and remote lists ::
+  Local bookmarks and remote bookmarks have separate sections, with remote
+  references grouped by remote and =@git= references in their own section.
+  Conflicted targets are expandable.  Remote rows show sync state and
+  local-only/remote-only commit counts between the name and revision description.
+  The remote list command opens this view; remote headings show URLs and offer
+  management and fetch actions, even before the first fetch.
+
+- Revision prompts ::
+  The log revset filter is an ordinary =-r= argument and empty
   input clears it.  Revision prompts prefer references at point, and diff
   file completion follows the selected revisions.
 
@@ -164,6 +248,19 @@
   ~majutsu-jjdescription-fill-column~; setting either to nil disables that
   behavior.  The summary line is not automatically wrapped.
 
+- Conflict interaction ::
+  Conflict sides have distinct backgrounds, Eldoc help, and a context menu.
+  New commands keep the term at point, concatenate complete side snapshots,
+  or switch marker styles.  Concatenation can duplicate shared context and
+  asks for confirmation when the base is nonempty.  Resolving the last conflict
+  disables the mode; undo re-enables it.  ~majutsu-conflict-auto-leave~ controls
+  automatic mode exit.
+
+- Restore confirmation ::
+  Executing a bare Restore asks before discarding all working-copy changes.
+  Restore DWIM also honors ~majutsu-no-confirm~ and ~majutsu-slow-confirm~
+  through the =restore= action.
+
 ** Removed
 
 - Obsolete diff and file commands ::
@@ -188,8 +285,10 @@
 ** Fixed
 
 - Split, Squash, and Restore defaults ::
-  Split inherits a displayed change only when the diff resolves to one revision;
-  multi-change ranges are no longer forwarded as invalid Split arguments.
+  Split and Restore use the log revision at point when no source is supplied.
+  Split inherits only single-change diff sources.  Squash retains its diff
+  =--revisions= or log point/region source when only a destination is supplied;
+  arbitrary =--from= / =--to= comparisons do not imply a Squash source.
 
 - Transient command context ::
   Revision and file prompts, selection toggles, and point-sensitive actions
@@ -198,14 +297,46 @@
 
 - Patch selection safety ::
   Concurrent patch operations no longer overwrite each other's patch input.
+  Patch operations reject stale selections or a source different from the
+  displayed diff, and pin execution to the validated revisions.  Restore
+  requires an explicit operation for ambiguous multi-revision diffs.
+  Binary contents and executable-bit changes are independently selectable.
+  File and directory selections include both; restoring only permissions
+  preserves unselected binary contents.
+
+- Cancelled editor sessions preserve selections ::
+  When a jj editor exits without changing the repository, the Emacs patch
+  selection remains available.  A changed or unverifiable repository state
+  invalidates the selection before it can be reused.
 
 - Files without a final newline ::
   Partial patch selections no longer join added text onto an unselected final
   line when the file lacks a trailing newline.
 
+- Restore selections spanning multiple files ::
+  Restore reuses the displayed fileset when applying a partial patch, preserving
+  unselected changes in other files.
+
+- Conflict side selection ::
+  Keep-side numbers match jj's side labels, and keep-base selects the actual
+  merge base.  A command at the line after a conflict no longer resolves that
+  conflict; revision labels also handle missing or quoted descriptions.
+
 - Ediff conflict results ::
   Quitting Ediff without edits keeps a conflict unresolved.  Saving edited
   merge results requires confirmation and preserves unresolved conflict markers.
+
+- Historical conflict editing ::
+  The conflict-mode resolve workflow opens non-working-copy files as editable
+  blobs, so saving applies the resolution to the selected revision, including
+  conflicts inherited by multi-parent merges without changing their parents.
+
+- Divergent revision files ::
+  Blob editing, history navigation, and annotation use unambiguous commit IDs.
+  Saving follows the rewrite produced by that save, not a moving revset or
+  another divergent sibling; semantic no-ops retain the original pin.
+  Unverifiable saves keep edits in the buffer and require an explicit abort
+  and revert before saving again.
 
 - Paths and filesets ::
   Conflict discovery and diffedit handle file names containing spaces or
@@ -215,13 +346,15 @@
   for file paths.
 
 - Diff display and window behavior ::
-  Disabling refinement also clears hidden hunks.  Evolution inter-diffs honor
-  diff window policies, and custom jj wrapping or presentation no longer breaks
-  history rows.  Patch-like text in a revision description stays ordinary text.
+  File permission changes display their old and new modes.  Disabling
+  refinement also clears hidden hunks.  Evolution inter-diffs honor diff window
+  policies, and custom jj wrapping or presentation no longer breaks history
+  rows.  Patch-like text in a revision description stays ordinary text.
 
 - Section folding and refresh ::
   Collapsed sections no longer leave invisible remnants that join adjacent
-  headings together.  =jj new= refreshes the buffer it was invoked from.
+  headings together, and refreshes arriving during a rebuild no longer corrupt
+  the buffer.  =jj new= refreshes the buffer it was invoked from.
 
 - GPG prompt responsiveness ::
   Emacs-based GPG/pinentry prompts can be answered while jj commands wait.
@@ -274,7 +407,7 @@
   - ~D~ now runs ~majutsu-diff-dwim~ in log mode (was global).
   - ~Y~ now runs ~majutsu-duplicate-dwim~ in log mode (was global).
   - ~o~ now runs ~majutsu-new~ transient globally.
-- ~majutsu-abandon~ now respects active region selection to abandon multiple changesets at once.
+- ~majutsu-abandon~ now respects active region selection to abandon multiple revisions at once.
 - In ~majutsu-new~ transient:
   - Parent revision key changed from ~p~ to ~r~.
   - Action key changed from ~n~ to ~o~.

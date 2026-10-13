@@ -7,7 +7,7 @@
 ;; Keywords: tools, vc
 ;; URL: https://github.com/0WD0/majutsu
 ;; Version: 0.6.0
-;; Package-Requires: ((emacs "29.1") (compat "31.0.0.1") (transient "0.8.7") (magit "4.4.0") (consult "1.0") (plz "0.9.1"))
+;; Package-Requires: ((emacs "29.1") (compat "31.0.0.1") (transient "0.13.0") (magit "4.4.0") (consult "1.0") (plz "0.9.1"))
 
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -47,8 +47,9 @@ Instead of invoking this alias for `majutsu-log' using
     ("d" "Diff"              majutsu-diff)
     ("v" "Evolution log"     majutsu-evolog)
     ("D" "Diff (dwim)"       majutsu-diff-dwim)
-    ("e" "Edit change"       majutsu-edit-changeset)
-    ("E" "Ediff"             majutsu-ediff)]
+    ("e" "Edit revision"     majutsu-edit)
+    ("E" "Ediff"             majutsu-ediff)
+    ("M" "Resolve conflicts" majutsu-resolve)]
    [("G" "Git"               majutsu-git-transient)
     ("!" "Run"               majutsu-command)
     ("l" "Log options"       majutsu-log-transient)
@@ -61,6 +62,7 @@ Instead of invoking this alias for `majutsu-log' using
    [("s" "Squash"            majutsu-squash)
     ("S" "Split"             majutsu-split)
     ("a" "Absorb"            majutsu-absorb)
+    ("A" "Arrange (TUI)"     majutsu-arrange-tui)
     ("y" "Duplicate"         majutsu-duplicate)
     ("j" "Sign"              majutsu-sign)
     ("J" "Unsign"            majutsu-unsign)
@@ -99,6 +101,7 @@ Instead of invoking this alias for `majutsu-log' using
   (require 'majutsu-git)
   (require 'majutsu-command)
   (require 'majutsu-interactive)
+  (require 'majutsu-arrange)
   (require 'majutsu-file)
   (require 'majutsu-annotate)
   (require 'majutsu-rebase)
@@ -117,6 +120,7 @@ Instead of invoking this alias for `majutsu-log' using
   (require 'majutsu-evolog)
   (require 'majutsu-workspace)
   (require 'majutsu-conflict)
+  (require 'majutsu-resolve)
   (require 'majutsu-gerrit))
 
 (with-eval-after-load 'evil

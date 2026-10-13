@@ -19,12 +19,17 @@
 
 (require 'majutsu-base)
 (require 'majutsu-diff)
+(require 'majutsu-file-tree)
 (require 'majutsu-process)
 
 (require 'cl-lib)
 (require 'diff-mode)
 (require 'magit-section)
 (require 'transient)
+
+(declare-function majutsu-jj-operation-id "majutsu-jj"
+                  (&optional directory snapshot))
+(declare-function majutsu-process-completion-owned-p "majutsu-process" (process))
 
 ;;; Options
 
@@ -47,6 +52,11 @@
   "Face for selected whole-file changes."
   :group 'majutsu-interactive)
 
+(defface majutsu-interactive-partially-selected-file
+  '((t :inherit majutsu-interactive-selected-region))
+  "Face for partially selected files and directories in the diffstat."
+  :group 'majutsu-interactive)
+
 ;;; Selection Model
 
 (defun majutsu-interactive-selection-available-p ()
@@ -61,6 +71,165 @@ region within a hunk.")
 (defvar-local majutsu-interactive--overlays nil
   "List of overlays for selection visualization.")
 
+(defvar-local majutsu-interactive--selection-operation nil
+  "Transient operation that owns the current patch selection.")
+
+(cl-defstruct (majutsu-interactive-context
+               (:constructor majutsu-interactive-context-create))
+  "Repository and buffer generation that a patch selection belongs to."
+  operation
+  root
+  operation-id
+  buffer-tick
+  diff-range
+  diff-filesets)
+
+(defvar-local majutsu-interactive--render-context nil
+  "Repository state represented by the current rendered diff.
+Nil means no context has been recorded; `stale' requires a fresh render.")
+
+(defvar-local majutsu-interactive--selection-context nil
+  "Rendered repository state copied when the first change is selected.")
+
+(defun majutsu-interactive--current-operation ()
+  "Return the patch-selection operation active in the current transient."
+  (and (boundp 'transient-current-command)
+       (memq transient-current-command
+             '(majutsu-split majutsu-squash majutsu-absorb majutsu-restore))
+       transient-current-command))
+
+(defun majutsu-interactive--repository-root ()
+  "Return the current buffer's repository root without signaling."
+  (condition-case nil
+      (when-let* ((root (or (majutsu--buffer-root)
+                            (majutsu--toplevel-safe default-directory))))
+        (file-name-as-directory root))
+    (error nil)))
+
+(defun majutsu-interactive--current-repository-operation (root &optional snapshot)
+  "Return ROOT's current jj operation id without signaling.
+When SNAPSHOT is non-nil, snapshot working-copy filesystem changes first."
+  (and root
+       (fboundp 'majutsu-jj-operation-id)
+       (majutsu-jj-operation-id root snapshot)))
+
+(defun majutsu-interactive-record-render-context ()
+  "Record the repository state represented by the current diff buffer."
+  (when (derived-mode-p 'majutsu-diff-mode)
+    (let ((root (majutsu-interactive--repository-root)))
+      (setq-local
+       majutsu-interactive--render-context
+       (majutsu-interactive-context-create
+        :root root
+        :operation-id
+        ;; The refresh command has already produced the rendered tree.  Merely
+        ;; read that operation here; freshness checks snapshot later changes.
+        (majutsu-interactive--current-repository-operation root)
+        :buffer-tick (buffer-chars-modified-tick)
+        :diff-range (copy-tree majutsu-buffer-diff-range)
+        :diff-filesets (copy-tree majutsu-buffer-diff-filesets))))))
+
+(defun majutsu-interactive--context-current-p (context &optional check-operation)
+  "Return non-nil when CONTEXT still describes the current buffer.
+When CHECK-OPERATION is non-nil, also require the same readable jj operation."
+  (and context
+       (equal (majutsu-interactive-context-root context)
+              (majutsu-interactive--repository-root))
+       (equal (majutsu-interactive-context-buffer-tick context)
+              (buffer-chars-modified-tick))
+       (equal (majutsu-interactive-context-diff-range context)
+              majutsu-buffer-diff-range)
+       (equal (majutsu-interactive-context-diff-filesets context)
+              majutsu-buffer-diff-filesets)
+       (or (not check-operation)
+           (let ((before (majutsu-interactive-context-operation-id context))
+                 (after
+                  (majutsu-interactive--current-repository-operation
+                   (majutsu-interactive-context-root context) t)))
+             ;; Hand-built test/extension buffers may not have a render-time
+             ;; token.  Real refreshed diff buffers are rejected below when
+             ;; their token could not be recorded.
+             (or (null before)
+                 (and after (equal before after)))))))
+
+(defun majutsu-interactive--stale-selection-error ()
+  "Invalidate the current selection and report its stale repository state."
+  (majutsu-interactive-invalidate t)
+  (user-error "Repository changed since this diff was rendered; refresh and select again"))
+
+(defun majutsu-interactive--assert-selection-context (&optional operation)
+  "Signal if current selections do not belong to OPERATION and this diff.
+
+OPERATION is a transient command symbol such as `majutsu-split'.  A selection
+is deliberately not transferable between jj commands: its patch direction and
+the command's source semantics differ."
+  (when (and (majutsu-interactive--has-selections-p)
+             majutsu-interactive--selection-context
+             (not (majutsu-interactive--context-current-p
+                   majutsu-interactive--selection-context t)))
+    (majutsu-interactive--stale-selection-error))
+  (when (and operation
+             (majutsu-interactive--has-selections-p)
+             (not (eq majutsu-interactive--selection-operation operation)))
+    (user-error "Patch selection belongs to %s; clear it before using %s"
+                (or majutsu-interactive--selection-operation "another context")
+                operation)))
+
+(defun majutsu-interactive--ensure-selection-context ()
+  "Bind a new selection to the current transient operation, or validate it."
+  (when (eq majutsu-interactive--render-context 'stale)
+    (majutsu-interactive--stale-selection-error))
+  (let ((operation (majutsu-interactive--current-operation)))
+    (if (majutsu-interactive--has-selections-p)
+        (majutsu-interactive--assert-selection-context operation)
+      (let* ((root (majutsu-interactive--repository-root))
+             (render (or majutsu-interactive--render-context
+                         (majutsu-interactive-context-create
+                          :root root
+                          :operation-id
+                          (majutsu-interactive--current-repository-operation
+                           root t)
+                          :buffer-tick (buffer-chars-modified-tick)
+                          :diff-range (copy-tree majutsu-buffer-diff-range)
+                          :diff-filesets
+                          (copy-tree majutsu-buffer-diff-filesets)))))
+        ;; A real refreshed diff has a render token.  If jj advanced before the
+        ;; first selection, do not bind positions from the old tree to the new
+        ;; repository state.
+        (when majutsu-interactive--render-context
+          (unless (majutsu-interactive-context-operation-id render)
+            (user-error "Cannot verify the repository state for this diff; refresh and try again"))
+          (unless (majutsu-interactive--context-current-p render t)
+            (majutsu-interactive--stale-selection-error)))
+        (setq-local majutsu-interactive--selection-operation operation)
+        (setq-local majutsu-interactive--selection-context
+                    (copy-majutsu-interactive-context render))
+        (setf (majutsu-interactive-context-operation
+               majutsu-interactive--selection-context)
+              operation)))))
+
+(defun majutsu-interactive-invalidate (&optional forget-render-context)
+  "Discard selections whose rendered diff is about to be rebuilt.
+
+Interactive selection ranges are buffer positions, so retaining them across a
+diff refresh would make a later patch apply to unrelated text.  This helper is
+quiet on purpose; callers use it as part of refresh lifecycle rather than an
+explicit user action.  When FORGET-RENDER-CONTEXT is non-nil, also mark the
+current diff rendering as stale."
+  (setq majutsu-interactive--selections nil)
+  (setq majutsu-interactive--selection-operation nil)
+  (setq majutsu-interactive--selection-context nil)
+  (when forget-render-context
+    (setq majutsu-interactive--render-context 'stale))
+  (majutsu-interactive--clear-overlays))
+
+(defun majutsu-interactive-invalidate-repository (root)
+  "Invalidate patch selections in every Majutsu diff buffer for ROOT."
+  (dolist (buffer (majutsu-mode-get-buffers root))
+    (with-current-buffer buffer
+      (when (derived-mode-p 'majutsu-diff-mode)
+        (majutsu-interactive-invalidate t)))))
+
 (defun majutsu-interactive--hunk-id (section)
   "Return unique identifier for hunk SECTION."
   (oref section value))
@@ -71,15 +240,15 @@ region within a hunk.")
     (if (consp val) (car val) val)))
 
 (defun majutsu-interactive--file-id (file)
-  "Return the selection identifier for whole-file FILE."
+  "Return FILE's whole-file content ID, independent of mode metadata."
   (list :file file))
 
 (defun majutsu-interactive--file-id-p (id)
-  "Return non-nil when ID identifies a whole-file selection."
+  "Return non-nil when ID identifies a whole-file content selection."
   (and (consp id) (eq (car id) :file)))
 
 (defun majutsu-interactive--file-id-file (id)
-  "Return the path stored in whole-file selection ID."
+  "Return the path stored in whole-file content selection ID."
   (cadr id))
 
 (defun majutsu-interactive--ensure-selections ()
@@ -109,42 +278,40 @@ region within a hunk.")
   (with-current-buffer (or buffer (current-buffer))
     (majutsu-interactive--has-selections-p)))
 
-(defun majutsu-interactive-build-patch-if-selected (&optional buffer invert include-all-files)
+(defun majutsu-interactive-build-patch-if-selected
+    (&optional buffer invert include-all-files operation)
   "Return patch for BUFFER if there are selections, otherwise nil.
 When INVERT is non-nil, invert the selection within each hunk.
-When INCLUDE-ALL-FILES is non-nil, include hunks from all files in invert mode."
+When INCLUDE-ALL-FILES is non-nil, include hunks from all files in invert mode.
+OPERATION, when non-nil, must own BUFFER's patch selection."
   (with-current-buffer (or buffer (current-buffer))
+    (majutsu-interactive--assert-selection-context operation)
     (when (majutsu-interactive--has-selections-p)
       (majutsu-interactive--build-patch invert include-all-files))))
 
 ;;; Selection Functions
 
+(defun majutsu-interactive--patch-section-p (section)
+  "Return non-nil when SECTION is an independently selectable patch unit."
+  (or (magit-section-match 'jj-hunk section)
+      (magit-section-match 'jj-mode-change section)))
+
 (defun majutsu-interactive-toggle-hunk ()
-  "Toggle selection of the hunk at point."
+  "Toggle selection of the patch unit at point."
   (interactive)
   (when-let* ((section (magit-current-section)))
-    (when (cl-typep section 'majutsu-hunk-section)
+    (when (majutsu-interactive--patch-section-p section)
       (let* ((hunk-id (majutsu-interactive--hunk-id section))
              (current (majutsu-interactive--get-selection hunk-id)))
+        (majutsu-interactive--ensure-selection-context)
         (majutsu-interactive--set-selection
          hunk-id (if current nil :all))
         (majutsu-interactive--render-overlays)
-        (message "%s hunk" (if current "Deselected" "Selected"))))))
-
-(defun majutsu-interactive--file-section-with-hunks (file)
-  "Find a jj-file section for FILE that contains hunks."
-  (let (result)
-    (when (and file magit-root-section)
-      (magit-map-sections
-       (lambda (section)
-         (when (and (magit-section-match 'jj-file section)
-                    (equal (oref section value) file)
-                    (seq-some (lambda (child)
-                                (magit-section-match 'jj-hunk child))
-                              (oref section children)))
-           (setq result section)))
-       magit-root-section))
-    result))
+        (message "%s %s"
+                 (if current "Deselected" "Selected")
+                 (if (magit-section-match 'jj-mode-change section)
+                     "mode change"
+                   "hunk"))))))
 
 (defun majutsu-interactive--file-section-for-file (file)
   "Find the real diff file section for FILE, ignoring diffstat if possible."
@@ -161,60 +328,73 @@ When INCLUDE-ALL-FILES is non-nil, include hunks from all files in invert mode."
     (or result fallback)))
 
 (defun majutsu-interactive--file-section-hunks (file-section)
-  "Return the hunk children of FILE-SECTION."
-  (seq-filter (lambda (child) (magit-section-match 'jj-hunk child))
+  "Return the text hunks of FILE-SECTION, excluding mode metadata."
+  (seq-filter (lambda (section) (magit-section-match 'jj-hunk section))
               (oref file-section children)))
 
-(defun majutsu-interactive--whole-file-selection-allowed-p ()
-  "Return non-nil when the active transient supports whole-file selections."
-  (and (boundp 'transient-current-command)
-       (memq transient-current-command
-             '(majutsu-split majutsu-squash majutsu-restore))))
+(defun majutsu-interactive--file-section-patches (file-section)
+  "Return selectable text and mode patch children of FILE-SECTION."
+  (seq-filter #'majutsu-interactive--patch-section-p
+              (oref file-section children)))
 
-(defun majutsu-interactive--toggle-whole-file (file-section)
-  "Toggle the whole-file selection represented by FILE-SECTION."
-  (unless (majutsu-interactive--whole-file-selection-allowed-p)
-    (user-error "Whole-file selections are supported by Split, Squash, and Restore"))
-  (unless (majutsu-diff-file-metadata file-section)
-    (user-error
-     "Cannot verify this whole-file selection against structured metadata from jj; refresh the diff and try again"))
-  (let* ((id (majutsu-interactive--file-id (oref file-section value)))
-         (current (majutsu-interactive--get-selection id)))
-    (majutsu-interactive--set-selection id (unless current :all))
-    (majutsu-interactive--render-overlays)
-    (message "%s whole-file change" (if current "Deselected" "Selected"))))
+(defun majutsu-interactive--file-content-p (file-section)
+  "Return non-nil when FILE-SECTION needs a whole-file content selection.
+Mode-only changes need no payload; binary changes still do when accompanied
+by a separately selectable mode change."
+  (and (null (majutsu-interactive--file-section-hunks file-section))
+       (or (null (majutsu-interactive--file-section-patches file-section))
+           (string-match-p "^Binary files " (or (oref file-section header) ""))
+           (member (plist-get (majutsu-diff-file-metadata file-section) :status)
+                   '("renamed" "copied")))))
+
+(defun majutsu-interactive--selection-units (file-section &optional validate)
+  "Return content, text and mode selection IDs for FILE-SECTION.
+When VALIDATE is non-nil, reject unsupported or unverified whole-file content."
+  (let ((ids (mapcar #'majutsu-interactive--hunk-id
+                     (majutsu-interactive--file-section-patches file-section))))
+    (when (majutsu-interactive--file-content-p file-section)
+      (when validate
+        (unless (majutsu-interactive--current-operation)
+          (user-error "Whole-file selections are supported by Split, Squash, Absorb, and Restore"))
+        (unless (majutsu-diff-file-metadata file-section)
+          (user-error
+           "Cannot verify this whole-file selection against structured metadata from jj; refresh the diff and try again")))
+      (push (majutsu-interactive--file-id (oref file-section value)) ids))
+    ids))
 
 (defun majutsu-interactive-toggle-file ()
-  "Toggle all hunks, or a whole-file change with no text hunks, at point."
+  "Toggle all changes in the file or diffstat directory at point.
+A partially selected file or directory becomes fully selected.
+A fully selected one becomes unselected, including its hidden descendants."
   (interactive)
-  (let (file-section)
+  (let (files ids directory)
     (magit-section-case
-      (jj-hunk (setq file-section (oref it parent)))
-      (jj-file (setq file-section it)))
-    (let ((file (and file-section (oref file-section value))))
-      (when (and file-section (magit-section-match 'jj-file file-section))
-        (unless (majutsu-interactive--file-section-hunks file-section)
-          (setq file-section
-                (or (majutsu-interactive--file-section-with-hunks file)
-                    (majutsu-interactive--file-section-for-file file))))
-        (unless file-section
-          (user-error "No file change at point"))
-        (let ((hunks (majutsu-interactive--file-section-hunks file-section)))
-          (if (null hunks)
-              (majutsu-interactive--toggle-whole-file file-section)
-            (let ((all-selected
-                   (cl-every
-                    (lambda (h)
-                      (majutsu-interactive--get-selection
-                       (majutsu-interactive--hunk-id h)))
-                    hunks)))
-              (dolist (hunk hunks)
-                (majutsu-interactive--set-selection
-                 (majutsu-interactive--hunk-id hunk)
-                 (unless all-selected :all)))
-              (majutsu-interactive--render-overlays)
-              (message "%s all hunks in file"
-                       (if all-selected "Deselected" "Selected")))))))))
+      ((jj-hunk jj-mode-change)
+       (setq files (list (oref (oref it parent) value))))
+      (jj-file (setq files (list (oref it value))))
+      (jj-directory
+       (setq directory t
+             files (majutsu-file-tree-files it))))
+    (unless files
+      (user-error "No file or directory change at point"))
+    ;; Resolve and validate every file before mutating any selection.  A
+    ;; missing binary/rename sidecar must not leave a directory half-selected.
+    (dolist (file (delete-dups files))
+      (let ((section (majutsu-interactive--file-section-for-file file)))
+        (unless section
+          (user-error "No diff for file %s" file))
+        (setq ids (nconc ids (majutsu-interactive--selection-units section t)))))
+    (majutsu-interactive--ensure-selection-context)
+    (let ((all-selected
+           (cl-every (lambda (id)
+                       (eq (majutsu-interactive--get-selection id) :all))
+                     ids)))
+      (dolist (id ids)
+        (majutsu-interactive--set-selection id (unless all-selected :all)))
+      (majutsu-interactive--render-overlays)
+      (message "%s all changes in %s"
+               (if all-selected "Deselected" "Selected")
+               (if directory "directory" "file")))))
 
 (defun majutsu-interactive--normalize-line-range (start end limit-start limit-end)
   "Return a line-aligned range between START and END.
@@ -252,6 +432,7 @@ The range is clamped to LIMIT-START and LIMIT-END."
                     (region-beginning) (region-end)
                     (oref it content) (oref it end)))
             (current (majutsu-interactive--get-selection hunk-id)))
+       (majutsu-interactive--ensure-selection-context)
        (unless range
          (user-error "Region is outside hunk"))
        (cond
@@ -289,9 +470,9 @@ The range is clamped to LIMIT-START and LIMIT-END."
   (majutsu-interactive-toggle-hunk))
 
 (transient-define-suffix majutsu-interactive:select-file ()
-  "Select file."
+  "Select file or directory."
   :key "F"
-  :description "Select file"
+  :description "Select file/directory"
   :if 'majutsu-interactive-selection-available-p
   :transient t
   (interactive)
@@ -313,6 +494,38 @@ The range is clamped to LIMIT-START and LIMIT-END."
   (mapc #'delete-overlay majutsu-interactive--overlays)
   (setq majutsu-interactive--overlays nil))
 
+(defun majutsu-interactive--file-selection-state (section)
+  "Return `all', `partial', or nil for the real file SECTION."
+  (let ((specs (mapcar #'majutsu-interactive--get-selection
+                       (majutsu-interactive--selection-units section))))
+    (cond ((and specs (cl-every (lambda (spec) (eq spec :all)) specs))
+           'all)
+          ((seq-some #'identity specs) 'partial))))
+
+(defun majutsu-interactive--render-stat-overlays ()
+  "Mirror patch selection in diffstat files and aggregate directory headings."
+  (let ((states (make-hash-table :test #'equal))
+        stats)
+    (when magit-root-section
+      (magit-map-sections
+       (lambda (section)
+         (cond ((magit-section-match 'diffstat section)
+                (push section stats))
+               ((and (magit-section-match 'jj-file section)
+                     (oref section header))
+                (puthash (oref section value)
+                         (majutsu-interactive--file-selection-state section)
+                         states))))
+       magit-root-section))
+    (dolist (stat stats)
+      (setq majutsu-interactive--overlays
+            (nconc
+             (majutsu-selection-highlight-tree
+              stat (lambda (section) (gethash (oref section value) states))
+              'majutsu-interactive-selected-file
+              'majutsu-interactive-partially-selected-file)
+             majutsu-interactive--overlays)))))
+
 (defun majutsu-interactive--render-overlays ()
   "Render overlays for current selections."
   (majutsu-interactive--clear-overlays)
@@ -323,7 +536,11 @@ The range is clamped to LIMIT-START and LIMIT-END."
          (if (majutsu-interactive--file-id-p id)
              (when-let* ((section (majutsu-interactive--find-file-section id)))
                (let ((ov (make-overlay (oref section start) (oref section end))))
-                 (overlay-put ov 'face 'majutsu-interactive-selected-file)
+                 (overlay-put ov 'face
+                              (if (eq (majutsu-interactive--file-selection-state
+                                       section) 'all)
+                                  'majutsu-interactive-selected-file
+                                'majutsu-interactive-partially-selected-file))
                  (overlay-put ov 'evaporate t)
                  (push ov majutsu-interactive--overlays)))
            (when-let* ((section (majutsu-interactive--find-hunk-section id)))
@@ -340,14 +557,15 @@ The range is clamped to LIMIT-START and LIMIT-END."
                      (overlay-put ov 'face 'majutsu-interactive-selected-region)
                      (overlay-put ov 'evaporate t)
                      (push ov majutsu-interactive--overlays)))))))))
-       selections))))
+       selections)
+      (majutsu-interactive--render-stat-overlays))))
 
 (defun majutsu-interactive--find-hunk-section (hunk-id)
   "Find hunk section with HUNK-ID in current buffer."
   (let ((result nil))
     (when magit-root-section
       (cl-labels ((walk (section)
-                    (when (and (cl-typep section 'majutsu-hunk-section)
+                    (when (and (majutsu-interactive--patch-section-p section)
                                (equal (majutsu-interactive--hunk-id section) hunk-id))
                       (setq result section))
                     (dolist (child (oref section children))
@@ -363,8 +581,8 @@ The range is clamped to LIMIT-START and LIMIT-END."
 ;;; Patch Generation
 
 (defun majutsu-interactive--collect-selected-hunks ()
-  "Collect all selected hunks with their selection specs.
-Returns list of (FILE-SECTION HUNK-SECTION SPEC)."
+  "Collect all selected patch units with their selection specs.
+Returns list of (FILE-SECTION PATCH-SECTION SPEC)."
   (let ((result nil))
     (when majutsu-interactive--selections
       (maphash
@@ -375,7 +593,7 @@ Returns list of (FILE-SECTION HUNK-SECTION SPEC)."
     (nreverse result)))
 
 (defun majutsu-interactive--hunkless-file-sections ()
-  "Return metadata-backed file sections that have no text hunks.
+  "Return metadata-backed file sections requiring a whole-file payload.
 The result follows the displayed diff order, rather than the unspecified
 iteration order of the selection hash table."
   (let (result)
@@ -383,14 +601,14 @@ iteration order of the selection hash table."
       (magit-map-sections
        (lambda (section)
          (when (and (magit-section-match 'jj-file section)
-                    (null (majutsu-interactive--file-section-hunks section))
+                    (majutsu-interactive--file-content-p section)
                     (majutsu-diff-file-metadata section))
            (push section result)))
        magit-root-section))
     (nreverse result)))
 
 (defun majutsu-interactive--whole-file-selected-p (file-section)
-  "Return non-nil when FILE-SECTION is selected as a whole file."
+  "Return non-nil when FILE-SECTION's whole-file content is selected."
   (majutsu-interactive--get-selection
    (majutsu-interactive--file-id (oref file-section value))))
 
@@ -443,20 +661,62 @@ Never infer filesystem paths from rendered Git patch headers."
       ("copied" (list :action 'copy :source source :path path))
       (_ (user-error "Unsupported whole-file jj diff status: %S" status)))))
 
-(defun majutsu-interactive--build-file-operations (file-sections)
-  "Return forward whole-file operations for FILE-SECTIONS."
-  (mapcar (lambda (section)
-            (majutsu-interactive--file-operation
-             (majutsu-interactive--file-change section)))
-          file-sections))
+(defun majutsu-interactive--build-file-operations (file-sections &optional invert)
+  "Return forward whole-file operations for FILE-SECTIONS.
+Keep independently selectable permissions separate from payload bytes.
+INVERT selects unselected mode changes for a complement replay.
+A copy's mode requires its destination; unlike a rename, a copy cannot
+retarget that mode change onto its unchanged source."
+  (let ((operations
+         (mapcar (lambda (section)
+                   (let ((op (majutsu-interactive--file-operation
+                              (majutsu-interactive--file-change section))))
+                     (when (and (eq (plist-get op :action) 'modify)
+                                (majutsu-interactive--file-section-patches section))
+                       (setq op (plist-put op :action 'content)))
+                     op))
+                 file-sections))
+        modes)
+    (dolist (section (majutsu-interactive--hunkless-file-sections))
+      (let ((metadata (majutsu-diff-file-metadata section)))
+        (when (member (plist-get metadata :status) '("renamed" "copied"))
+          (dolist (unit (majutsu-interactive--file-section-patches section))
+            (when (magit-section-match 'jj-mode-change unit)
+              (let* ((content (memq section file-sections))
+                     (mode (majutsu-interactive--get-selection
+                            (majutsu-interactive--hunk-id unit)))
+                     (keep-mode (if invert (not mode) mode)))
+                (when (and keep-mode (not content)
+                           (equal (plist-get metadata :status) "copied"))
+                  (user-error
+                   "Cannot keep the mode change for copied file %s without keeping the copy"
+                   (oref section value)))
+                (when (or content keep-mode)
+                  (let ((header (oref section header))
+                        (change (majutsu-interactive--file-change section))
+                        (side (if keep-mode "new" "old")))
+                    ;; Unchanged copy sources are absent from jj's sparse
+                    ;; editor checkout.  Read the baseline mode from the diff
+                    ;; instead of inheriting the payload's unselected mode.
+                    (unless (string-match
+                             (concat "^" side " mode \\([0-7]+\\)$") header)
+                      (error "Missing %s mode for %s" side (oref section value)))
+                    (push (list :action 'chmod
+                                :path (plist-get change
+                                                 (if content :target :source))
+                                :mode (logand (string-to-number
+                                               (match-string 1 header) 8)
+                                              #o777))
+                          modes)))))))))
+    (append operations (nreverse modes))))
 
 (defun majutsu-interactive--collect-hunks-by-file ()
-  "Return hash table of FILE-SECTION to list of HUNK-SECTIONS."
+  "Return hash table of FILE-SECTION to selectable patch sections."
   (let ((by-file (make-hash-table :test 'eq)))
     (when magit-root-section
       (magit-map-sections
        (lambda (section)
-         (when (magit-section-match 'jj-hunk section)
+         (when (majutsu-interactive--patch-section-p section)
            (let ((file (oref section parent)))
              (push section (gethash file by-file)))))
        magit-root-section))
@@ -625,24 +885,47 @@ Return a hunk string or nil when no change lines remain."
                 header)))
         (concat hunk-header body)))))
 
+(defun majutsu-interactive--without-mode-change (header)
+  "Return Git file HEADER without an old/new mode pair."
+  (replace-regexp-in-string
+   "^old mode [^\n]+\nnew mode [^\n]+\n" "" header))
+
 (defun majutsu-interactive--build-file-patch (file-section hunks-with-specs &optional invert)
   "Build patch string for FILE-SECTION with HUNKS-WITH-SPECS.
 HUNKS-WITH-SPECS is list of (HUNK-SECTION SPEC [INVERT]).
 When INVERT is non-nil, invert selected hunks by default."
   (let ((header (oref file-section header))
+        (mode-change nil)
         (hunk-patches nil))
     (dolist (hs hunks-with-specs)
       (let* ((hunk (nth 0 hs))
              (spec (nth 1 hs))
-             (hunk-invert (if (> (length hs) 2) (nth 2 hs) invert))
-             (hunk-patch (majutsu-interactive--build-hunk-patch
-                          hunk spec hunk-invert)))
-        (when hunk-patch
-          (push hunk-patch hunk-patches))))
-    (when hunk-patches
-      (concat header
+             (hunk-invert (if (> (length hs) 2) (nth 2 hs) invert)))
+        (if (magit-section-match 'jj-mode-change hunk)
+            (when (and spec (not hunk-invert))
+              (setq mode-change t))
+          (when-let* ((hunk-patch (majutsu-interactive--build-hunk-patch
+                                   hunk spec hunk-invert)))
+            (push hunk-patch hunk-patches)))))
+    (when (or hunk-patches
+              (and mode-change
+                   ;; Cross-path mode-only Git patches cannot be applied.
+                   ;; Replay these modes separately from rename/copy payloads.
+                   (not (and
+                         (majutsu-interactive--file-content-p file-section)
+                         (member
+                          (plist-get (majutsu-diff-file-metadata file-section)
+                                     :status)
+                          '("renamed" "copied"))))))
+      (concat (cond (hunk-patches
+                     (if mode-change header
+                       (majutsu-interactive--without-mode-change header)))
+                    (mode-change
+                     ;; A mode-only patch must not retain binary payload
+                     ;; markers or text headers for unselected content.
+                     (concat (substring header 0 (1+ (string-match "\n" header)))
+                             (majutsu-diff--mode-change-header (list header)))))
               (mapconcat #'identity (nreverse hunk-patches) "")))))
-
 
 (defun majutsu-interactive--build-patch (&optional invert include-all-files)
   "Build complete patch from current selections.
@@ -713,17 +996,21 @@ Returns patch string or nil if no selections."
         (majutsu-interactive--fixup-patch
          (mapconcat #'identity (nreverse patches) ""))))))
 
-(defun majutsu-interactive-build-replay-plan-if-selected (&optional buffer mode)
+(defun majutsu-interactive-build-replay-plan-if-selected
+    (&optional buffer mode operation)
   "Return a plan that reconstructs the editor's right tree from selections.
-MODE is `selected' for Split and Squash, or `complement' for Restore.  A
-selected plan starts from the editor's left tree and replays selected changes
-from its initial right tree.  A complement plan starts from the initial right
-tree and replays unselected changes from the left tree.  Both plans apply
-their text patches forward; this keeps new-file and copy patches valid.
+MODE is `selected' for Split, Squash, and Absorb, or `complement' for Restore.
+A selected plan starts from the editor's left tree and replays selected
+changes from its initial right tree.  A complement plan starts from the
+initial right tree and replays unselected changes from the left tree.
+Both plans apply their text patches forward; this keeps new-file and copy
+patches valid.
 
 The returned plist contains :base, :payload-root, :patch, and :file-ops, or
-nil when BUFFER has no selections."
+nil when BUFFER has no selections.  OPERATION, when non-nil, must own
+BUFFER's patch selection."
   (with-current-buffer (or buffer (current-buffer))
+    (majutsu-interactive--assert-selection-context operation)
     (when (majutsu-interactive--has-selections-p)
       (pcase (or mode 'selected)
         ('selected
@@ -740,9 +1027,8 @@ nil when BUFFER has no selections."
                :patch (majutsu-interactive--build-patch t t)
                :file-ops
                (majutsu-interactive--build-file-operations
-                (majutsu-interactive--collect-unselected-files))))
+                (majutsu-interactive--collect-unselected-files) t)))
         (_ (error "Unknown replay plan mode: %S" mode))))))
-
 
 (defun majutsu-interactive--fixup-patch (patch)
   "Fix hunk header line counts in PATCH using diff-mode."
@@ -772,9 +1058,10 @@ nil when BUFFER has no selections."
 (defun majutsu-interactive--write-applypatch-script (plan directory)
   "Write PLAN's applypatch helper script and return its path.
 PLAN describes the editor right tree with :base (`left' or `right'),
-:payload-root (`left' or `right'), a forward text patch, and explicit
-whole-file operations.  Paths needed by FILE-OPS are snapshotted from the
-payload root before the right tree is rebuilt.  Write the script in DIRECTORY."
+:payload-root (`left' or `right'), a forward patch, and explicit file
+operations.  A `content' operation replaces bytes without replacing the
+destination mode.  Paths needed by FILE-OPS are snapshotted from the payload
+root before the right tree is rebuilt.  Write the script in DIRECTORY."
   (let* ((base (plist-get plan :base))
          (payload-root (plist-get plan :payload-root))
          (file-ops (plist-get plan :file-ops))
@@ -812,7 +1099,7 @@ payload root before the right tree is rebuilt.  Write the script in DIRECTORY."
         (insert "majutsu_cleanup() { rm -rf -- \"$PRESERVED\"; }\n")
         (insert "trap majutsu_cleanup 0 1 2 3 15\n")
         (dolist (op file-ops)
-          (when (memq (plist-get op :action) '(add modify rename copy))
+          (when (memq (plist-get op :action) '(add modify content rename copy))
             (let ((path (plist-get op :path)))
               (insert
                (format "majutsu_copy %s %s || exit $?\n"
@@ -830,24 +1117,34 @@ payload root before the right tree is rebuilt.  Write the script in DIRECTORY."
                (destination (majutsu-interactive--script-path "RIGHT" path))
                (preserved (majutsu-interactive--script-path "PRESERVED" path)))
           (pcase action
+            ('content
+             ;; Unlike cp -a, plain cp retains an existing destination's
+             ;; permissions, including an independently replayed chmod.
+             ;; The left baseline is read-only in jj's editor checkout.
+             ;; Restore owner write access without changing its executable bit.
+             (insert (format "chmod u+w -- %s || exit $?\n" destination))
+             (insert (format "cp -- %s %s || exit $?\n"
+                             preserved destination)))
             ((or 'add 'modify)
              (insert (format "majutsu_remove %s || exit $?\n" destination))
              (insert (format "majutsu_copy %s %s || exit $?\n"
                              preserved destination)))
             ('delete
              (insert (format "majutsu_remove %s || exit $?\n" destination)))
-            ('rename
-             (insert
-              (format "majutsu_remove %s || exit $?\n"
-                      (majutsu-interactive--script-path
-                       "RIGHT" (plist-get op :source))))
+            ((or 'rename 'copy)
+             ;; Preserve the payload's own mode.  Independently selected
+             ;; permissions are explicit chmod operations, never inherited
+             ;; from a source that may be absent or separately modified.
+             (when (eq action 'rename)
+               (insert (format "majutsu_remove %s || exit $?\n"
+                               (majutsu-interactive--script-path
+                                "RIGHT" (plist-get op :source)))))
              (insert (format "majutsu_remove %s || exit $?\n" destination))
              (insert (format "majutsu_copy %s %s || exit $?\n"
                              preserved destination)))
-            ('copy
-             (insert (format "majutsu_remove %s || exit $?\n" destination))
-             (insert (format "majutsu_copy %s %s || exit $?\n"
-                             preserved destination)))
+            ('chmod
+             (insert (format "chmod %o -- %s || exit $?\n"
+                             (plist-get op :mode) destination)))
             (_ (error "Unknown whole-file operation: %S" action)))))
       (insert "exit 0\n"))
     (set-file-modes script #o755)
@@ -903,14 +1200,92 @@ Remove its temporary directory when PROCESS exits or is signaled."
         t)
     nil))
 
+(defun majutsu-interactive--refresh-operation-origin (buffer root)
+  "Refresh Majutsu BUFFER, falling back to ROOT's live log buffer."
+  (if (and (buffer-live-p buffer)
+           (with-current-buffer buffer (derived-mode-p 'majutsu-mode)))
+      (with-current-buffer buffer
+        (let ((default-directory root))
+          (majutsu-refresh)))
+    (when-let* ((log (majutsu--find-mode-buffer 'majutsu-log-mode root)))
+      (with-current-buffer log
+        (majutsu-refresh)))))
+
+(defvar majutsu-interactive-repository-operation-functions nil
+  "Functions run before refreshing the buffer of a changed repository.
+Each receives ORIGIN-BUFFER and OPERATION-BEFORE.")
+
+(defun majutsu-interactive-complete-repository-operation
+    (root origin-buffer operation-before &optional unchanged-message)
+  "Complete a repository operation rooted at ROOT.
+
+Compare OPERATION-BEFORE with jj's current operation id.  A changed or
+unreadable id invalidates every patch selection for ROOT before refreshing
+ORIGIN-BUFFER.  An unchanged id preserves selections and optionally displays
+UNCHANGED-MESSAGE.  Return `unchanged', `changed', or `unknown'."
+  (let (completed outcome)
+    (unwind-protect
+        (let ((operation-after (majutsu-jj-operation-id root)))
+          (setq outcome
+                (cond
+                 ((not (and operation-before operation-after)) 'unknown)
+                 ((equal operation-before operation-after) 'unchanged)
+                 (t 'changed)))
+          (pcase outcome
+            ('unchanged
+             (when unchanged-message
+               (message "%s" unchanged-message)))
+            ((or 'changed 'unknown)
+             (majutsu-interactive-invalidate-repository root)
+             (when (eq outcome 'changed)
+               (run-hook-with-args
+                'majutsu-interactive-repository-operation-functions
+                origin-buffer operation-before))
+             (majutsu-interactive--refresh-operation-origin
+              origin-buffer root)
+             (when (eq outcome 'unknown)
+               (message "jj operation ended; could not verify its repository result"))))
+          (setq completed t)
+          outcome)
+      (unless completed
+        ;; `quit' is not an `error'.  If the probe or refresh was interrupted,
+        ;; never leave position-based selections usable against an unknown tree.
+        (let ((inhibit-quit t))
+          (majutsu-interactive-invalidate-repository root)
+          (run-at-time 0 nil
+                       #'majutsu-interactive--refresh-operation-origin
+                       origin-buffer root))))))
+
+(defun majutsu-interactive--complete-patch-operation
+    (buffer root operation-before exit-code)
+  "Complete a custom patch operation from BUFFER after EXIT-CODE."
+  (majutsu-interactive-complete-repository-operation
+   root buffer operation-before
+   (and (integerp exit-code)
+        (zerop exit-code)
+        "jj patch selection ended without a repository operation")))
+
 (defun majutsu-interactive-run-replay-plan (command args filesets plan)
   "Run jj COMMAND with ARGS and FILESETS using replay PLAN.
 PLAN reconstructs the merge editor's right tree from its selected or
-complemented text and whole-file changes."
-  (let ((directory (majutsu-interactive--make-operation-temp-dir))
-        retained)
+complemented text and whole-file changes.  Reserve the workspace's shared
+interactive slot until completion so another writer cannot replay a stale
+selection while this operation is still running."
+  (let* ((origin-buffer (current-buffer))
+         (root (file-name-as-directory
+                (majutsu--toplevel-safe default-directory)))
+         (owner (list 'patch-replay))
+         operation-before directory retained child
+         (created-callback majutsu-process--start-created-callback)
+         (majutsu-process--start-created-callback
+          (lambda (process)
+            (setq child process)
+            (when created-callback (funcall created-callback process)))))
+    (majutsu-process-register-interactive-session root owner)
     (unwind-protect
-        (let* ((patch-file (majutsu-interactive--write-patch
+        (let* ((_ (setq operation-before (majutsu-jj-operation-id root)
+                        directory (majutsu-interactive--make-operation-temp-dir)))
+               (patch-file (majutsu-interactive--write-patch
                             (or (plist-get plan :patch) "") directory))
                (tool-config (majutsu-interactive--build-tool-config
                              patch-file plan directory))
@@ -919,12 +1294,33 @@ complemented text and whole-file changes."
                              tool-config))
                (full-args
                 (cons command (majutsu-jj-append-filesets args filesets)))
-               (process (majutsu-run-jj-with-editor full-args)))
+               (process
+                (majutsu-start-jj-with-editor
+                 full-args nil
+                 (lambda (process exit-code)
+                   (majutsu-process-unregister-interactive-session root owner)
+                   (when (and (fboundp 'majutsu-process-completion-owned-p)
+                              (majutsu-process-completion-owned-p process))
+                     (run-at-time 0 nil
+                                  #'majutsu-interactive--complete-patch-operation
+                                  origin-buffer root operation-before
+                                  exit-code)))
+                 t)))
           (setq retained
                 (majutsu-interactive--retain-temp-dir-for-process
                  process directory))
+          (message "Running jj %s with the patch selection..." command)
           process)
+      ;; Startup can quit after the child acquired its completion sentinel.
+      ;; It still owns the workspace and may still need its replay files.
+      (when (and (not retained) child
+                 (majutsu-process-completion-owned-p child))
+        (let ((inhibit-quit t))
+          (setq retained
+                (majutsu-interactive--retain-temp-dir-for-process
+                 child directory))))
       (unless retained
+        (majutsu-process-unregister-interactive-session root owner)
         (majutsu-interactive--delete-operation-temp-dir directory)))))
 
 ;;; _

@@ -24,16 +24,17 @@ When NEWLINE is non-nil or omitted, append a trailing newline."
           heading
           majutsu-row-tail-token
           majutsu-row-body-token
-          (replace-regexp-in-string
-           "\n" majutsu-row-field-line-separator (or conflict-details "") t t)
+          (if (and conflict-details
+                   (not (string-blank-p conflict-details)))
+              (concat "\n" conflict-details)
+            "")
           majutsu-row-meta-token
-          (string-join (list name (or remote "")
-                             (if tracked "t" "")
-                             (string-join (or removed-ids nil)
-                                          majutsu-row-field-line-separator)
-                             (string-join (or added-ids nil)
-                                          majutsu-row-field-line-separator))
-                       majutsu-row-field-separator)
+          (mapconcat #'json-serialize
+                     (list name (or remote "")
+                           (if tracked "t" "")
+                           (string-join (or removed-ids nil) "\n")
+                           (string-join (or added-ids nil) "\n"))
+                     majutsu-row-field-separator)
           majutsu-row-end-token
           (if (or (not newline-supplied-p) newline) "\n" "")))
 
@@ -127,68 +128,6 @@ When NEWLINE is non-nil or omitted, append a trailing newline."
   (should (equal (majutsu--bookmark-split-remote-ref "main")
                  '("main" . nil))))
 
-(ert-deftest majutsu-bookmark-get-bookmark-names/local-args ()
-  (let (seen-args)
-    (cl-letf (((symbol-function 'majutsu-jj-lines)
-               (lambda (&rest args)
-                 (setq seen-args (flatten-list args))
-                 '("main" "feature"))))
-      (should (equal (majutsu--get-bookmark-names 'local) '("main" "feature")))
-      (should (equal (seq-take seen-args 3) '("bookmark" "list" "--quiet")))
-      (should-not (member "--all-remotes" seen-args))
-      (should-not (member "--tracked" seen-args))
-      (should (member "-T" seen-args))
-      (let ((template (cadr (member "-T" seen-args))))
-        (should (string-match-p (regexp-quote "(!self.remote())") template))
-        (should (string-match-p (regexp-quote "self.present()") template))
-        (should (string-match-p (regexp-quote "\\n") template))))))
-
-(ert-deftest majutsu-bookmark-get-bookmark-names/remote-args ()
-  (let (seen-args)
-    (cl-letf (((symbol-function 'majutsu-jj-lines)
-               (lambda (&rest args)
-                 (setq seen-args (flatten-list args))
-                 '("main@origin" "dev@upstream"))))
-      (should (equal (majutsu--get-bookmark-names 'remote) '("main@origin" "dev@upstream")))
-      (should (member "--all-remotes" seen-args))
-      (should (member "-T" seen-args))
-      (let ((template (cadr (member "-T" seen-args))))
-        (should (string-match-p (regexp-quote "self.remote()") template))
-        (should (string-match-p (regexp-quote "self.present()") template))
-        (should (string-match-p (regexp-quote "\"@\"") template))))))
-
-(ert-deftest majutsu-bookmark-get-bookmark-names/remote-tracked-args ()
-  (let (seen-args)
-    (cl-letf (((symbol-function 'majutsu-jj-lines)
-               (lambda (&rest args)
-                 (setq seen-args (flatten-list args))
-                 '("main@origin"))))
-      (should (equal (majutsu--get-bookmark-names 'remote-tracked) '("main@origin")))
-      (should (member "--tracked" seen-args))
-      (let ((template (cadr (member "-T" seen-args))))
-        (should (string-match-p (regexp-quote "self.tracked()") template))))))
-
-(ert-deftest majutsu-bookmark-get-bookmark-names/remote-untracked-args ()
-  (let (seen-args)
-    (cl-letf (((symbol-function 'majutsu-jj-lines)
-               (lambda (&rest args)
-                 (setq seen-args (flatten-list args))
-                 '("topic@origin"))))
-      (should (equal (majutsu--get-bookmark-names 'remote-untracked) '("topic@origin")))
-      (should (member "--all-remotes" seen-args))
-      (let ((template (cadr (member "-T" seen-args))))
-        (should (string-match-p (regexp-quote "(!self.tracked())") template))))))
-
-(ert-deftest majutsu-bookmark-forget-name-candidates/include-local-and-remote-bases ()
-  (cl-letf (((symbol-function 'majutsu--get-bookmark-names)
-             (lambda (&optional scope)
-               (pcase scope
-                 ('local '("main" "local-only"))
-                 ('remote '("main@origin" "remote-only@upstream"))
-                 (_ nil)))))
-    (should (equal (majutsu--bookmark-forget-name-candidates)
-                   '("main" "local-only" "remote-only")))))
-
 (ert-deftest majutsu-bookmark-track-name-candidates/uses-untracked-remote-bases ()
   (cl-letf (((symbol-function 'majutsu--get-bookmark-names)
              (lambda (&optional scope)
@@ -205,47 +144,6 @@ When NEWLINE is non-nil or omitted, append a trailing newline."
     (should (equal (majutsu--bookmark-untrack-name-candidates)
                    '("main" "topic")))))
 
-(ert-deftest majutsu-bookmark-completion-template/emits-line-delimiters ()
-  (should (string-match-p (regexp-quote "\\n") majutsu-bookmark--completion-template)))
-
-(ert-deftest majutsu-bookmark-list-template/uses-typed-commitref-fields ()
-  (let ((majutsu-bookmark--compiled-template-cache nil))
-    (let ((template (majutsu-bookmark--list-template)))
-      (should-not (string-match-p "format_commit_ref" template))
-      (should-not (string-match-p "format_commit_summary_with_refs" template))
-      (should-not (string-match-p ":map-join" template))
-      (should (string-match-p "self.removed_targets().map" template))
-      (should (string-match-p "self.added_targets().map" template))
-      (should-not (string-match-p "self.primary()" template))
-      (should-not (string-match-p "self.tracked_refs()" template))
-      (should (string-match-p (regexp-quote "change_id().shortest(8)") template))
-      (should (string-match-p (regexp-quote "commit_id().shortest(8)") template))
-      (should (string-match-p (regexp-quote "description().first_line()") template))
-      (should (string-match-p (regexp-quote "label(\"bookmark\"") template))
-      (should (string-match-p (regexp-quote "label(\"conflict\"") template))
-      (should (string-match-p (regexp-quote "\\x1E") template))
-      (should (string-match-p (regexp-quote "\\x1D") template)))))
-
-(ert-deftest majutsu-bookmark-list-template/uses-custom-heading-template ()
-  (let ((majutsu-bookmark--compiled-template-cache nil)
-        (majutsu-bookmark-list-template-heading
-         '[:separate " :: " [:majutsu-bookmark-list-name] "CUSTOM-HEADING"]))
-    (let ((template (majutsu-bookmark--list-template)))
-      (should (string-match-p (regexp-quote "CUSTOM-HEADING") template)))))
-
-(ert-deftest majutsu-bookmark-list-template/uses-flat-row-columns ()
-  (let* ((compiled (majutsu-bookmark--ensure-list-template))
-         (heading-fields
-          (mapcar (lambda (column) (plist-get column :field))
-                  (majutsu-row-module-columns compiled 'heading)))
-         (metadata-fields
-          (mapcar (lambda (column) (plist-get column :field))
-                  (majutsu-row-module-columns compiled 'metadata))))
-    (should (equal heading-fields '(heading)))
-    (should (equal metadata-fields
-                   '(name remote tracked removed-target-ids
-                     added-target-ids)))))
-
 (ert-deftest majutsu-bookmark-row-output/parses-flat-refs-and-remote-state ()
   (let* ((compiled (majutsu-bookmark--ensure-list-template))
          (output (concat
@@ -254,14 +152,14 @@ When NEWLINE is non-nil or omitted, append a trailing newline."
                   (majutsu-bookmark-test--ref
                    "dev" "origin" t
                    "  @origin (+2/-10+): sxwtxlqt/1 4bb5dd3b (hidden) summary")))
-         parsed roots dev origin)
+         parsed entries dev origin)
     (with-temp-buffer
       (insert output)
       (setq parsed (majutsu-row-read-buffer compiled)))
-    (setq roots (plist-get parsed :roots)
-          dev (car roots)
-          origin (cadr roots))
-    (should (= (length roots) 2))
+    (setq entries (plist-get parsed :entries)
+          dev (car entries)
+          origin (cadr entries))
+    (should (= (length entries) 2))
     (should (equal (majutsu-row-column dev 'name) "dev"))
     (should (equal (majutsu-row-column origin 'remote) "origin"))
     (should (majutsu-row-column origin 'tracked))))
@@ -432,17 +330,6 @@ When NEWLINE is non-nil or omitted, append a trailing newline."
       (dolist (section groups)
         (should-not (oref section hidden))))))
 
-(ert-deftest majutsu-bookmark-list-refresh/includes-all-remotes ()
-  (with-temp-buffer
-    (majutsu-bookmark-list-mode)
-    (let (seen)
-      (cl-letf (((symbol-function 'majutsu-remote-candidate-data)
-                 (lambda () nil))
-                ((symbol-function 'majutsu-jj-wash)
-                 (lambda (_washer _args args) (setq seen args))))
-        (majutsu-bookmark-list-refresh-buffer))
-      (should (member "--all-remotes" seen)))))
-
 (ert-deftest majutsu-bookmark-wash-list/preserves-folding-on-refresh ()
   (with-temp-buffer
     (majutsu-bookmark-list-mode)
@@ -463,6 +350,53 @@ When NEWLINE is non-nil or omitted, append a trailing newline."
         (should-not (oref remote hidden))
         (should (oref (car (oref remote children)) hidden))))))
 
+(defun majutsu-bookmark-test--heading (repo name)
+  "Render NAME's heading from REPO through the colored bookmark washer."
+  (let* ((default-directory (file-name-as-directory repo))
+         (majutsu-jj-executable majutsu-jj-integration--jj)
+         (majutsu-bookmark--compiled-template-cache nil)
+         (majutsu-bookmark-list-template-commit-summary "SUMMARY")
+         (output (majutsu-jj-integration-output
+                  repo "--no-pager" "--color=always"
+                  "--config" "colors.elided=\"bright black\""
+                  "--config" "colors.\"diff added\"=\"green\""
+                  "--config" "colors.\"diff modified\"=\"cyan\""
+                  "--config" "colors.\"warning heading\"=\"yellow\""
+                  "bookmark" "list" "--all-remotes"
+                  "-T" (majutsu-bookmark--list-template))))
+    (with-temp-buffer
+      (majutsu-bookmark-list-mode)
+      (let ((inhibit-read-only t))
+        (magit-insert-section (bookmark-list)
+          (insert output)
+          (let ((ansi-color-apply-face-function
+                 #'ansi-color-apply-text-property-face))
+            (ansi-color-apply-on-region (point-min) (point-max)))
+          (majutsu-bookmark--wash-list nil)))
+      (let ((section (seq-find
+                      (lambda (section)
+                        (and (eq (oref section type) 'jj-bookmark)
+                             (equal (oref section value) name)))
+                      (majutsu-bookmark-test--sections))))
+        (should section)
+        (goto-char (oref section start))
+        (buffer-substring (point) (line-end-position))))))
+
+(defun majutsu-bookmark-test--status-face (heading status color)
+  "Check that STATUS in HEADING has the expected ANSI COLOR and help."
+  (let* ((position (string-match (regexp-quote status) heading))
+         (face (get-text-property position 'font-lock-face heading))
+         (foreground
+          (if (keywordp (car face))
+              (plist-get face :foreground)
+            (seq-some (lambda (part)
+                        (and (listp part) (plist-get part :foreground)))
+                      face))))
+    (should (equal foreground
+                   (face-foreground color nil 'default)))
+    (should (string-match-p "↑.*local.*↓.*remote"
+                            (get-text-property position 'help-echo heading)))))
+
 (ert-deftest majutsu-bookmark-list/real-jj-tracking-states ()
   (majutsu-jj-integration-with-sandbox sandbox
     (let ((source (expand-file-name "source" sandbox))
@@ -474,24 +408,84 @@ When NEWLINE is non-nil or omitted, append a trailing newline."
       (majutsu-jj-integration-call sandbox "--no-pager" "git" "clone" source repo)
       (majutsu-jj-integration-call repo "--no-pager" "bookmark" "track" "main@origin")
       (majutsu-jj-integration-call repo "--no-pager" "bookmark" "untrack" "topic@origin")
-      (cl-labels ((heading (name)
-                    (let* ((compiled (majutsu-bookmark--ensure-list-template))
-                           (output (majutsu-jj-integration-output
-                                    repo "--no-pager" "--color=never" "bookmark" "list"
-                                    "--all-remotes" "-T" (plist-get compiled :template)))
-                           (entries (plist-get (with-temp-buffer (insert output) (majutsu-row-read-buffer compiled))
-                                               :entries)))
-                      (majutsu-row-render-heading-content
-                       (seq-find (lambda (entry)
-                                   (equal (majutsu-bookmark--row-ref-section-value entry) name))
-                                 entries)
-                       compiled))))
-        (should (string-match-p (regexp-quote "[tracked, synced]") (heading "main@origin")))
-        (should (string-match-p (regexp-quote "[untracked]") (heading "topic@origin")))
+      (let ((default-directory (file-name-as-directory repo))
+            (majutsu-jj-executable majutsu-jj-integration--jj))
+        (pcase-dolist (`(,scope ,included ,excluded)
+                       '((local "main" "main@origin")
+                         (remote-tracked "main@origin" "topic@origin")
+                         (remote-untracked "topic@origin" "main@origin")))
+          (let ((names (majutsu--get-bookmark-names scope)))
+            (should (member included names))
+            (should-not (member excluded names)))))
+      (cl-labels ((heading (name) (majutsu-bookmark-test--heading repo name)))
+        (let ((synced (heading "main@origin"))
+              (untracked (heading "topic@origin")))
+          (should (equal synced "main@origin ≡ SUMMARY"))
+          (should (equal untracked "topic@origin ○ SUMMARY"))
+          (majutsu-bookmark-test--status-face synced "≡" 'ansi-color-bright-black)
+          (majutsu-bookmark-test--status-face untracked "○" 'ansi-color-bright-black))
+        (should (equal (heading "main") "main SUMMARY"))
+        (let ((majutsu-bookmark-list-template-heading
+               '[:concat "REF=" [:majutsu-bookmark-list-name]]))
+          (should (equal (heading "main") "REF=main")))
         (majutsu-jj-integration-call repo "--no-pager" "bookmark" "delete" "main")
-        (should (string-match-p (regexp-quote "(deleted)") (heading "main")))
-        (should (string-match-p (regexp-quote "[tracked, local deleted]")
-                                (heading "main@origin")))))))
+        (should (equal (heading "main") "main (deleted)"))
+        (let ((default-directory (file-name-as-directory repo))
+              (majutsu-jj-executable majutsu-jj-integration--jj))
+          (should-not (member "main" (majutsu--get-bookmark-names 'local))))
+        (let ((deleted (heading "main@origin")))
+          (should (equal deleted "main@origin × local SUMMARY"))
+          (majutsu-bookmark-test--status-face deleted "× local" 'ansi-color-yellow))))))
+
+(ert-deftest majutsu-bookmark-list/real-jj-distances-use-local-perspective ()
+  (majutsu-jj-integration-with-sandbox sandbox
+    (let ((source (expand-file-name "source" sandbox))
+          (repo (expand-file-name "clone" sandbox)))
+      (majutsu-jj-integration-call sandbox "--no-pager" "git" "init" source)
+      (majutsu-jj-integration-call source "--no-pager" "bookmark" "create" "main")
+      (majutsu-jj-integration-call source "--no-pager" "git" "export")
+      (majutsu-jj-integration-call sandbox "--no-pager" "git" "clone" source repo)
+      (majutsu-jj-integration-call repo "--no-pager" "bookmark" "track" "main@origin")
+      (majutsu-jj-integration-call repo "--no-pager" "new" "main" "-m" "local")
+      (majutsu-jj-integration-call repo "--no-pager" "bookmark" "set" "main" "-r" "@")
+      (let ((heading (majutsu-bookmark-test--heading repo "main@origin")))
+        (should (equal heading "main@origin ↑1 SUMMARY"))
+        (majutsu-bookmark-test--status-face heading "↑1" 'ansi-color-green))
+      (dotimes (_ 2)
+        (majutsu-jj-integration-call source "--no-pager" "new" "-m" "remote"))
+      (majutsu-jj-integration-call source "--no-pager" "bookmark" "set" "main" "-r" "@")
+      (majutsu-jj-integration-call source "--no-pager" "git" "export")
+      (majutsu-jj-integration-call repo "--no-pager" "git" "fetch")
+      ;; Fetch can conflict the local bookmark when both sides moved.
+      ;; Resolve it to the local target before comparing the two histories.
+      (majutsu-jj-integration-call repo "--no-pager" "bookmark" "set" "main" "-r" "@"
+                                  "--allow-backwards")
+      (let ((heading (majutsu-bookmark-test--heading repo "main@origin")))
+        (should (equal heading "main@origin ↑1 ↓2 SUMMARY"))
+        (majutsu-bookmark-test--status-face heading "↑1" 'ansi-color-green)
+        (majutsu-bookmark-test--status-face heading "↓2" 'ansi-color-cyan))
+      (majutsu-jj-integration-call repo "--no-pager" "bookmark" "set" "main" "-r" "main@origin--"
+                                  "--allow-backwards")
+      (should (equal (majutsu-bookmark-test--heading repo "main@origin")
+                     "main@origin ↓2 SUMMARY"))
+      ;; jj may return only a lower bound for a larger revset (notably in
+      ;; builds with its `testing' feature).  Preserve that distinction.
+      (dotimes (_ 12)
+        (majutsu-jj-integration-call repo "--no-pager" "new" "-m" "local"))
+      (majutsu-jj-integration-call repo "--no-pager" "bookmark" "set" "main" "-r" "@")
+      (let* ((counts (majutsu-jj-integration-output
+                      repo "--no-pager" "--color=never" "bookmark" "list" "main"
+                      "--all-remotes" "-T"
+                      (concat "if(remote == \"origin\", "
+                              "tracking_behind_count.exact() ++ \"|\" ++ "
+                              "tracking_behind_count.lower())")))
+             (parts (split-string counts "|"))
+             (count (if (string-empty-p (car parts))
+                        (concat "≥" (cadr parts))
+                      (car parts))))
+        (should (string-match-p
+                 (regexp-quote (concat "↑" count " ↓2 SUMMARY"))
+                 (majutsu-bookmark-test--heading repo "main@origin")))))))
 
 (ert-deftest majutsu-bookmark-wash-list/preserves-custom-tail-columns ()
   (let* ((majutsu-bookmark-list-columns
@@ -504,7 +498,7 @@ When NEWLINE is non-nil or omitted, append a trailing newline."
           (replace-regexp-in-string
            (regexp-quote (concat majutsu-row-tail-token
                                  majutsu-row-body-token))
-           (concat majutsu-row-tail-token "TAIL" majutsu-row-body-token)
+           (concat majutsu-row-tail-token "\"TAIL\"" majutsu-row-body-token)
            (majutsu-bookmark-test--ref
             "dev" "" nil "dev: rymwrkkn b052a92d summary")
            t t)))
@@ -590,20 +584,6 @@ When NEWLINE is non-nil or omitted, append a trailing newline."
             (should (string-match-p (regexp-quote "  + new-target")
                                     (buffer-string)))))))))
 
-(ert-deftest majutsu-bookmark-list-refresh-buffer/uses-structured-template ()
-  (let (seen-args)
-    (with-temp-buffer
-      (majutsu-bookmark-list-mode)
-      (cl-letf (((symbol-function 'majutsu-remote-candidate-data)
-                 (lambda () nil))
-                ((symbol-function 'majutsu-jj-wash)
-                 (lambda (_washer _keep &rest args)
-                   (setq seen-args (flatten-list args)))))
-        (majutsu-bookmark-list-refresh-buffer))
-      (should (member "-T" seen-args))
-      (should (equal (cadr (member "-T" seen-args))
-                     (majutsu-bookmark--list-template))))))
-
 (ert-deftest majutsu-bookmark-candidate-data/aggregates-local-and-remote-state ()
   (let ((sep majutsu-bookmark--completion-field-separator))
     (cl-letf (((symbol-function 'majutsu-jj-lines)
@@ -621,48 +601,6 @@ When NEWLINE is non-nil or omitted, append a trailing newline."
         (should (equal (plist-get main :tracked-remotes) '("origin")))
         (should (plist-get feature :conflict))
         (should (equal (plist-get feature :untracked-remotes) '("fork")))))))
-
-(ert-deftest majutsu-bookmark-advance/builds-default-args ()
-  (let (called)
-    (cl-letf (((symbol-function 'majutsu-run-jj)
-               (lambda (&rest args)
-                 (setq called args)
-                 0)))
-      (majutsu-bookmark-advance)
-      (should (equal (seq-remove #'null (flatten-tree called))
-                     '("bookmark" "advance"))))))
-
-(ert-deftest majutsu-bookmark-advance-to/builds-target-args ()
-  (let (called)
-    (cl-letf (((symbol-function 'majutsu-run-jj)
-               (lambda (&rest args)
-                 (setq called args)
-                 0)))
-      (majutsu-bookmark-advance-to "@")
-      (should (equal (seq-remove #'null (flatten-tree called))
-                     '("bookmark" "advance" "-t" "@"))))))
-
-(ert-deftest majutsu-read-bookmark-name/uses-name-history ()
-  (let (seen-history seen-category)
-    (cl-letf (((symbol-function 'majutsu-bookmark-candidate-data)
-               (lambda (&optional _candidates _directory)
-                 (list :candidates '("main" "feature")
-                       :entries (make-hash-table :test #'equal))))
-              ((symbol-function 'completing-read)
-               (lambda (_prompt collection _predicate _require-match _initial hist _default)
-                 (setq seen-history hist
-                       seen-category (plist-get completion-extra-properties :category))
-                 (should (equal collection '("main" "feature")))
-                 "main")))
-      (should (equal (majutsu-read-bookmark-name "Bookmark") "main"))
-      (should (eq seen-history 'majutsu-bookmark-name-history))
-      (should (eq seen-category 'majutsu-bookmark)))))
-
-(ert-deftest majutsu-bookmark-at-point/uses-exact-bookmark ()
-  (cl-letf (((symbol-function 'magit-section-value-if)
-             (lambda (type)
-               (and (eq type 'jj-bookmark) "main"))))
-    (should (equal (majutsu-bookmark-at-point) "main"))))
 
 (ert-deftest majutsu-bookmark-at-point/uses-structured-bookmark-field ()
   (with-temp-buffer
@@ -814,18 +752,6 @@ When NEWLINE is non-nil or omitted, append a trailing newline."
                        "Delete bookmark(s) main and propagate on next push? ")))
       (should (equal (seq-remove #'null (flatten-tree called))
                      '("bookmark" "delete" "main"))))))
-
-(ert-deftest majutsu-bookmark-forget/builds-pattern-args ()
-  (let (called)
-    (cl-letf (((symbol-function 'majutsu-run-jj)
-               (lambda (&rest args)
-                 (setq called args)
-                 0))
-              ((symbol-function 'message) (lambda (&rest _args) nil)))
-      (majutsu-bookmark-forget '("main" "glob:\"feat*\""))
-      (should (equal (seq-remove #'null (flatten-tree called))
-                     '("bookmark" "forget"
-                       "main" "glob:\"feat*\""))))))
 
 (ert-deftest majutsu-bookmark-untrack/builds-remote-args ()
   (let (called)
