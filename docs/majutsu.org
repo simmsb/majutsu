@@ -844,10 +844,8 @@ read-only snapshots.
   down if it is already open.
 
 *** Ediff and Diffedit
-#+attr_reference: :kind command-binding :interface "Majutsu dispatcher / buffer" :mode majutsu-mode
-- Key: ? E (Vanilla) (majutsu-ediff) ::
-  Open the Ediff transient.
-- Key: E (Evil) (majutsu-ediff) ::
+#+attr_reference: :kind command-binding :interface "Majutsu buffer / dispatcher" :mode majutsu-mode
+- Key: E (majutsu-ediff) ::
   Open the Ediff transient.
 
 Selection: choose revisions via =--revisions= or =--from= / =--to= (with
@@ -1499,8 +1497,7 @@ shows each exact conflicted path together with its conflict side count.
 ** Text Conflict Workbench
 #+attr_reference: :kind command-binding :interface "Majutsu dispatcher"
 - Key: ? M (majutsu-resolve) :: Open a directory-tree workbench for the revision
-  at point, or =@=. Evil users can press ~M~ directly. With a prefix argument,
-  choose a revision explicitly.
+  at point, or =@=. With a prefix argument, choose a revision explicitly.
 
 The workbench pins an exact commit, including historical revisions and
 inherited multi-sided conflicts with no changes-in diff. The main view keeps
@@ -2085,10 +2082,73 @@ newlines or other control characters are preserved as complete values.
 - User Option: majutsu-evil-initial-state :: The Evil state to start in (default:
   =normal=).
 
-When Evil integration is enabled, the dispatcher displays and accepts the same
-Evil-facing top-level keys used in Majutsu buffers, including =x=, =L=, =_=,
-=*=, =u=, =C-r=, and =`=. The global Evil =v= binding remains Visual state;
-open evolog from the dispatcher with =? v=.
+When Evil integration is enabled, the dispatcher follows the invoking
+buffer's Evil state: Normal, Visual, and Motion use the Evil keys, other
+states use the Vanilla keys.  The global Evil =v= binding remains Visual
+state; open evolog from the dispatcher with =? v=.
+
+** jjosh Extensions
+Majutsu has two fixed build variants: upstream ~jj~ (the default) and ~jjosh~.
+The build parameter decides which code is included; the executable's name,
+version, and capabilities do not select or change the variant at runtime.
+
+*** Building a variant
+Compile Majutsu directly with your Emacs package manager or build system; no
+package-specific make step is required. Set ~MAJUTSU_BACKEND~ to ~jj~ or
+~jjosh~ in the compiler environment before any Majutsu library is loaded.
+An unset value selects upstream ~jj~; invalid values are rejected. Use the
+same setting for byte and native compilation.
+
+The builder owns dependency ~load-path~ entries and output directories.
+Keep generated files outside the source checkout and separate the variants.
+For a direct byte-compilation invocation, start a fresh Emacs process in a
+clean, builder-owned staging directory containing the Majutsu sources. With
+dependencies installed through package.el:
+#+begin_src sh
+MAJUTSU_BACKEND=jjosh emacs -Q --batch \
+  --eval '(package-initialize)' \
+  -L . -l majutsu-jjosh.el -f batch-byte-compile majutsu*.el
+#+end_src
+
+Use ~MAJUTSU_BACKEND=jj~ for the upstream variant. For dependencies supplied
+by another build system, replace ~package-initialize~ with its dependency
+~load-path~ setup. Put only the selected build directory on the runtime
+~load-path~, ahead of the source checkout or an installed copy.
+For source-only development, set ~MAJUTSU_BACKEND~ before the first Majutsu
+load.
+
+~majutsu-build-backend~ records the selected variant in bytecode. It is not a
+runtime customization option: changing the environment or setting the variable
+after compilation does not change the generated code. Rebuild the entire
+package and restart Emacs when switching variants; do not mix their libraries.
+
+Executable paths remain separate configuration:
+~majutsu-jj-executable~ selects the local program and
+~majutsu-remote-jj-executable~ selects the program on remote hosts. One build
+applies to both. The jjosh build requires executables implementing its jjosh
+extensions, including ~touched_projects()~ and remote bookmark forget; there is
+no older-version fallback or automatic capability probing. The upstream build
+can use a jjosh executable, but still exposes only upstream functionality.
+
+*** Marking fork-specific code
+Wrap jjosh-specific definitions or expressions in ~majutsu-jjosh~:
+#+begin_src emacs-lisp
+(majutsu-jjosh
+  (keymap-set majutsu-embark-git-bookmark-map "f"
+              #'majutsu-bookmark-forget-ref))
+#+end_src
+
+The macro expands to a ~progn~ containing its body in the jjosh build and to
+~nil~ in the upstream build. It works for commands, parameters, UI bindings,
+templates, and ordinary expressions; it is not part of the template DSL.
+Conditional expressions can use ~(if (majutsu-jjosh t) FORK COMMON)~: the
+byte compiler eliminates the unused branch. Lists such as the default log
+columns use ~eval-when-compile~ and splice optional declarations into a constant
+layout, keeping the transport template and parser schema aligned.
+
+No runtime backend checks, subprocess probes, binary timestamp checks, or
+capability caches are generated. The upstream build omits the project column
+and remote Forget command/action rather than defining disabled placeholders.
 
 ** jjosh Extensions
 Majutsu has two fixed build variants: upstream ~jj~ (the default) and ~jjosh~.

@@ -1015,16 +1015,22 @@ text scaling is reflected without measuring every line in the window."
 
 (defun majutsu-row--collapsed-graph (heading-prefix body-prefixes)
   "Return the graph-only projection of BODY-PREFIXES after HEADING-PREFIX.
-Collapse only consecutive equal geometries, ignoring trailing alignment
-spaces and text properties when comparing.  Nil means no remaining lines;
-an empty string represents one blank graph line."
+Omit straight parent-edge padding and collapse consecutive equal geometries,
+ignoring trailing alignment spaces and text properties when comparing.
+Keep junctions, indirect edges and termination lines.  Nil means no remaining
+lines; an empty string represents one blank graph line."
   (let ((previous (string-trim-right (substring-no-properties heading-prefix)))
         lines)
     (dolist (prefix body-prefixes)
       (let ((geometry (string-trim-right (substring-no-properties prefix))))
-        (unless (equal geometry previous)
-          (push prefix lines)
-          (setq previous geometry))))
+        ;; A node glyph becomes a vertical edge on body lines.  Comparing
+        ;; those strings alone would retain one padding line for every node.
+        ;; Direct vertical edges add no connectivity; indirect edges and
+        ;; junctions still need a visible line of their own.
+        (unless (or (equal geometry previous)
+                    (string-match-p "\\`[ │|]+\\'" geometry))
+          (push prefix lines))
+        (setq previous geometry)))
     (when lines
       (majutsu-row-join-lines (nreverse lines)))))
 
@@ -1161,10 +1167,26 @@ lines are decorations, not cursor stops or targets for section commands."
         (setq pos next)))
     (apply #'concat (nreverse parts))))
 
+(defun majutsu-row--visible-substring (beg end)
+  "Return text between BEG and END, omitting invisible runs.
+Collapsed section bodies are hidden by overlays, but line-wise yanks span
+them; copy what the window shows instead of the hidden descriptions."
+  (let ((pos beg)
+        parts)
+    (while (< pos end)
+      (let ((next (next-single-char-property-change pos 'invisible nil end)))
+        (unless (invisible-p pos)
+          (push (buffer-substring--filter pos next) parts))
+        (setq pos next)))
+    (apply #'concat (nreverse parts))))
+
 (defun majutsu-row-filter-buffer-substring (beg end &optional delete)
   "Filter copied row text between BEG and END.
-Drops tail text when both heading and tail are present in the copied region."
-  (let ((string (buffer-substring--filter beg end delete))
+Omits text hidden by collapsed sections.  Drops tail text when both heading
+and tail are present in the copied region."
+  (let ((string (if delete
+                    (buffer-substring--filter beg end delete)
+                  (majutsu-row--visible-substring beg end)))
         (trim-tail nil))
     (when (and (stringp string)
                (majutsu-row-string-has-module-p string 'heading)
